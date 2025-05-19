@@ -5,7 +5,6 @@ import logging
 from pathlib import Path
 import random
 from PIL import Image
-import time  # 引入 time 模块
 
 import torch
 import torch.nn.functional as F
@@ -13,9 +12,7 @@ import torch.utils.checkpoint
 from torch.utils.data import DataLoader
 
 import diffusers
-import xformers  # 导入 xformers
 # Import ConfigMixin for type hinting
-from diffusers.configuration_utils import ConfigMixin
 from diffusers.models.unets.unet_2d import UNet2DModel
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 # 引入 DDPMSchedulerOutput 用于类型提示
@@ -23,7 +20,6 @@ from diffusers.schedulers.scheduling_ddpm import DDPMSchedulerOutput
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 
-import accelerate
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -34,7 +30,7 @@ from torcheval.metrics.functional import peak_signal_noise_ratio
 
 from utils.misic import ssim, save_path
 from datasets.data_set import LowLightDataset  # 假设数据集类可用
-import lpips  # <-- 添加 LPIPS 导入
+import lpips
 
 # 检查 diffusers 版本
 check_min_version("0.10.0")  # 示例版本，根据需要调整
