@@ -30,5 +30,7 @@ dependencies = [
     "timm>=0.9.12" 
 ]
 
-[tool.uv]
-# You can add uv specific configurations here if needed later
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
