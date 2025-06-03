@@ -69,7 +69,7 @@ def parse_args():
         "--gradient_checkpointing", action="store_true", help="是否启用梯度检查点"
     )
     parser.add_argument(
-        "--lr", type=float, default=4e-4, help="优化器初始学习率"
+        "--lr", type=float, default=2e-4, help="优化器初始学习率"
     )
     parser.add_argument(
         "--lr_scheduler", type=str, default="constant_with_warmup",
@@ -91,10 +91,10 @@ def parse_args():
         "--epsilon", type=float, default=1e-07, help="AdamW 优化器的 epsilon 参数"
     )
     parser.add_argument(
-        "--max_grad_norm", default=1.0, type=float, help="最大梯度范数（用于梯度裁剪）"
+        "--max_grad_norm", default=5.0, type=float, help="最大梯度范数（用于梯度裁剪）"
     )
     parser.add_argument(
-        "--mixed_precision", type=str, default='fp16', choices=["no", "fp16", "bf16"],
+        "--mixed_precision", type=str, default='no', choices=["no", "fp16", "bf16"],
         help="是否使用混合精度训练。选择 'fp16' 或 'bf16' (需要 PyTorch >= 1.10)，或 'no' 关闭。"
     )
     parser.add_argument(
@@ -116,7 +116,7 @@ def parse_args():
         "--unet_layers_per_block", type=int, default=2, help="UNet 中每个块的 ResNet 层数"
     )
     parser.add_argument(
-        "--unet_block_channels", nargs='+', type=int, default=[64, 64, 128, 128, 256, 512], help="UNet 各层级的通道数"
+        "--unet_block_channels", nargs='+', type=int, default=[128, 128, 128, 256, 256, 512], help="UNet 各层级的通道数"
     )
     parser.add_argument(
         "--unet_down_block_types", nargs='+', type=str,
@@ -433,7 +433,7 @@ def main():
             # 确保 timesteps 是 LongTensor
             timesteps = torch.randint(
                 0, noise_scheduler.config["num_train_timesteps"], (bsz,), device=clean_images.device
-            ).long()
+            ).int()
 
             # 根据噪声和时间步将噪声添加到干净图像中，得到噪声图像
             # Revert to .long() for timesteps as it's generally accepted
