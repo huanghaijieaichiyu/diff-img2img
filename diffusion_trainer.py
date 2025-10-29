@@ -13,7 +13,8 @@ from torch.utils.data import DataLoader
 
 import diffusers
 # Import ConfigMixin for type hinting
-from diffusers.models.unets.unet_2d import UNet2DModel
+from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel
+import torch.nn as nn
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 # 引入 DDPMSchedulerOutput 用于类型提示
 from diffusers.schedulers.scheduling_ddpm import DDPMSchedulerOutput
@@ -29,6 +30,7 @@ from torchvision import transforms
 from torcheval.metrics.functional import peak_signal_noise_ratio
 
 from utils.misic import ssim, save_path
+from models.common import ImageEncoder
 from datasets.data_set import LowLightDataset  # 假设数据集类可用
 import lpips
 
@@ -116,7 +118,7 @@ def parse_args():
         "--unet_layers_per_block", type=int, default=2, help="UNet 中每个块的 ResNet 层数"
     )
     parser.add_argument(
-        "--unet_block_channels", nargs='+', type=int, default=[128, 128, 128, 256, 256, 512], help="UNet 各层级的通道数"
+        "--unet_block_channels", nargs='+', type=int, default=[64, 64, 64, 128, 128, 256], help="UNet 各层级的通道数"
     )
     parser.add_argument(
         "--unet_down_block_types", nargs='+', type=str,
@@ -232,19 +234,33 @@ def main():
         logger.info(f"Overwriting output directory {args.output_dir}")
 
     # 初始化模型 - 使用解析后的参数
-    logger.info("Initializing UNet model...")
+    # 使用条件 UNet（支持 cross-attention）并用简单编码器将 low_light_images 投影为 encoder_hidden_states
+    logger.info("Initializing conditional UNet model + image encoder...")
     logger.info(f"  Layers per block: {args.unet_layers_per_block}")
     logger.info(f"  Block channels: {args.unet_block_channels}")
     logger.info(f"  Down blocks: {args.unet_down_block_types}")
     logger.info(f"  Up blocks: {args.unet_up_block_types}")
-    model = UNet2DModel(
+
+    # cross_attention_dim 与 ImageEncoder.out_dim 保持一致
+    cross_attention_dim = 320
+    image_encoder = ImageEncoder(
+        out_dim=cross_attention_dim, proj_size=(4, 4), in_channels=3)
+
+    # 如果用户传入了使用老的 AttnDownBlock2D 的配置，将其替换为 CrossAttnDownBlock2D
+    safe_down_block_types = [
+        ("CrossAttnDownBlock2D" if t == "AttnDownBlock2D" else t)
+        for t in args.unet_down_block_types
+    ]
+
+    model = UNet2DConditionModel(
         sample_size=args.resolution,
-        in_channels=6,  # 修改这里: 3 (noisy) + 3 (condition)
-        out_channels=3,  # 预测噪声还是 3 通道
+        in_channels=3,  # 只传入 noisy image，condition 通过 encoder_hidden_states 传递
+        out_channels=3,
         layers_per_block=args.unet_layers_per_block,
         block_out_channels=args.unet_block_channels,
-        down_block_types=args.unet_down_block_types,
-        up_block_types=args.unet_up_block_types,
+        down_block_types=tuple(safe_down_block_types),
+        up_block_types=tuple(args.unet_up_block_types),
+        cross_attention_dim=cross_attention_dim,
     )
 
     model.enable_xformers_memory_efficient_attention()
@@ -252,6 +268,7 @@ def main():
 
     if args.gradient_checkpointing:
         model.enable_gradient_checkpointing()
+        image_encoder.train()  # encoder 也支持梯度检查点（保持默认训练模式）
 
     # 初始化噪声调度器
     # DDPM 常用 1000 步, 尝试不同的 schedule
@@ -312,8 +329,10 @@ def main():
 
     # 使用 Accelerate 准备
     # 注意 noise_scheduler 不需要 prepare
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler  # 添加 eval_dataloader
+    # 将 image_encoder 一并准备
+    model, image_encoder, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        # 添加 eval_dataloader
+        model, image_encoder, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
 
     # 初始化追踪器 (tensorboard)
@@ -442,12 +461,13 @@ def main():
             )
 
             with accelerator.accumulate(model):
-                # 准备模型输入：拼接噪声图像和条件图像
-                model_input = torch.cat(
-                    [noisy_images, low_light_images], dim=1)
+                # 准备模型输入：使用 noisy_images 作为 sample，low_light_images 通过 encoder 作为 encoder_hidden_states
+                model_input = noisy_images
+                encoder_hidden_states = image_encoder(low_light_images)
 
-                # 预测噪声残差
-                noise_pred = model(model_input, timesteps).sample
+                # 预测噪声残差（使用 cross-attention）
+                noise_pred = model(
+                    model_input, timesteps, encoder_hidden_states=encoder_hidden_states).sample
 
                 # 1. 计算 MSE 损失 (预测噪声和实际添加噪声之间的 MSE)
                 loss_mse = F.mse_loss(noise_pred.float(),
@@ -553,6 +573,14 @@ def main():
                                 f"Running validation at step {global_step} (Epoch {epoch+1})...")
                             unet = accelerator.unwrap_model(model)  # 获取原始模型
                             unet.eval()  # 设置为评估模式
+                            # 同时 unwrap 出 image encoder 用于生成 encoder_hidden_states
+                            try:
+                                unet_encoder = accelerator.unwrap_model(
+                                    image_encoder)
+                                unet_encoder.eval()
+                            except Exception:
+                                # 如果 unwrap 失败（例如 encoder 未被包装），直接使用 image_encoder
+                                unet_encoder = image_encoder
 
                             # 获取未包装的 scheduler config
                             # noise_scheduler 是 accelerate prepare 之前的原始对象
@@ -587,15 +615,16 @@ def main():
                                 timesteps_to_iterate = sampling_scheduler.timesteps
                                 for t in tqdm(timesteps_to_iterate, leave=False, desc="Sampling", position=2):
                                     with torch.no_grad():
-                                        # 准备模型输入: [b, 6, H, W]
-                                        # latents 可能需要扩展以匹配模型预期（如果需要）
-                                        model_input = torch.cat(
-                                            [latents, low_light_images], dim=1)
+                                        # 准备模型输入: 使用 latents 作为 sample，low_light_images 作为 encoder_hidden_states
+                                        model_input = latents
                                         # timestep 需要是 LongTensor
                                         timestep_tensor = torch.tensor(
                                             [t] * batch_size, device=accelerator.device).long()
+                                        encoder_hidden_states = unet_encoder(
+                                            low_light_images)
                                         noise_pred = unet(
-                                            model_input, timestep_tensor).sample
+                                            model_input, timestep_tensor, encoder_hidden_states=encoder_hidden_states
+                                        ).sample
                                         # 使用调度器计算上一步的样本
                                         # scheduler.step 需要 int timestep
                                         # 将 t 转换为 int
@@ -792,6 +821,17 @@ def main():
         save_path_final = os.path.join(args.output_dir, "unet_final")
         unet.save_pretrained(save_path_final)
         logger.info(f"最终模型已保存到 {save_path_final}")
+        # 同时保存 image encoder 的权重
+        try:
+            encoder_to_save = accelerator.unwrap_model(image_encoder)
+        except Exception:
+            encoder_to_save = image_encoder
+        encoder_path = os.path.join(save_path_final, "image_encoder.pth")
+        try:
+            torch.save(encoder_to_save.state_dict(), encoder_path)
+            logger.info(f"Image encoder 权重已保存到 {encoder_path}")
+        except Exception as e:
+            logger.warning(f"保存 image encoder 失败: {e}")
 
 
 if __name__ == "__main__":

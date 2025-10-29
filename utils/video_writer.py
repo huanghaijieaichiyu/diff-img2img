@@ -44,7 +44,7 @@ def video_writer(image_path, video_path):
         height, width, _ = image.shape  # 获取高宽
 
         # 创建视频写入器
-        video = cv2.VideoWriter(video_path, fourcc, 30,
+        video = cv2.VideoWriter(video_path, fourcc, 10,
                                 (width, height))  # 使用获取的宽高
         if not video.isOpened():
             print(f"错误：无法在 {video_path} 创建视频写入器。")
@@ -74,8 +74,8 @@ def video_writer(image_path, video_path):
 
 
 if __name__ == '__main__':
-    image_path = '/mnt/f/datasets/test_video'
-    video_path = '/mnt/f/datasets/test_video.mp4'
+    image_path = '/home/huang/BEVFormer/runs/visual/combined'
+    video_path = '/home/huang/BEVFormer/runs/visual/combined.mp4'
     print(f'image_path: {image_path}')
     print(f'video_path: {video_path}')
     video_writer(image_path, video_path)

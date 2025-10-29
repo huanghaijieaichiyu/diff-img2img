@@ -438,7 +438,7 @@ def parse_predict_args():
 
     if not os.path.exists(model_bin_path) and not os.path.exists(model_safetensors_path):
         parser.error(
-            f"在 '{args.model_path}' 目录下未找到 'diffusion_pytorch_model.bin' 或 'diffusion_pytorch_model.safetensors'。")
+            f"在 '{args.model_path}' 目录下未找到 'diffusion_pytorch_model.bin' 或 'model.safetensors'。")
     if not os.path.exists(config_path):
         parser.error(f"在 '{args.model_path}' 目录下未找到 'config.json'。")
 
@@ -451,11 +451,36 @@ if __name__ == "__main__":
     # 根据模式选择并运行相应的预测器
     if args.mode == 'image':
         # 检查 LowLightDataset 是否有效加载且不是占位符
-        is_placeholder = 'LowLightDataset' in globals() and \
-                         issubclass(globals()['LowLightDataset'], Dataset) and \
-                         len(globals()['LowLightDataset']()) == 0  # 检查占位符的特征
+        # Revised logic to check for LowLightDataset and avoid placeholder issues
+        can_proceed_with_image_prediction = False
+        lowlight_dataset_cls = globals().get('LowLightDataset')
 
-        if 'LowLightDataset' in globals() and not is_placeholder:
+        if lowlight_dataset_cls and issubclass(lowlight_dataset_cls, Dataset):
+            # LowLightDataset is defined and is a subclass of Dataset.
+            # Now, check if it's a placeholder (instantiable with no args, len 0).
+            is_placeholder_behavior = False
+            try:
+                instance = lowlight_dataset_cls()  # Attempt to instantiate without arguments
+
+                # Check if the instance has length 0, robustly handling non-Sized objects
+                actual_len = -1  # Initialize to a value indicating length not found or not 0
+                try:
+                    actual_len = len(instance)
+                except TypeError:
+                    # This instance does not support len(), so it doesn't match placeholder criteria.
+                    pass  # actual_len remains -1, is_placeholder_behavior remains False
+
+                if actual_len == 0:
+                    is_placeholder_behavior = True  # Matches placeholder criteria
+            except TypeError:  # This outer except is for lowlight_dataset_cls() failing
+                # Failed to instantiate with no args (e.g., real dataset needs args).
+                # This means it's NOT exhibiting placeholder behavior.
+                pass  # is_placeholder_behavior remains False
+
+            if not is_placeholder_behavior:
+                can_proceed_with_image_prediction = True
+
+        if can_proceed_with_image_prediction:
             try:
                 predictor = ImageDiffusionPredictor(args)
                 predictor.predict_images()

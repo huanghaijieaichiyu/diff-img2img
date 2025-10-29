@@ -4,13 +4,30 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from timm.models.layers import DropPath
+from timm.layers.drop import DropPath
 
 __init__ = ['calc_same_pad', 'Conv2dSame', 'Mlp', 'DilateAttention', 'MultiDilatelocalAttention', 'DilateBlock',
             'Conv', 'C3_DilateBlock', 'AConv', 'ADown', 'RepConvN', 'SP', 'MP', 'ConvTranspose', 'DWConv',
             'DWConvTranspose2d', 'DFL', 'BottleneckBase', 'RBottleneckBase', 'RepNRBottleneckBase', 'Bottleneck',
             'RepNBottleneck', 'Res', 'RepNRes', 'BottleneckCSP', 'CSP', 'RepNCSP', 'RepNBottleneckCSP', 'RepNCSP',
             'C2f', 'C3', 'Disconv', 'Genconv']
+
+
+# 简单图像编码器：将条件图像降采样并投影为 cross-attention 的 encoder_hidden_states
+class ImageEncoder(nn.Module):
+    def __init__(self, out_dim=1280, proj_size=(16, 16), in_channels=3):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(proj_size)
+        # 1x1 conv 将通道投影到 cross_attention_dim
+        self.proj = nn.Conv2d(in_channels, out_dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, H, W] -> pool -> [B, C, Hp, Wp] -> proj -> [B, D, Hp, Wp]
+        x = self.pool(x)
+        x = self.proj(x)
+        b, d, hp, wp = x.shape
+        x = x.reshape(b, d, hp * wp).permute(0, 2, 1)  # [B, seq_len, D]
+        return x
 
 
 class Conv2dSame(torch.nn.Conv2d):
