@@ -1,31 +1,27 @@
-'''
-数据集类，用于加载LOL数据集。
-
-'''
-
-
 import numpy as np
 import os
+import random
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image  # 导入 PIL Image
+import torchvision.transforms.functional as TF  # 关键引用：用于函数式变换
+from PIL import Image
 
 
 class LowLightDataset(Dataset):
-    def __init__(self, image_dir, transform=None, phase="train"):
+    def __init__(self, image_dir, img_size=256, phase="train"):
         """
         Args:
-            image_dir (string): 包含LOLdataset的目录。
-            transform (callable, optional): 可选的图像转换。
-            phase (string, optional):  指定数据集的用途，可以是 "train" 或 "test"。
-                                        "train" 加载 our485, "test" 加载 eval15.
+            image_dir (string): 数据集根目录。
+            img_size (int): 训练/测试时的图像分辨率。
+            phase (string): "train" 或 "test"。
         """
         self.image_dir = image_dir
-        self.transform = transform
-        self.phase = phase  # 指定数据集的用途
+        self.img_size = img_size
+        self.phase = phase
 
-        self.data = []  # 存储图像对的列表 (low_img_path, high_img_path)
+        self.data = []
 
+        # === 1. 构建文件列表 (保持原逻辑不变) ===
         if phase == "train":
             subset = "our485"
         elif phase == "test":
@@ -34,115 +30,101 @@ class LowLightDataset(Dataset):
             raise ValueError("phase must be 'train' or 'test'")
 
         if subset == "eval15":
-            eval15_dir = os.path.join(image_dir, "eval15")
-            if os.path.exists(eval15_dir):  # 检查目录是否存在
-                eval15_high_dir = os.path.join(eval15_dir, "high")
-                eval15_low_dir = os.path.join(eval15_dir, "low")
-                eval15_image_names = [f for f in os.listdir(
-                    eval15_high_dir) if any(
-                    f.endswith(ext) for ext in [".png", ".jpg", ".jpeg"])]  # 兼容多种图片格式
-                eval15_image_names.sort()
-                for img_name in eval15_image_names:
-                    low_img_path = os.path.join(eval15_low_dir, img_name)
-                    high_img_path = os.path.join(eval15_high_dir, img_name)
-                    self.data.append((low_img_path, high_img_path))
-
+            subset_dir = os.path.join(image_dir, "eval15")
         elif subset == "our485":
-            our485_dir = os.path.join(image_dir, "our485")
-            if os.path.exists(our485_dir):  # 检查目录是否存在
-                our485_high_dir = os.path.join(our485_dir, "high")
-                our485_low_dir = os.path.join(our485_dir, "low")
-                our485_image_names = [f for f in os.listdir(our485_high_dir) if any(
-                    f.endswith(ext) for ext in [".png", ".jpg", ".jpeg"])]  # 兼容多种图片格式
-                our485_image_names.sort()
-                for img_name in our485_image_names:
-                    low_img_path = os.path.join(our485_low_dir, img_name)
-                    high_img_path = os.path.join(our485_high_dir, img_name)
-                    self.data.append((low_img_path, high_img_path))
+            subset_dir = os.path.join(image_dir, "our485")
+
+        if os.path.exists(subset_dir):
+            high_dir = os.path.join(subset_dir, "high")
+            low_dir = os.path.join(subset_dir, "low")
+            # 过滤图片文件
+            image_names = [f for f in os.listdir(high_dir)
+                           if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+            image_names.sort()
+
+            for img_name in image_names:
+                low_path = os.path.join(low_dir, img_name)
+                high_path = os.path.join(high_dir, img_name)
+                # 简单检查低光文件是否存在
+                if os.path.exists(low_path):
+                    self.data.append((low_path, high_path))
+        else:
+            print(f"警告: 目录 {subset_dir} 不存在，数据集为空。")
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        """
-        Args:
-            idx (int): 索引。
-
-        Returns:
-            tuple: (低光照图像, 正常光照图像)。
-        """
         low_img_path, high_img_path = self.data[idx]
-        if os.path.exists(low_img_path):
-            # 使用 PIL 读取图像，确保是 RGB
-            low_img = Image.open(low_img_path).convert("RGB")
-        else:
-            raise FileNotFoundError(f"低光图像文件不存在: {low_img_path}")
 
-        # 使用 PIL 读取图像，确保是 RGB
+        # === 2. 加载图像 ===
+        # 必须确保转换为 RGB
+        low_img = Image.open(low_img_path).convert("RGB")
         high_img = Image.open(high_img_path).convert("RGB")
 
-        if self.transform:
-            low_img = self.transform(low_img)
-            high_img = self.transform(high_img)
+        # === 3. 同步数据增强 (关键修改) ===
+        if self.phase == "train":
+            # A. 随机裁剪 (Random Crop)
+            # 获取随机裁剪参数
+            i, j, h, w = transforms.RandomCrop.get_params(
+                low_img, output_size=(self.img_size, self.img_size))
+
+            # 对两张图应用【完全相同】的裁剪参数
+            low_img = TF.crop(low_img, i, j, h, w)
+            high_img = TF.crop(high_img, i, j, h, w)
+
+            # B. 随机水平翻转 (Random Horizontal Flip)
+            if random.random() > 0.5:
+                low_img = TF.hflip(low_img)
+                high_img = TF.hflip(high_img)
+
+        else:
+            # 测试/验证阶段：统一 Resize 或 CenterCrop，不做随机操作
+            low_img = TF.resize(low_img, (self.img_size, self.img_size))
+            high_img = TF.resize(high_img, (self.img_size, self.img_size))
+
+        # === 4. 转为 Tensor 并归一化 ===
+        low_img = TF.to_tensor(low_img)
+        high_img = TF.to_tensor(high_img)
+
+        # 归一化到 [-1, 1] (Diffusion 模型标准)
+        low_img = TF.normalize(low_img, [0.5], [0.5])
+        high_img = TF.normalize(high_img, [0.5], [0.5])
 
         return low_img, high_img
 
 
-# 示例用法:
+# 示例用法
 if __name__ == '__main__':
-    # 1. 设置数据集目录
-    data_dir = "../datasets/kitti_LOL"  # 替换成你的数据集路径
+    # 替换成你的真实路径
+    data_dir = "../datasets/kitti_LOL"
 
-    # 2. 定义图像转换
-    transform = transforms.Compose([
-        transforms.ToPILImage(),  # 先转换为PIL Image, 因为一些transform需要PIL Image作为输入
-        transforms.Resize((256, 256)),  # 可选：调整大小
-        transforms.ToTensor(),          # 转换为Tensor
-        # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) # 可选：归一化
-    ])
+    # 只需要传入 img_size，内部会自动处理同步变换
+    try:
+        train_dataset = LowLightDataset(
+            image_dir=data_dir, img_size=256, phase="train")
 
-    # 3. 创建数据集实例
-    # 创建训练数据集
-    train_dataset = LowLightDataset(
-        image_dir=data_dir, transform=transform, phase="train")
+        # 检查是否加载成功
+        if len(train_dataset) > 0:
+            train_loader = DataLoader(
+                train_dataset, batch_size=2, shuffle=True)
 
-    # 创建测试/评估数据集
-    test_dataset = LowLightDataset(
-        image_dir=data_dir, transform=transform, phase="test")
+            print("检查第一个 Batch 的数据对齐情况...")
+            for low, high in train_loader:
+                print(
+                    f"Low shape: {low.shape}, Range: [{low.min():.2f}, {low.max():.2f}]")
+                print(
+                    f"High shape: {high.shape}, Range: [{high.min():.2f}, {high.max():.2f}]")
 
-    # 4. 创建 DataLoader
-    batch_size = 4
-    train_dataloader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    test_dataloader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)  # 测试时通常不需要shuffle
+                # 简单的肉眼验证：保存下来看看裁剪是否一致
+                transforms.ToPILImage()(
+                    low[0]/2+0.5).save("debug_crop_low.png")
+                transforms.ToPILImage()(
+                    high[0]/2+0.5).save("debug_crop_high.png")
+                print("已保存 debug_crop_low.png 和 debug_crop_high.png，请手动检查内容是否对应。")
+                break
+        else:
+            print(f"在 {data_dir} 未找到数据。")
 
-    # 5. 迭代训练数据
-    print("Training data:")
-    for i, (low_images, high_images) in enumerate(train_dataloader):
-        print(f"Batch {i+1}")
-        print("Low images shape:", low_images.shape)
-        print("High images shape:", high_images.shape)
-
-        # 在这里进行你的模型训练
-        # 例如:
-        # outputs = model(low_images)
-        # loss = criterion(outputs, high_images)
-
-        if i == 2:  # 只迭代几个批次，方便演示
-            break
-
-    # 6. 迭代测试数据
-    print("\nTesting data:")
-    for i, (low_images, high_images) in enumerate(test_dataloader):
-        print(f"Batch {i+1}")
-        print("Low images shape:", low_images.shape)
-        print("High images shape:", high_images.shape)
-
-        # 在这里进行你的模型测试/评估
-        # 例如:
-        # outputs = model(low_images)
-        # psnr = calculate_psnr(outputs, high_images)
-
-        if i == 2:  # 只迭代几个批次，方便演示
-            break
+    except Exception as e:
+        print(f"发生错误: {e}")

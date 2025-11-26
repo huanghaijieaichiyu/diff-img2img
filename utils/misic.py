@@ -207,7 +207,7 @@ def ssim(img1, img2, window_size=11, size_average=True):
     return _ssim(img1, img2, window, window_size, channel, size_average)
 
 
-def save_path(path: str, model: str = 'train') -> str:
+def Save_path(path: str, model: str = 'train') -> str:
     """
     Generates a unique file path for saving models, incrementing a counter
     if the path already exists. The directory is not created by this function.
