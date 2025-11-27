@@ -480,7 +480,7 @@ def main():
                 model_input = torch.cat(
                     [noisy_images, low_light_images], dim=1)
 
-                # 预测 (注意：encoder_hidden_states=None，因为我们用了 concat)
+                # 预测
                 model_output = model(model_input, timesteps).sample
 
                 # 确定 Target (Epsilon 或 V-Prediction)
