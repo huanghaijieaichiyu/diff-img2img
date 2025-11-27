@@ -6,7 +6,7 @@ import glob
 from tqdm import tqdm
 
 
-def video_writer(image_path, video_path):
+def video_writer(image_path, video_path, fps=30):
     # 支持的图片扩展名列表
     supported_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tiff']
     image_paths = []
@@ -44,7 +44,8 @@ def video_writer(image_path, video_path):
         height, width, _ = image.shape  # 获取高宽
 
         # 创建视频写入器
-        video = cv2.VideoWriter(video_path, fourcc, 10,
+        print(f"Creating video with {fps} FPS")
+        video = cv2.VideoWriter(video_path, fourcc, fps,
                                 (width, height))  # 使用获取的宽高
         if not video.isOpened():
             print(f"错误：无法在 {video_path} 创建视频写入器。")

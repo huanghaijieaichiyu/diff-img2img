@@ -140,10 +140,10 @@ datasets/
         --data_dir ../datasets/kitti_LOL \
         --output_dir diffusion_output_lol \
         --resolution 256 \
-        --train_batch_size 4 \
-        --num_train_epochs 300 \
+        --batch_size 4 \
+        --epochs 300 \
         --gradient_accumulation_steps 1 \
-        --learning_rate 1e-4 \
+        --lr 1e-4 \
         --lr_scheduler cosine \
         --lr_warmup_steps 500 \
         --mixed_precision fp16 \
@@ -151,8 +151,8 @@ datasets/
         --validation_epochs 10 \
         --seed 42
         # --enable_xformers_memory_efficient_attention # 如果安装了 xformers 可以启用
-        # --resum latest # 从最新的检查点恢复
-        # --lightweight_unet # 使用轻量级UNet进行快速测试
+        # --resume latest # 从最新的检查点恢复
+        # --prediction_type v_prediction # 如果需要改变预测目标
     ```
 
     **多 GPU 训练:**
@@ -203,11 +203,11 @@ python diffusion_predictor.py \
     --video_path /path/to/your/input_video.mp4 \
     --output_dir diffusion_video_prediction_output \
     --resolution 256 \
-    --num_inference_steps 50 \
-    --save_output_video \
-    --save_frame_interval 100 \
-    --device cuda
+    --num_inference_steps 20 \
+    --device cuda \
+    --prediction_type epsilon
     # --display_video # 可选，实时显示处理结果
+    # --use_ddpm # 可选，使用 DDPM 调度器（较慢）
 ```
 
 ### 预测参数说明
@@ -217,13 +217,13 @@ python diffusion_predictor.py \
 - `--output_dir`: 保存预测结果的根目录。
 - `--device`: 使用设备 (`cuda` 或 `cpu`)。
 - `--resolution`: 模型输入/输出分辨率 (应与训练时一致)。
-- `--num_inference_steps`: 扩散采样步数。
+- `--num_inference_steps`: 扩散采样步数 (默认 20，使用 DPM-Solver)。
+- `--prediction_type`: **重要**，必须与训练时的预测类型一致 (`epsilon` 或 `v_prediction`)。
 - `--data_dir` (图像模式): 输入图像数据集的路径。
 - `--eval_batch_size` (图像模式): 图像预测批次大小。
 - `--video_path` (视频模式): 输入视频文件的路径。
-- `--save_output_video` (视频模式): 是否保存增强后的视频。
-- `--save_frame_interval` (视频模式): 每隔 N 帧保存一次 PNG 图像。
 - `--display_video` (视频模式): 是否实时显示处理中的视频帧。
+- `--use_ddpm`: 是否强制使用 DDPM 调度器 (更慢但可能是标准参考)。
 
 ## 模型评估
 

@@ -136,23 +136,23 @@ Use the `diffusion_trainer.py` script for training.
     **Single GPU Training:**
 
     ```bash
-    accelerate launch diffusion_trainer.py \\
-        --data_dir ../datasets/kitti_LOL \\
-        --output_dir diffusion_output_lol \\
-        --resolution 256 \\
-        --train_batch_size 4 \\
-        --num_train_epochs 300 \\
-        --gradient_accumulation_steps 1 \\
-        --learning_rate 1e-4 \\
-        --lr_scheduler cosine \\
-        --lr_warmup_steps 500 \\
-        --mixed_precision fp16 \\
-        --checkpointing_steps 5000 \\
-        --validation_epochs 10 \\
+    accelerate launch diffusion_trainer.py \
+        --data_dir ../datasets/kitti_LOL \
+        --output_dir diffusion_output_lol \
+        --resolution 256 \
+        --batch_size 4 \
+        --epochs 300 \
+        --gradient_accumulation_steps 1 \
+        --lr 1e-4 \
+        --lr_scheduler cosine \
+        --lr_warmup_steps 500 \
+        --mixed_precision fp16 \
+        --checkpointing_steps 5000 \
+        --validation_epochs 10 \
         --seed 42
         # --enable_xformers_memory_efficient_attention # Enable if xformers is installed
-        # --resum latest # Resume from the latest checkpoint
-        # --lightweight_unet # Use a lightweight UNet for quick testing
+        # --resume latest # Resume from the latest checkpoint
+        # --prediction_type v_prediction # If you want to change the prediction target
     ```
 
     **Multi-GPU Training:**
@@ -197,17 +197,17 @@ python diffusion_predictor.py \\
 #### Single Video Prediction
 
 ```bash
-python diffusion_predictor.py \\
-    --mode video \\
-    --model_path diffusion_output_lol/unet_final \\
-    --video_path /path/to/your/input_video.mp4 \\
-    --output_dir diffusion_video_prediction_output \\
-    --resolution 256 \\
-    --num_inference_steps 50 \\
-    --save_output_video \\
-    --save_frame_interval 100 \\
-    --device cuda
+python diffusion_predictor.py \
+    --mode video \
+    --model_path diffusion_output_lol/unet_final \
+    --video_path /path/to/your/input_video.mp4 \
+    --output_dir diffusion_video_prediction_output \
+    --resolution 256 \
+    --num_inference_steps 20 \
+    --device cuda \
+    --prediction_type epsilon
     # --display_video # Optional: Display processing results in real-time
+    # --use_ddpm # Optional: Use DDPM scheduler (slower)
 ```
 
 ### Prediction Parameter Explanation
@@ -217,13 +217,13 @@ python diffusion_predictor.py \\
 - `--output_dir`: Root directory to save prediction results.
 - `--device`: Device to use (`cuda` or `cpu`).
 - `--resolution`: Model input/output resolution (should match training).
-- `--num_inference_steps`: Number of diffusion sampling steps.
+- `--num_inference_steps`: Number of diffusion sampling steps (default 20, uses DPM-Solver).
+- `--prediction_type`: **Important**, must match the training prediction type (`epsilon` or `v_prediction`).
 - `--data_dir` (image mode): Path to the input image dataset.
 - `--eval_batch_size` (image mode): Batch size for image prediction.
 - `--video_path` (video mode): Path to the input video file.
-- `--save_output_video` (video mode): Whether to save the enhanced video.
-- `--save_frame_interval` (video mode): Save an enhanced PNG image every N frames.
 - `--display_video` (video mode): Whether to display the video frames being processed in real-time.
+- `--use_ddpm`: Whether to force use of DDPM scheduler (slower, but maybe used as reference).
 
 ## Model Evaluation
 

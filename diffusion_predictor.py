@@ -280,13 +280,7 @@ class VideoDiffusionPredictor(BaseDiffusionPredictor):
             video_output_path = os.path.join(
                 self.output_path, "enhanced_video.mp4")
             print("Synthesizing video...")
-            try:
-                # 假设 video_writer 接受 (input_dir, output_path, fps)
-                # 这里为了兼容性，如果你的 video_writer 签名不同，请相应调整
-                video_writer(frames_output_dir, video_output_path, fps=fps)
-            except TypeError:
-                # Fallback if video_writer doesn't take fps
-                video_writer(frames_output_dir, video_output_path)
+            video_writer(frames_output_dir, video_output_path, fps=fps)
             print(f"Done: {video_output_path}")
 
 
