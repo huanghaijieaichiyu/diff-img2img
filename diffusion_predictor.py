@@ -20,7 +20,7 @@ from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultist
 
 from datasets.data_set import LowLightDataset
 from utils.video_writer import video_writer
-
+from models.retinex import DecomNet
 
 def save_output_path(base_path, model_type='predict'):
     """创建一个带有时间戳的唯一输出目录"""
@@ -51,6 +51,25 @@ class BaseDiffusionPredictor:
         except Exception as e:
             print(f"加载模型时出错: {e}")
             raise
+            
+        # === Load DecomNet if Retinex mode ===
+        self.decom_model = None
+        if args.use_retinex:
+            try:
+                decom_path = os.path.join(args.model_path, "decom_model.pth")
+                if not os.path.exists(decom_path):
+                    # 尝试在上级目录找 (针对 checkpoints 结构)
+                    decom_path = os.path.join(os.path.dirname(args.model_path), "decom_model.pth")
+                
+                if os.path.exists(decom_path):
+                    self.decom_model = DecomNet().to(self.device)
+                    self.decom_model.load_state_dict(torch.load(decom_path, map_location=self.device))
+                    self.decom_model.eval()
+                    print(f"成功加载 DecomNet: {decom_path}")
+                else:
+                    print(f"警告: 启用了 --use_retinex 但未找到 decom_model.pth。路径: {decom_path}")
+            except Exception as e:
+                print(f"加载 DecomNet 出错: {e}")
 
         # === 2. 初始化调度器 (Scheduler) ===
         # 为了加快推理速度，默认使用 DPMSolverMultistepScheduler (20-50步)
@@ -111,10 +130,18 @@ class BaseDiffusionPredictor:
 
             with torch.no_grad():
                 # [关键逻辑] Concat Conditioning
-                # 将 噪声Latent(3通道) 和 低光照条件图(3通道) 在维度1拼接 -> 6通道
-                # 这与训练时的 model_input = torch.cat([noisy_images, low_light_images], dim=1) 对应
-                model_input = torch.cat(
-                    [latent_model_input, low_light_condition_batch], dim=1)
+                if self.decom_model is not None:
+                    # Retinex Mode: Input = Noisy(3) + R(3) + I(1) = 7
+                    low_light_01 = (low_light_condition_batch / 2 + 0.5).clamp(0, 1)
+                    r_low, i_low = self.decom_model(low_light_01)
+                    r_low_norm = r_low * 2.0 - 1.0
+                    i_low_norm = i_low * 2.0 - 1.0
+                    model_input = torch.cat(
+                        [latent_model_input, r_low_norm, i_low_norm], dim=1)
+                else:
+                    # Standard Mode: Input = Noisy(3) + LowLight(3) = 6
+                    model_input = torch.cat(
+                        [latent_model_input, low_light_condition_batch], dim=1)
 
                 # 预测噪声/速度
                 # UNet2DModel 不需要 encoder_hidden_states
@@ -307,6 +334,9 @@ def parse_predict_args():
     # 可选：强制使用 DDPM
     parser.add_argument("--use_ddpm", action="store_true",
                         help="Force use DDPMScheduler (slow)")
+    
+    parser.add_argument("--use_retinex", action="store_true",
+                        help="Use Retinex Decomposition (Must match training)")
 
     parser.add_argument("--data_dir", type=str,
                         default="../datasets/kitti_LOL")

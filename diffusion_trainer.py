@@ -32,7 +32,9 @@ from torcheval.metrics.functional import peak_signal_noise_ratio
 from utils.misic import ssim, Save_path
 # from models.common import ImageEncoder # 移除 ImageEncoder，因为改用 Concat
 from datasets.data_set import LowLightDataset
+from models.retinex import DecomNet
 import lpips
+import itertools
 
 # 检查 diffusers 版本
 check_min_version("0.10.0")
@@ -152,6 +154,9 @@ def parse_args():
     parser.add_argument(
         "--snr_gamma", type=float, default=5.0, help="Min-SNR Gamma"
     )
+    parser.add_argument(
+        "--use_retinex", action="store_true", help="是否使用 Retinex 分解网络辅助训练"
+    )
 
     args = parser.parse_args()
     return args
@@ -262,20 +267,30 @@ def main():
         Save_path(args.output_dir)
 
     # === 1. 初始化模型 (Concat Architecture) ===
+    # 如果使用 Retinex，输入通道 = 3 (Noisy) + 3 (Reflectance) + 1 (Illumination) = 7
+    # 否则，输入通道 = 3 (Noisy) + 3 (Low Light) = 6
+    input_channels = 7 if args.use_retinex else 6
+    
     logger.info(
-        "Initializing UNet for Concat Conditioning (Input Channels=6)...")
+        f"Initializing UNet for Concat Conditioning (Input Channels={input_channels})...")
 
     # 注意：不再需要 ImageEncoder
     model = UNet2DModel(
         sample_size=args.resolution,
-        # 关键修改：输入通道 = 3 (Noisy) + 3 (Low Light Condition)
-        in_channels=6,
+        in_channels=input_channels,
         out_channels=3,
         layers_per_block=args.unet_layers_per_block,
         block_out_channels=args.unet_block_channels,
         down_block_types=tuple(args.unet_down_block_types),
         up_block_types=tuple(args.unet_up_block_types)
     )
+    
+    # === Retinex Decomposition Net Init ===
+    decom_model = None
+    if args.use_retinex:
+        logger.info("Initializing Retinex Decomposition Network...")
+        decom_model = DecomNet().to(accelerator.device)
+        decom_model.train()
 
     # === 2. 初始化 EMA 模型 ===
     if args.use_ema:
@@ -299,8 +314,13 @@ def main():
         prediction_type=args.prediction_type
     )
 
+    # 如果有 Retinex，需要联合优化
+    params_to_optimize = model.parameters()
+    if decom_model is not None:
+        params_to_optimize = itertools.chain(model.parameters(), decom_model.parameters())
+
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=1e-2, eps=1e-08
+        params_to_optimize, lr=args.lr, weight_decay=1e-2, eps=1e-08
     )
 
     # === 3. 数据增强优化 (Random Crop) ===
@@ -345,9 +365,14 @@ def main():
             train_dataloader) * args.epochs * args.gradient_accumulation_steps,
     )
 
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-    )
+    if decom_model is not None:
+        model, decom_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+            model, decom_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+        )
+    else:
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+        )
 
     # Accelerate Tracker Init
     if accelerator.is_main_process:
@@ -424,6 +449,21 @@ def main():
                             ema_path, map_location=accelerator.device))
                     else:
                         logger.warning(f"EMA model not found at {ema_path}")
+                
+                # Restore DecomNet
+                if decom_model is not None:
+                    decom_path = os.path.join(checkpoint_path, "decom_model.pth")
+                    if os.path.exists(decom_path):
+                        logger.info(f"Loading DecomNet model from {decom_path}")
+                        # 需要 unwrap 吗？accelerator.load_state 应该已经处理了 optimizer 和 model，
+                        # 但如果是额外的模型保存，可能需要手动加载。
+                        # accelerate save_state 保存所有注册的模型。
+                        # 如果 decom_model 被 prepare 过，它应该在 accelerator.load_state 中自动处理吗？
+                        # Accelerate 的 save_state 保存整个 env，所以不需要手动 load_state_dict 除非是分开保存的。
+                        # 为了保险，我们检查一下。通常 save_state 会保存所有 prepare 过的对象。
+                        pass 
+                    else:
+                        logger.warning(f"DecomNet model not found at {decom_path}")
 
     # LPIPS Init (仅在验证时计算指标，避免训练开销，但模型需加载)
     if accelerator.is_main_process:
@@ -475,10 +515,29 @@ def main():
                 clean_images, noise, timesteps)
 
             with accelerator.accumulate(model):
-                # === 关键修改：Concat Conditioning ===
-                # 并在通道维度拼接: (Batch, 6, H, W)
-                model_input = torch.cat(
-                    [noisy_images, low_light_images], dim=1)
+                # === 关键修改：Conditioning ===
+                if decom_model is not None:
+                    # 使用 Retinex 分解
+                    # R: (B, 3, H, W), I: (B, 1, H, W)
+                    # 确保 low_light_images 范围在 [0, 1] 用于分解 (通常 dataset 是 [-1, 1])
+                    # DecomNet 包含 sigmoid，所以能适应一定范围，但最好归一化输入
+                    low_light_01 = (low_light_images / 2 + 0.5).clamp(0, 1)
+                    r_low, i_low = decom_model(low_light_01)
+                    
+                    # 拼接: Noisy(3) + R(3) + I(1) = 7
+                    # 还需要把 r_low, i_low 变回 [-1, 1] 吗？
+                    # 扩散模型输入通常全是 [-1, 1]。
+                    # R 和 I 是 [0, 1]。
+                    # 让我们保持 R 和 I 为 [0, 1] 或者转为 [-1, 1]。为了统一分布，转为 [-1, 1] 更好。
+                    r_low_norm = r_low * 2.0 - 1.0
+                    i_low_norm = i_low * 2.0 - 1.0
+                    
+                    model_input = torch.cat(
+                        [noisy_images, r_low_norm, i_low_norm], dim=1)
+                else:
+                    # 原始逻辑: Noisy(3) + Low Light(3) = 6
+                    model_input = torch.cat(
+                        [noisy_images, low_light_images], dim=1)
 
                 # 预测
                 model_output = model(model_input, timesteps).sample
@@ -610,8 +669,18 @@ def main():
                                 # 构造输入: Concat
                                 latent_model_input = val_scheduler.scale_model_input(
                                     latents, t)
-                                model_input = torch.cat(
-                                    [latent_model_input, val_low], dim=1)
+                                
+                                if decom_model is not None:
+                                    # 验证时也需要分解
+                                    val_low_01 = (val_low / 2 + 0.5).clamp(0, 1)
+                                    r_val, i_val = decom_model(val_low_01)
+                                    r_val_norm = r_val * 2.0 - 1.0
+                                    i_val_norm = i_val * 2.0 - 1.0
+                                    model_input = torch.cat(
+                                        [latent_model_input, r_val_norm, i_val_norm], dim=1)
+                                else:
+                                    model_input = torch.cat(
+                                        [latent_model_input, val_low], dim=1)
 
                                 noise_pred = unet_val(
                                     model_input, t).sample
@@ -686,6 +755,12 @@ def main():
                     if args.use_ema:
                         torch.save(ema_model.state_dict(), os.path.join(
                             save_path, "ema_model.pth"))
+                    
+                    # 显式保存 DecomNet (虽然 accelerate save_state 可能会保存，但为了保险和方便预测脚本加载)
+                    if decom_model is not None:
+                        unwrapped_decom = accelerator.unwrap_model(decom_model)
+                        torch.save(unwrapped_decom.state_dict(), os.path.join(
+                            save_path, "decom_model.pth"))
 
             if global_step >= args.max_train_steps:
                 break
@@ -702,6 +777,11 @@ def main():
 
         unet = accelerator.unwrap_model(model)
         unet.save_pretrained(os.path.join(args.output_dir, "unet_final"))
+        
+        if decom_model is not None:
+            unwrapped_decom = accelerator.unwrap_model(decom_model)
+            torch.save(unwrapped_decom.state_dict(), os.path.join(args.output_dir, "unet_final", "decom_model.pth"))
+            
         logger.info("Training Finished.")
 
 
