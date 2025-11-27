@@ -107,28 +107,28 @@ def parse_args():
         "--unet_layers_per_block", type=int, default=2, help="ResNet layers per block"
     )
     parser.add_argument(
-        "--unet_block_channels", nargs='+', type=int, default=[64, 64, 128, 128, 256, 256],
+        "--unet_block_channels", nargs='+', type=int, default=[64, 128, 128, 256, 256, 512],
         help="UNet channels"
     )
-    # 移除了 CrossAttnDownBlock2D，因为我们不再使用 Cross-Attention 注入条件
+    # [改进] 引入 Attention Block 到深层，增强全局上下文建模能力
     parser.add_argument(
         "--unet_down_block_types", nargs='+', type=str,
         default=["DownBlock2D", "DownBlock2D", "DownBlock2D",
-                 "DownBlock2D", "DownBlock2D", "DownBlock2D"],
-        help="UNet Down Blocks (无 CrossAttn)"
+                 "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"],
+        help="UNet Down Blocks (深层使用 AttnDownBlock2D)"
     )
     parser.add_argument(
         "--unet_up_block_types", nargs='+', type=str,
-        default=["UpBlock2D", "UpBlock2D", "UpBlock2D",
+        default=["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D",
                  "UpBlock2D", "UpBlock2D", "UpBlock2D"],
-        help="UNet Up Blocks"
+        help="UNet Up Blocks (深层使用 AttnUpBlock2D)"
     )
     # ========================================
     parser.add_argument(
         "--num_inference_steps", type=int, default=20, help="验证时的采样步数 (使用 DPM-Solver 可以更少)"
     )
     parser.add_argument(
-        "--prediction_type", type=str, default="epsilon", choices=["epsilon", "v_prediction"],
+        "--prediction_type", type=str, default="v_prediction", choices=["epsilon", "v_prediction"],
         help="预测目标类型"
     )
     parser.add_argument(
@@ -138,7 +138,13 @@ def parse_args():
         "--validation_epochs", type=int, default=5, help="验证频率"
     )
     parser.add_argument(
-        "--lambda_lpips", type=float, default=0.1, help="LPIPS 权重"
+        "--lambda_lpips", type=float, default=0.1, help="LPIPS 权重 (仅用于验证指标)"
+    )
+    parser.add_argument(
+        "--lambda_fft", type=float, default=0.1, help="FFT 频域损失权重"
+    )
+    parser.add_argument(
+        "--lambda_edge", type=float, default=0.5, help="Sobel 边缘损失权重 (针对 BEV 结构保持)"
     )
     parser.add_argument(
         "--report_to", type=str, default="tensorboard", help="日志报告目标"
@@ -179,7 +185,7 @@ def compute_min_snr_loss_weights(noise_scheduler, timesteps, snr_gamma=5.0):
         raise ValueError(f"不支持的预测类型: {prediction_type}")
     return weights.detach()
 
-# === 辅助函数：Charbonnier Loss ===
+# === 辅助函数：Loss ===
 
 
 def charbonnier_loss_elementwise(pred, target, eps=1e-3):
@@ -188,6 +194,44 @@ def charbonnier_loss_elementwise(pred, target, eps=1e-3):
     公式: sqrt((x-y)^2 + eps^2)
     """
     return torch.sqrt((pred - target)**2 + eps**2)
+
+
+def fft_loss(pred, target):
+    """
+    计算频域损失 (FFT Loss)，用于强化边缘和高频细节恢复
+    """
+    pred_fft = torch.fft.rfft2(pred)
+    target_fft = torch.fft.rfft2(target)
+    return (pred_fft - target_fft).abs().mean()
+
+
+def sobel_loss(pred, target):
+    """
+    计算 Sobel 边缘损失，增强几何结构稳定性 (针对 BEV 任务优化)
+    """
+    # 定义 Sobel 算子 (保持 device 一致)
+    # shape: (out_channels, in_channels, kernel_size, kernel_size) -> (1, 1, 3, 3)
+    # 这里假设输入是 RGB (batch, 3, H, W)，我们对每个通道分别计算然后平均
+    device = pred.device
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                           dtype=pred.dtype, device=device).view(1, 1, 3, 3)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                           dtype=pred.dtype, device=device).view(1, 1, 3, 3)
+
+    # 为了适应 conv2d，reshape weight: output=3, input=1 (grouped conv)
+    sobel_x = sobel_x.repeat(3, 1, 1, 1)
+    sobel_y = sobel_y.repeat(3, 1, 1, 1)
+
+    pred_grad_x = F.conv2d(pred, sobel_x, padding=1, groups=3)
+    pred_grad_y = F.conv2d(pred, sobel_y, padding=1, groups=3)
+    pred_grad = torch.sqrt(pred_grad_x**2 + pred_grad_y**2 + 1e-6)
+
+    target_grad_x = F.conv2d(target, sobel_x, padding=1, groups=3)
+    target_grad_y = F.conv2d(target, sobel_y, padding=1, groups=3)
+    target_grad = torch.sqrt(target_grad_x**2 + target_grad_y**2 + 1e-6)
+
+    return F.l1_loss(pred_grad, target_grad)
+
 # ==============================
 
 
@@ -327,19 +371,68 @@ def main():
         args.epochs = math.ceil(args.max_train_steps /
                                 num_update_steps_per_epoch)
 
-    # Resume logic (simplified)
+    # Resume logic
     global_step = 0
     first_epoch = 0
-    if args.resume and args.resume != "latest":
-        # ... (Use existing resume logic)
-        pass
+    resume_step = 0
 
-    # LPIPS Init
+    if args.resume:
+        if args.resume == "latest":
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint-")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+        else:
+            path = os.path.basename(args.resume)
+
+        if path is None:
+            logger.info(
+                f"Checkpoint '{args.resume}' not found. Starting a new training run."
+            )
+            args.resume = None
+        else:
+            # The checkpoint path expected by accelerator.load_state is the folder path
+            if os.path.isabs(args.resume) and args.resume != "latest":
+                checkpoint_path = args.resume
+            else:
+                checkpoint_path = os.path.join(args.output_dir, path)
+
+            if not os.path.exists(checkpoint_path):
+                logger.info(
+                    f"Checkpoint '{checkpoint_path}' does not exist. Starting a new training run.")
+                args.resume = None
+            else:
+                logger.info(f"Resuming from checkpoint {checkpoint_path}")
+                accelerator.load_state(checkpoint_path)
+
+                # Restore global_step
+                try:
+                    global_step = int(path.split("-")[-1])
+                except ValueError:
+                    global_step = 0
+
+                first_epoch = global_step // num_update_steps_per_epoch
+                resume_step = global_step % num_update_steps_per_epoch
+
+                # Restore EMA
+                if args.use_ema:
+                    ema_path = os.path.join(checkpoint_path, "ema_model.pth")
+                    if os.path.exists(ema_path):
+                        logger.info(f"Loading EMA model from {ema_path}")
+                        ema_model.load_state_dict(torch.load(
+                            ema_path, map_location=accelerator.device))
+                    else:
+                        logger.warning(f"EMA model not found at {ema_path}")
+
+    # LPIPS Init (仅在验证时计算指标，避免训练开销，但模型需加载)
     if accelerator.is_main_process:
-        logger.info("Initializing LPIPS...")
+        logger.info("Initializing LPIPS (for validation)...")
     try:
+        # 确保 lpips_model 在正确的设备上
         lpips_model = lpips.LPIPS(net='alex').to(accelerator.device).eval()
     except:
+        logger.warning("LPIPS init failed, skipping LPIPS metric.")
         lpips_model = None
 
     # === 训练循环 ===
@@ -351,7 +444,14 @@ def main():
         model.train()
         train_loss = 0.0
 
-        for step, batch in enumerate(train_dataloader):
+        if args.resume and epoch == first_epoch and resume_step > 0:
+            # We need to skip the first `resume_step` batches
+            active_dataloader = accelerator.skip_first_batches(
+                train_dataloader, resume_step)
+        else:
+            active_dataloader = train_dataloader
+
+        for step, batch in enumerate(active_dataloader):
             low_light_images, clean_images = batch
 
             # 采样噪声---高斯改进
@@ -405,16 +505,39 @@ def main():
                 # 4. 加权平均
                 loss_main = (loss_per_sample * snr_weights).mean()
 
-                # 5. LPIPS Loss (可选，通常只在 v_pred 或 epsilon 后期加，这里作为辅助)
-                # 简化处理：为了效率，每隔一定步数或者直接加上
-                loss_lpips_val = torch.tensor(0.0, device=accelerator.device)
-                if lpips_model is not None and args.lambda_lpips > 0:
-                    # 只有当 prediction type 为 epsilon 时，复原 x0 比较方便公式计算
-                    # 这里略过复杂的 pred_x0 转换逻辑以保持代码清晰，建议主要依赖 Charbonnier
-                    # 若需开启，请使用 scheduler.step 逆推 x0
-                    pass
+                # 5. [改进] 频域损失 (FFT Loss) & [新增] 边缘损失 (Sobel Loss)
+                # 需要先恢复出 x0 (pred_original_sample)
+                alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps].view(
+                    -1, 1, 1, 1)
+                beta_prod_t = 1 - alpha_prod_t
 
-                loss = loss_main + loss_lpips_val
+                if args.prediction_type == "epsilon":
+                    # x0 = (x_t - sqrt(1-alpha) * eps) / sqrt(alpha)
+                    pred_original_sample = (
+                        noisy_images - beta_prod_t ** 0.5 * model_output) / alpha_prod_t ** 0.5
+                elif args.prediction_type == "v_prediction":
+                    # x0 = alpha * x_t - sigma * v
+                    pred_original_sample = alpha_prod_t ** 0.5 * \
+                        noisy_images - beta_prod_t ** 0.5 * model_output
+                else:
+                    pred_original_sample = None
+
+                loss_fft_val = torch.tensor(0.0, device=accelerator.device)
+                loss_edge_val = torch.tensor(0.0, device=accelerator.device)
+
+                if pred_original_sample is not None:
+                    # FFT Loss
+                    if args.lambda_fft > 0:
+                        loss_fft_val = fft_loss(
+                            pred_original_sample, clean_images) * args.lambda_fft
+
+                    # Sobel Edge Loss (针对 BEV 优化)
+                    if args.lambda_edge > 0:
+                        loss_edge_val = sobel_loss(
+                            pred_original_sample, clean_images) * args.lambda_edge
+
+                # LPIPS 在训练中禁用以节省开销，仅在验证中使用
+                loss = loss_main + loss_fft_val + loss_edge_val
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -433,12 +556,16 @@ def main():
                 global_step += 1
 
                 if accelerator.is_main_process:
-                    logs = {"loss": loss_main.item(
-                    ), "lr": lr_scheduler.get_last_lr()[0]}
+                    logs = {
+                        "loss": loss_main.item(),
+                        "loss_fft": loss_fft_val.item(),
+                        "loss_edge": loss_edge_val.item(),
+                        "lr": lr_scheduler.get_last_lr()[0]
+                    }
                     progress_bar.set_postfix(**logs)
                     accelerator.log(logs, step=global_step)
 
-                # === 验证逻辑 (使用 EMA + DPMSolver) ===
+                # === 验证逻辑 (使用 EMA + DPMSolver + 详细指标计算) ===
                 if accelerator.is_main_process and (global_step % (args.validation_epochs * num_update_steps_per_epoch) == 0):
                     logger.info("Running validation with EMA model...")
 
@@ -457,28 +584,92 @@ def main():
                     val_scheduler.set_timesteps(
                         args.num_inference_steps)  # 步数少，速度快
 
+                    # 准备验证结果保存目录
+                    val_save_dir = os.path.join(
+                        args.output_dir, "validation", f"step_{global_step}")
+                    os.makedirs(val_save_dir, exist_ok=True)
+
+                    total_psnr = 0.0
+                    total_ssim = 0.0
+                    total_lpips = 0.0
+                    num_val_samples = 0
+
                     with torch.no_grad():
                         for val_idx, (val_low, val_clean) in enumerate(eval_dataloader):
-                            if val_idx >= 1:
-                                break  # 只验证一个 Batch
+                            if val_idx >= args.num_validation_images // args.batch_size:
+                                break  # 限制验证数量
 
                             val_low = val_low.to(accelerator.device)
+                            val_clean = val_clean.to(accelerator.device)
                             latents = torch.randn_like(val_low)
 
-                            for t in tqdm(val_scheduler.timesteps, desc="DPM Sampling"):
+                            # DPM-Solver Init Noise Scaling
+                            latents = latents * val_scheduler.init_noise_sigma
+
+                            for t in tqdm(val_scheduler.timesteps, desc="DPM Sampling", leave=False):
                                 # 构造输入: Concat
-                                # latents 需根据 scheduler 缩放 (DPM-Solver 不需要 scale_model_input，但标准流程通常需要)
+                                latent_model_input = val_scheduler.scale_model_input(
+                                    latents, t)
                                 model_input = torch.cat(
-                                    [latents, val_low], dim=1)
+                                    [latent_model_input, val_low], dim=1)
 
                                 noise_pred = unet_val(
-                                    model_input, t, encoder_hidden_states=None).sample
+                                    model_input, t).sample
                                 latents = val_scheduler.step(
                                     noise_pred, t, latents).prev_sample
 
-                            # 后处理 & 保存 (略写详细保存代码，参照旧代码)
-                            # ... 保存图片到 local ...
-                            logger.info(f"Validation images generated.")
+                            # 后处理: [-1, 1] -> [0, 1]
+                            enhanced_images = (latents / 2 + 0.5).clamp(0, 1)
+                            gt_images = (val_clean / 2 + 0.5).clamp(0, 1)
+                            low_images = (val_low / 2 + 0.5).clamp(0, 1)
+
+                            # 计算指标
+                            # PSNR
+                            # batch mean PSNR
+                            batch_psnr = peak_signal_noise_ratio(
+                                enhanced_images, gt_images, data_range=1.0)
+                            total_psnr += batch_psnr.item() * val_low.shape[0]
+
+                            # SSIM (使用 utils.misic 中的 ssim，或者 torchmetrics)
+                            # 假设 ssim 接收 (N, C, H, W)
+                            batch_ssim = ssim(
+                                enhanced_images, gt_images).item()
+                            total_ssim += batch_ssim * val_low.shape[0]
+
+                            # LPIPS (如果已加载)
+                            if lpips_model is not None:
+                                # LPIPS model expects input in [-1, 1] usually, but check specific implementation.
+                                # standard lpips expects [-1, 1].
+                                # enhanced_images is [0, 1], so convert back to [-1, 1] for lpips
+                                enh_norm = enhanced_images * 2.0 - 1.0
+                                gt_norm = gt_images * 2.0 - 1.0
+                                batch_lpips = lpips_model(
+                                    enh_norm, gt_norm).mean().item()
+                                total_lpips += batch_lpips * val_low.shape[0]
+
+                            num_val_samples += val_low.shape[0]
+
+                            # 保存图片 (仅保存第一个 batch 的前几张)
+                            if val_idx == 0:
+                                for i in range(min(4, enhanced_images.shape[0])):
+                                    grid = torch.cat(
+                                        [low_images[i], enhanced_images[i], gt_images[i]], dim=2)  # W 维度拼接
+                                    transforms.ToPILImage()(grid).save(
+                                        os.path.join(val_save_dir, f"val_{val_idx}_{i}.png"))
+
+                    # 平均指标
+                    if num_val_samples > 0:
+                        avg_psnr = total_psnr / num_val_samples
+                        avg_ssim = total_ssim / num_val_samples
+                        avg_lpips = total_lpips / num_val_samples
+
+                        logger.info(
+                            f"Validation Step {global_step}: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
+                        accelerator.log({
+                            "val/psnr": avg_psnr,
+                            "val/ssim": avg_ssim,
+                            "val/lpips": avg_lpips
+                        }, step=global_step)
 
                     # 3. 恢复原始权重
                     if args.use_ema:

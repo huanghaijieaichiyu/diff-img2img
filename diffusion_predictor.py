@@ -78,12 +78,6 @@ class BaseDiffusionPredictor:
         self.scheduler.set_timesteps(args.num_inference_steps)
         print(f"推断步数: {args.num_inference_steps}")
 
-        # === 3. 数据转换 ===
-        self.transform = transforms.Compose([
-            transforms.Resize((args.resolution, args.resolution)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ])
         self.to_pil = transforms.ToPILImage()
 
         self.output_path = save_output_path(
@@ -145,14 +139,8 @@ class ImageDiffusionPredictor(BaseDiffusionPredictor):
     def __init__(self, args):
         super().__init__(args)
         try:
-            # 预测时不建议使用 RandomCrop，改用 Resize 或 CenterCrop
-            eval_transform = transforms.Compose([
-                transforms.Resize((args.resolution, args.resolution)),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ])
             self.dataset: Dataset = LowLightDataset(
-                image_dir=args.data_dir, transform=eval_transform, phase="test"
+                image_dir=args.data_dir, img_size=args.resolution, phase="test"
             )
             if len(self.dataset) == 0:
                 raise ValueError(f"No images found in {args.data_dir}")
