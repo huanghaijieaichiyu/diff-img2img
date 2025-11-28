@@ -40,10 +40,12 @@ nvidia-nvtx-cu11==11.8.86
 opencv-python==4.11.0.86
 packaging==25.0
 pillow==11.0.0
+plotly
 protobuf==6.31.0
 psutil==7.0.0
 ptflops==0.7.4
 pygments==2.19.1
+pyinstaller
 pyparsing==3.2.3
 python-dateutil==2.9.0.post0
 pyyaml==6.0.2
@@ -55,6 +57,7 @@ scikit-image==0.25.2
 scipy==1.15.3
 setuptools==70.2.0
 six==1.17.0
+streamlit
 sympy==1.13.3
 tensorboard==2.19.0
 tensorboard-data-server==0.7.2
