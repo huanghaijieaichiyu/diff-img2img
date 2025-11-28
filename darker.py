@@ -3,91 +3,47 @@ import os
 import numpy as np
 from tqdm import tqdm
 import random
-from typing import Optional, Union, Tuple
+from typing import Optional, Union
 from pathlib import Path
-
-# --- Helper Functions ---
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def add_gaussian_noise(image: np.ndarray, mean: float = 0, sigma: float = 10) -> np.ndarray:
-    """Adds Gaussian noise to an image."""
     if image is None:
         return None
     img_float = image.astype(np.float32)
     row, col, ch = img_float.shape
     gauss = np.random.normal(mean, sigma, (row, col, ch))
-    noisy_image = img_float + gauss
-    noisy_image = np.clip(noisy_image, 0, 255)
-    return noisy_image.astype(np.uint8)
+    noisy = np.clip(img_float + gauss, 0, 255)
+    return noisy.astype(np.uint8)
 
 
-def create_headlight_mask(
-    height: int,
-    width: int,
-    center_y_factor: float = 0.9,  # 车灯垂直中心位置（0=顶, 1=底）
-    center_x_factor: float = 0.5,  # 车灯水平中心位置（0=左, 1=右）
-    beam_width_factor: float = 0.6,  # 底部光束宽度比例
-    falloff_sharpness: float = 2.0,  # 光线衰减锐度 (越高衰减越快)
-    max_intensity: float = 1.0     # 光束中心最大强度
-) -> np.ndarray:
-    """Creates a mask simulating headlight illumination."""
+def create_headlight_mask(height: int, width: int, center_y_factor=0.9, center_x_factor=0.5,
+                          beam_width_factor=0.6, falloff_sharpness=2.0, max_intensity=1.0) -> np.ndarray:
     Y, X = np.ogrid[:height, :width]
-
-    # 计算像素到光束中心的归一化距离
-    # 垂直距离，底部为0，向上增加
-    dist_y = (center_y_factor * height - Y) / (center_y_factor * height)
-    dist_y = np.maximum(0, dist_y)  # 只考虑光束前方的区域
-
-    # 水平距离，中心为0，向两侧增加
+    dist_y = np.maximum(0, (center_y_factor * height - Y) /
+                        (center_y_factor * height))
     center_x = center_x_factor * width
-    dist_x = np.abs(X - center_x) / (beam_width_factor * width / 2)  # 归一化到光束半宽
+    dist_x = np.abs(X - center_x) / (beam_width_factor * width / 2)
 
-    # 组合距离，考虑光束形状 (例如，越远越窄)
-    # 这里简化处理，使用简单的衰减组合
-    # 垂直衰减
     falloff_y = np.exp(-falloff_sharpness * dist_y)
-    # 水平衰减 (在光束范围内衰减较慢)
-    falloff_x = np.exp(-falloff_sharpness * 0.5 * np.maximum(0,
-                       dist_x - (1-dist_y)*0.3)**2)  # 简单的水平衰减，随y距离变化
+    falloff_x = np.exp(-falloff_sharpness * 0.5 *
+                       np.maximum(0, dist_x - (1-dist_y)*0.3)**2)
 
-    # 合并蒙版，限制最大强度
-    mask = max_intensity * falloff_y * falloff_x
-    mask = np.clip(mask, 0, 1)  # 确保值在0-1
-
-    # (可选) 添加模糊使过渡更平滑
-    mask = cv2.GaussianBlur(
-        mask, (int(width*0.05) | 1, int(height*0.05) | 1), 0)  # 核大小需奇数
-
-    return mask.astype(np.float32)
+    mask = np.clip(max_intensity * falloff_y * falloff_x, 0, 1)
+    return cv2.GaussianBlur(mask, (int(width*0.05) | 1, int(height*0.05) | 1), 0).astype(np.float32)
 
 
 class Darker:
-    def __init__(
-        self,
-        data_dir: Optional[Union[str, Path]] = None,
-        ratio: float = 0.1,  # 基础暗化比例 (远处最暗程度)
-        phase: str = "train"
-    ):
-        """Initialize the Darker class for image/video darkening.
-
-        Args:
-            data_dir: Root directory of the dataset. Required for image processing.
-                If None, process_images method cannot be called.
-            ratio: Brightness reduction ratio between 0 and 1.
-            phase: Processing phase, either "train" or "test".
-
-        Raises:
-            ValueError: If ratio is not between 0 and 1 or phase is invalid.
-        """
-        if not 0 <= ratio <= 1:
-            raise ValueError("Ratio must be between 0 and 1")
-        if phase not in ["train", "test"]:
-            raise ValueError('Phase must be either "train" or "test"')
-
-        self.ratio = ratio
+    def __init__(self, data_dir: Optional[Union[str, Path]] = None,
+                 gamma: float = 2.5,  # SOTA style gamma correction
+                 linear_attenuation: float = 0.5,  # Linear scaling factor
+                 phase: str = "train"):
+        self.gamma = gamma
+        self.linear_attenuation = linear_attenuation
         self.phase = phase
         self.data_dir = Path(data_dir) if data_dir else None
-        self.mask_cache = {}  # 缓存蒙版以提高效率
+        self.mask_cache = {}
 
         if self.data_dir:
             base_dir = "our485" if phase == "train" else "eval15"
@@ -95,292 +51,137 @@ class Darker:
             self.low_dir = self.data_dir / base_dir / "low"
             os.makedirs(self.low_dir, exist_ok=True)
 
-            if not self.high_dir.exists():
-                raise FileNotFoundError(
-                    f"High-quality images directory not found: {self.high_dir}"
-                )
-
-    def get_mask(self, height: int, width: int, **mask_params) -> np.ndarray:
-        """获取或创建并缓存光照蒙版"""
-        key = (height, width)  # 使用尺寸作为缓存键
+    def get_mask(self, h, w, **params):
+        key = (h, w)
         if key not in self.mask_cache:
-            # 从mask_params中提取参数，如果未提供则使用默认值
-            mask_config = {
-                'center_y_factor': mask_params.get('center_y_factor', 0.9),
-                'center_x_factor': mask_params.get('center_x_factor', 0.5),
-                'beam_width_factor': mask_params.get('beam_width_factor', 0.6),
-                'falloff_sharpness': mask_params.get('falloff_sharpness', 2.5),
-                # 最大强度略小于1，保留一点环境暗度
-                'max_intensity': mask_params.get('max_intensity', 0.95)
-            }
-            self.mask_cache[key] = create_headlight_mask(
-                height, width, **mask_config)
+            self.mask_cache[key] = create_headlight_mask(h, w, **params)
         return self.mask_cache[key]
 
-    @staticmethod
-    def adjust_image(
-        img: np.ndarray,
-        mask: np.ndarray,  # 需要传入蒙版
-        base_ratio: float,  # 基础暗化比例
-        saturation_factor: float = 0.6,  # 基础饱和度因子
-        color_shift_factor: float = 0.1,  # 基础颜色偏移因子
-        noise_sigma: float = 5.0,        # 噪声标准差
-        headlight_boost: float = 0.8,    # 车灯区域提亮强度 (0-1)
-        saturation_boost: float = 0.3,   # 车灯区域饱和度提升比例
-        color_shift_dampen: float = 0.5  # 车灯区域颜色偏移减弱比例
-    ) -> np.ndarray:
-        """Apply darkening effect simulating headlights."""
-        if img is None:
-            raise ValueError("Input image cannot be None")
-        if img.shape[:2] != mask.shape[:2]:
-            raise ValueError("Image and mask dimensions must match")
+    def adjust_image(self, img: np.ndarray, mask: np.ndarray,
+                     saturation_factor: float = 0.6,
+                     color_shift_factor: float = 0.1,
+                     noise_sigma: float = 5.0,
+                     headlight_boost: float = 0.8) -> np.ndarray:
 
-        # 确保 mask 维度匹配图像 (H, W, 1) 以便广播
-        mask_3d = mask[:, :, np.newaxis]
-
-        # 1. Adjust Brightness (V) and Saturation (S) in HSV
-        seed = random.uniform(0.8, 1.2)  # 细微亮度随机性
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+        v = hsv[:, :, 2] / 255.0
 
-        # 基础暗化
-        v_channel = hsv[:, :, 2]
-        base_dark_v = v_channel * base_ratio * seed
+        # 1. Gamma Correction + Linear Attenuation (More realistic physics approximation)
+        # Low light = (High light)^Gamma * Attenuation
+        v_dark = (v ** self.gamma) * self.linear_attenuation
 
-        # 根据蒙版提亮车灯区域
-        # 提亮量 = (原始亮度 - 基础暗化亮度) * 蒙版 * 提亮因子
-        # boost_amount = (v_channel - base_dark_v) * mask * headlight_boost
-        # 或者更简单：最终亮度 = 基础暗化 * (1 - mask * boost) + 原始亮度 * mask * boost
-        # 或者，混合方式：
-        final_v = base_dark_v * (1 - mask_3d[:, :, 0] * headlight_boost) + v_channel * (
-            mask_3d[:, :, 0] * headlight_boost * 0.5)  # 混合一点原始亮度
-        # 另一种更简单的亮度调整: 亮度系数 = base_ratio + (1 - base_ratio) * mask * boost
-        # brightness_multiplier = base_ratio + (1 - base_ratio) * mask_3d[:,:,0] * headlight_boost
-        # final_v = v_channel * brightness_multiplier
+        # 2. Headlight Simulation
+        # Brighten areas based on mask
+        mask_val = mask if mask.ndim == 2 else mask[:, :, 0]
+        v_final = v_dark * (1 - mask_val * headlight_boost) + \
+            v * (mask_val * headlight_boost)
 
-        hsv[:, :, 2] = np.clip(final_v, 0, 255)
+        hsv[:, :, 2] = np.clip(v_final * 255.0, 0, 255)
 
-        # 调整饱和度 S，车灯区域饱和度降低较少
-        s_channel = hsv[:, :, 1]
-        sat_multiplier = saturation_factor + \
-            (1 - saturation_factor) * mask_3d[:, :, 0] * saturation_boost
-        hsv[:, :, 1] = np.clip(s_channel * sat_multiplier, 0, 255)
+        # 3. Saturation adjustment
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation_factor, 0, 255)
 
-        adjusted_hsv = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        adjusted_bgr = cv2.cvtColor(hsv.astype(
+            np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
 
-        # 2. Simulate Color Shift (Blue shift) in BGR, less shift in bright areas
-        bgr_float = adjusted_hsv.astype(np.float32)
-        avg_intensity = np.mean(final_v)  # 使用调整后的亮度作为参考
-        # 基础偏移量
-        base_shift_amount = color_shift_factor * avg_intensity * 0.5
-        # 根据蒙版减弱偏移 (蒙版亮的地方偏移小)
-        shift_multiplier = np.clip(
-            1.0 - mask_3d[:, :, 0] * color_shift_dampen, 0, 1)
-        dynamic_shift = base_shift_amount * shift_multiplier
+        # 4. Color Shift (Purkinje effect - blue shift in dark)
+        # Only shift in dark areas (low mask value)
+        shift_map = color_shift_factor * \
+            (1.0 - mask_val) * np.mean(v_final) * 255
+        adjusted_bgr[:, :, 0] += shift_map  # Blue +
+        adjusted_bgr[:, :, 2] -= shift_map * 0.5  # Red -
 
-        bgr_float[:, :, 0] += dynamic_shift  # Blue channel
-        bgr_float[:, :, 2] -= dynamic_shift * 0.5  # Red channel
-        bgr_shifted = np.clip(bgr_float, 0, 255).astype(np.uint8)
+        adjusted_bgr = np.clip(adjusted_bgr, 0, 255).astype(np.uint8)
 
-        # 3. Add Noise (保持均匀或稍微基于蒙版调整)
+        # 5. Noise
         if noise_sigma > 0:
-            # sigma_adjusted = noise_sigma * (1 + (1 - mask_3d[:,:,0]) * 0.1) # 暗区噪声稍大
-            noisy_img = add_gaussian_noise(
-                bgr_shifted, sigma=noise_sigma)  # 简化：均匀噪声
-        else:
-            noisy_img = bgr_shifted
+            return add_gaussian_noise(adjusted_bgr, sigma=noise_sigma)
+        return adjusted_bgr
 
-        return noisy_img
-
-    def process_images(
-        self,
-        # 添加蒙版和效果控制参数
-        mask_params: dict = {},
-        saturation_factor: float = 0.6,
-        color_shift_factor: float = 0.1,
-        noise_sigma: float = 7.0,  # 稍微增加默认噪声
-        headlight_boost: float = 0.85,  # 增强车灯亮度
-        saturation_boost: float = 0.4,
-        color_shift_dampen: float = 0.6
-    ) -> None:
-        """Batch process images to generate low-light versions.
-
-        Raises:
-            RuntimeError: If data_dir was not provided during initialization.
-            FileNotFoundError: If no valid images found in high_dir.
-        """
-        if not self.data_dir:
-            raise RuntimeError(
-                "Data directory not provided during initialization")
-
-        image_files = [
-            f for f in os.listdir(self.high_dir)
-            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
-        ]
-
-        if not image_files:
-            raise FileNotFoundError(
-                f"No valid images found in {self.high_dir}")
-
-        print(
-            f"Processing {len(image_files)} images with headlight simulation...")
-        first_image = True
-        mask = None
-
-        for image_file in tqdm(image_files):
-            high_img_path = self.high_dir / image_file
-            high_img = cv2.imread(str(high_img_path))
-
-            if high_img is None:
-                print(f"Warning: Could not read image: {high_img_path}")
-                continue
-
-            try:
-                # 获取或创建蒙版 (只在第一次或尺寸变化时创建)
-                h, w = high_img.shape[:2]
-                current_mask = self.get_mask(h, w, **mask_params)
-
-                # 调用更新后的 adjust_image
-                dark_img = self.adjust_image(
-                    high_img,
-                    current_mask,
-                    self.ratio,  # 现在是 base_ratio
-                    saturation_factor,
-                    color_shift_factor,
-                    noise_sigma,
-                    headlight_boost,
-                    saturation_boost,
-                    color_shift_dampen
-                )
-                low_img_path = self.low_dir / image_file
-                cv2.imwrite(str(low_img_path), dark_img)
-            except Exception as e:
-                print(f"Error processing {image_file}: {str(e)}")
-
-        print("Image processing completed!")
-
-    def process_video(
-        self,
-        video_path: Union[str, Path],
-        output_path: Union[str, Path] = "dark_video.mp4",
-        # 添加蒙版和效果控制参数
-        mask_params: dict = {},
-        saturation_factor: float = 0.6,
-        color_shift_factor: float = 0.1,
-        noise_sigma: float = 7.0,
-        headlight_boost: float = 0.85,
-        saturation_boost: float = 0.4,
-        color_shift_dampen: float = 0.6
-    ) -> None:
-        """Generate a low-light version of the input video.
-
-        Args:
-            video_path: Path to the source video file.
-            output_path: Path for the output darkened video.
-
-        Raises:
-            FileNotFoundError: If the input video file doesn't exist.
-            RuntimeError: If video processing fails.
-        """
-        video_path = Path(video_path)
-        if not video_path.exists():
-            raise FileNotFoundError(f"Video file not found: {video_path}")
-
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise RuntimeError(f"Failed to open video file: {video_path}")
-
+    def _process_single_image(self, filename: str, mask_params: dict, effect_params: dict):
+        """Helper function to process a single image in a worker process."""
         try:
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            input_path = self.high_dir / filename
+            img = cv2.imread(str(input_path))
+            if img is None:
+                return
 
-            # 获取蒙版
-            mask = self.get_mask(height, width, **mask_params)
+            mask = self.get_mask(img.shape[0], img.shape[1], **mask_params)
+            dark = self.adjust_image(img, mask, **effect_params)
 
-            fourcc = cv2.VideoWriter.fourcc(*'mp4v')
-            out = cv2.VideoWriter(
-                str(output_path), fourcc, fps, (width, height))
+            output_path = self.low_dir / filename
+            cv2.imwrite(str(output_path), dark)
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
 
-            print(
-                f"Processing video with headlight simulation ({total_frames} frames)...")
-            with tqdm(total=total_frames) as pbar:
-                while cap.isOpened():
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
+    def process_images(self, mask_params={}, num_workers: int = None, **effect_params):
+        if not self.data_dir:
+            raise RuntimeError("No data_dir provided")
 
-                    # 应用效果
-                    dark_frame = self.adjust_image(
-                        frame,
-                        mask,  # 使用缓存的蒙版
-                        self.ratio,
-                        saturation_factor,
-                        color_shift_factor,
-                        noise_sigma,
-                        headlight_boost,
-                        saturation_boost,
-                        color_shift_dampen
-                    )
-                    out.write(dark_frame)
-                    pbar.update(1)
-        finally:
-            cap.release()
-            if 'out' in locals() and out.isOpened():  # 确保 out 被定义且打开
-                out.release()
-            # cv2.destroyAllWindows()
+        valid_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
+        files = [f for f in os.listdir(
+            self.high_dir) if f.lower().endswith(valid_exts)]
 
-        print(f"Video processing completed! Output saved to: {output_path}")
+        if not files:
+            print(f"No images found in {self.high_dir}")
+            return
+
+        if num_workers is None:
+            # Use all available cores
+            num_workers = max(1, (os.cpu_count() or 1))
+
+        print(f"Processing {len(files)} images with {num_workers} workers...")
+
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(self._process_single_image,
+                                f, mask_params, effect_params)
+                for f in files
+            ]
+
+            for _ in tqdm(as_completed(futures), total=len(files), desc="Progress"):
+                pass
 
 
 if __name__ == '__main__':
-    # Example usage for image processing
-    data_dir = "/mnt/f/datasets/nuscenes_lol"  # 替换为你的数据集路径
-    base_ratio = 0.05  # 基础暗度（远处最暗）可以更低
-
-    # 定义蒙版参数 (可以调整)
-    headlight_mask_params = {
-        'center_y_factor': 0.95,  # 光源更靠近底部
-        'beam_width_factor': 0.7,  # 光束稍宽
-        'falloff_sharpness': 3.0,  # 衰减更快
-        'max_intensity': 0.98   # 中心最大亮度
+    # Configuration for realistic low-light synthesis
+    config = {
+        "gamma": 6.5,                # Higher = darker midtones
+        "linear_attenuation": 0.15,  # Global brightness scale
+        "headlight_boost": 0.9,      # Headlight brightness intensity
+        "noise_sigma": 8.0,          # Sensor noise
+        "saturation_factor": 0.5,    # Color washout
+        "color_shift_factor": 0.15,  # Blue tint strength
+        "mask_params": {
+            "center_y_factor": 0.9,
+            "beam_width_factor": 0.7,
+            "falloff_sharpness": 2.5
+        }
     }
 
-    # 定义效果参数
-    effect_params = {
-        'saturation_factor': 0.5,
-        'color_shift_factor': 0.12,
-        'noise_sigma': 8.0,
-        'headlight_boost': 0.9,  # 更强的提亮
-        'saturation_boost': 0.5,
-        'color_shift_dampen': 0.7  # 亮区颜色偏移抑制更强
-    }
+    # Separate parameters
+    init_keys = ['gamma', 'linear_attenuation']
+    init_params = {k: v for k, v in config.items() if k in init_keys}
 
-    # Process both train and test phase image datasets
-    for phase in ["train", "test"]:
-        try:
-            print(f"\nProcessing {phase} phase...")
-            darker = Darker(data_dir, ratio=base_ratio, phase=phase)
-            darker.process_images(
-                mask_params=headlight_mask_params, **effect_params)
-        except FileNotFoundError as e:
-            print(f"Skipping {phase} phase: {str(e)}")
-        except Exception as e:
-            print(f"Error processing {phase} phase: {str(e)}")
+    mask_params = config.get('mask_params', {})
 
-    # Example usage for video processing
-    # video_path = "examples/input.mp4" # 确保此文件存在
-    # output_video_path = "examples/output_headlight_sim.mp4"
-    # print(f"\nProcessing video {video_path}...")
-    # try:
-    #     darker_video = Darker(ratio=base_ratio) # data_dir 可以为 None
-    #     darker_video.process_video(
-    #         video_path,
-    #         output_video_path,
-    #         mask_params=headlight_mask_params,
-    #         **effect_params
-    #     )
-    # except FileNotFoundError as e:
-    #     print(f"Video processing skipped: {str(e)}")
-    # except Exception as e:
-    #     print(f"Error processing video: {str(e)}")
+    # Effect params are those not in init_keys and not mask_params
+    effect_params = {k: v for k, v in config.items(
+    ) if k not in init_keys and k != 'mask_params'}
+
+    # Note: Update data_dir to your actual dataset path
+    data_dir = "/mnt/f/datasets/nuscenes_lol"  # Change this to your dataset path
+
+    print(f"Initializing Darker with: {init_params}")
+    try:
+        darker = Darker(data_dir=data_dir, phase="train", **init_params)
+        darker.process_images(mask_params=mask_params, **effect_params)
+
+        # Also process test set if needed
+        # darker_test = Darker(data_dir=data_dir, phase="test", **init_params)
+        # darker_test.process_images(mask_params=mask_params, **effect_params)
+
+        print("Darker script completed.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        print("Please ensure your data_dir is correct.")

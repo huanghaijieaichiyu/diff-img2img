@@ -156,3 +156,4 @@ diffusion_predictions
 run_diffusion_cross_attn
 diffusion.tar
 run_diffusion_improved
+requirements.lock
