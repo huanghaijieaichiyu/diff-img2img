@@ -157,3 +157,9 @@ run_diffusion_cross_attn
 diffusion.tar
 run_diffusion_improved
 requirements.lock
+start_train.sh
+build_executable.sh
+README_release.md
+pyproject.toml
+run_app.py
+release.sh

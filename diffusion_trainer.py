@@ -25,8 +25,6 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from diffusers.training_utils import EMAModel
 
-import lpips
-
 from utils.misic import ssim, Save_path
 from datasets.data_set import LowLightDataset
 from models.retinex import DecomNet
@@ -130,6 +128,29 @@ def charbonnier_loss_elementwise(pred, target, eps=1e-3):
     return torch.sqrt((pred - target)**2 + eps**2)
 
 
+class CombinedModel(nn.Module):
+    def __init__(self, unet, decom_model=None):
+        super().__init__()
+        self.unet = unet
+        self.decom_model = decom_model
+
+    def forward(self, low_light_images, noisy_images, timesteps):
+        if self.decom_model is not None:
+            # Retinex Decomposition (R, I)
+            low_light_01 = (low_light_images / 2 + 0.5).clamp(0, 1)
+            r_low, i_low = self.decom_model(low_light_01)
+            
+            # Normalize [0,1] -> [-1,1]
+            r_low_norm = r_low * 2.0 - 1.0
+            i_low_norm = i_low * 2.0 - 1.0
+            
+            model_input = torch.cat([noisy_images, r_low_norm, i_low_norm], dim=1)
+        else:
+            model_input = torch.cat([noisy_images, low_light_images], dim=1)
+
+        return self.unet(model_input, timesteps).sample
+
+
 def main():
     args = parse_args()
     logging_dir = os.path.join(args.output_dir, "logs")
@@ -160,7 +181,7 @@ def main():
     input_channels = 7 if args.use_retinex else 6
     
     logger.info(f"Initializing UNet (Input Channels={input_channels})...")
-    model = UNet2DModel(
+    unet = UNet2DModel(
         sample_size=args.resolution,
         in_channels=input_channels,
         out_channels=3,
@@ -180,18 +201,21 @@ def main():
     if args.use_ema:
         logger.info("Initializing EMA model...")
         ema_model = EMAModel(
-            model.parameters(),
+            unet.parameters(),
             decay=args.ema_decay,
             model_cls=UNet2DModel,
-            model_config=model.config,
+            model_config=unet.config,
         )
         ema_model.to(accelerator.device)
 
     if args.enable_xformers_memory_efficient_attention:
-        model.enable_xformers_memory_efficient_attention()
+        unet.enable_xformers_memory_efficient_attention()
     
     if args.gradient_checkpointing:
-        model.enable_gradient_checkpointing()
+        unet.enable_gradient_checkpointing()
+
+    # Wrap models
+    training_model = CombinedModel(unet, decom_model)
 
     # Scheduler
     noise_scheduler = DDPMScheduler(
@@ -201,12 +225,8 @@ def main():
     )
 
     # Optimizer
-    params_to_optimize = model.parameters()
-    if decom_model is not None:
-        params_to_optimize = itertools.chain(model.parameters(), decom_model.parameters())
-
     optimizer = torch.optim.AdamW(
-        params_to_optimize, lr=args.lr, weight_decay=1e-2, eps=1e-08
+        training_model.parameters(), lr=args.lr, weight_decay=1e-2, eps=1e-08
     )
 
     # Data Transforms (handled in Dataset, implicitly assumed compatible)
@@ -233,14 +253,9 @@ def main():
     )
 
     # Prepare with Accelerator
-    if decom_model is not None:
-        model, decom_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-            model, decom_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-        )
-    else:
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-        )
+    training_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+        training_model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    )
 
     # Trackers
     if accelerator.is_main_process:
@@ -250,6 +265,12 @@ def main():
             if isinstance(value, (list, tuple)):
                 config_to_log[key] = str(value)
         accelerator.init_trackers(run_name, config=config_to_log)
+        
+        # Init CSV Logger
+        csv_path = os.path.join(args.output_dir, "training_metrics.csv")
+        if not args.resume: # Only overwrite if starting fresh, otherwise append handled by 'a' but we need headers if new
+            with open(csv_path, "w") as f:
+                f.write("step,loss,lr\n")
 
     # Training Steps Calculation
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -299,21 +320,12 @@ def main():
                     if os.path.exists(ema_path):
                         ema_model.load_state_dict(torch.load(ema_path, map_location=accelerator.device))
     
-    # Init LPIPS for validation only
-    if accelerator.is_main_process:
-        logger.info("Initializing LPIPS (for validation)...")
-    try:
-        lpips_model = lpips.LPIPS(net='alex').to(accelerator.device).eval()
-    except:
-        logger.warning("LPIPS init failed, skipping LPIPS metric.")
-        lpips_model = None
-
     # === Training Loop ===
     logger.info("***** Running training *****")
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
 
     for epoch in range(first_epoch, args.epochs):
-        model.train()
+        training_model.train()
         
         if args.resume and epoch == first_epoch and resume_step > 0:
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
@@ -333,24 +345,9 @@ def main():
             
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
-            with accelerator.accumulate(model):
-                # 2. Conditioning
-                if decom_model is not None:
-                    # Retinex Decomposition (R, I)
-                    low_light_01 = (low_light_images / 2 + 0.5).clamp(0, 1)
-                    r_low, i_low = decom_model(low_light_01)
-                    
-                    # Normalize [0,1] -> [-1,1]
-                    r_low_norm = r_low * 2.0 - 1.0
-                    i_low_norm = i_low * 2.0 - 1.0
-                    
-                    model_input = torch.cat([noisy_images, r_low_norm, i_low_norm], dim=1)
-                else:
-                    # Standard Concat: Noisy + LowLight
-                    model_input = torch.cat([noisy_images, low_light_images], dim=1)
-
-                # 3. Prediction
-                model_output = model(model_input, timesteps).sample
+            with accelerator.accumulate(training_model):
+                # CombinedModel forward
+                model_output = training_model(low_light_images, noisy_images, timesteps)
 
                 # 4. Target Calculation
                 if args.prediction_type == "epsilon":
@@ -371,7 +368,7 @@ def main():
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), 5.0)
+                    accelerator.clip_grad_norm_(training_model.parameters(), 5.0)
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -379,7 +376,9 @@ def main():
 
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    ema_model.step(model.parameters())
+                    # Step EMA with UNet parameters.
+                    unwrapped = accelerator.unwrap_model(training_model)
+                    ema_model.step(unwrapped.unet.parameters())
 
                 progress_bar.update(1)
                 global_step += 1
@@ -391,17 +390,29 @@ def main():
                     }
                     progress_bar.set_postfix(**logs)
                     accelerator.log(logs, step=global_step)
+                    
+                    # Append to CSV
+                    try:
+                        with open(csv_path, "a") as f:
+                            f.write(f"{global_step},{logs['loss']},{logs['lr']}\n")
+                    except:
+                        pass
 
                 # === Validation ===
                 if accelerator.is_main_process and (global_step % (args.validation_epochs * num_update_steps_per_epoch) == 0):
                     logger.info("Running validation...")
                     
+                    # Unwrap for validation
+                    unwrapped_combined = accelerator.unwrap_model(training_model)
+                    unet_val = unwrapped_combined.unet
+                    decom_val = unwrapped_combined.decom_model
+                    
                     if args.use_ema:
-                        ema_model.store(model.parameters())
-                        ema_model.copy_to(model.parameters())
+                        ema_model.store(unet_val.parameters())
+                        ema_model.copy_to(unet_val.parameters())
 
-                    unet_val = accelerator.unwrap_model(model)
                     unet_val.eval()
+                    if decom_val: decom_val.eval()
 
                     val_scheduler = DPMSolverMultistepScheduler.from_config(noise_scheduler.config)
                     val_scheduler.set_timesteps(args.num_inference_steps)
@@ -411,7 +422,6 @@ def main():
 
                     total_psnr = 0.0
                     total_ssim = 0.0
-                    total_lpips = 0.0
                     num_val_samples = 0
 
                     with torch.no_grad():
@@ -426,9 +436,9 @@ def main():
                             for t in tqdm(val_scheduler.timesteps, desc="Sampling", leave=False):
                                 latent_model_input = val_scheduler.scale_model_input(latents, t)
                                 
-                                if decom_model is not None:
+                                if decom_val is not None:
                                     val_low_01 = (val_low / 2 + 0.5).clamp(0, 1)
-                                    r_val, i_val = decom_model(val_low_01)
+                                    r_val, i_val = decom_val(val_low_01)
                                     r_val_norm = r_val * 2.0 - 1.0
                                     i_val_norm = i_val * 2.0 - 1.0
                                     model_input = torch.cat([latent_model_input, r_val_norm, i_val_norm], dim=1)
@@ -449,12 +459,6 @@ def main():
                             batch_ssim = ssim(enhanced_images, gt_images).item()
                             total_ssim += batch_ssim * val_low.shape[0]
 
-                            if lpips_model is not None:
-                                enh_norm = enhanced_images * 2.0 - 1.0
-                                gt_norm = gt_images * 2.0 - 1.0
-                                batch_lpips = lpips_model(enh_norm, gt_norm).mean().item()
-                                total_lpips += batch_lpips * val_low.shape[0]
-
                             num_val_samples += val_low.shape[0]
 
                             # Save Images
@@ -466,13 +470,13 @@ def main():
                     if num_val_samples > 0:
                         avg_psnr = total_psnr / num_val_samples
                         avg_ssim = total_ssim / num_val_samples
-                        avg_lpips = total_lpips / num_val_samples
-                        logger.info(f"Val Step {global_step}: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}, LPIPS={avg_lpips:.4f}")
-                        accelerator.log({"val/psnr": avg_psnr, "val/ssim": avg_ssim, "val/lpips": avg_lpips}, step=global_step)
+                        logger.info(f"Val Step {global_step}: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}")
+                        accelerator.log({"val/psnr": avg_psnr, "val/ssim": avg_ssim}, step=global_step)
 
                     if args.use_ema:
-                        ema_model.restore(model.parameters())
+                        ema_model.restore(unet_val.parameters())
                     unet_val.train()
+                    if decom_val: decom_val.train()
 
                 # === Checkpointing ===
                 if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
@@ -480,9 +484,10 @@ def main():
                     accelerator.save_state(save_path)
                     if args.use_ema:
                         torch.save(ema_model.state_dict(), os.path.join(save_path, "ema_model.pth"))
-                    if decom_model is not None:
-                        unwrapped_decom = accelerator.unwrap_model(decom_model)
-                        torch.save(unwrapped_decom.state_dict(), os.path.join(save_path, "decom_model.pth"))
+                    
+                    unwrapped_combined = accelerator.unwrap_model(training_model)
+                    if unwrapped_combined.decom_model is not None:
+                         torch.save(unwrapped_combined.decom_model.state_dict(), os.path.join(save_path, "decom_model.pth"))
 
             if global_step >= args.max_train_steps:
                 break
@@ -493,16 +498,18 @@ def main():
 
     # === Save Final Model ===
     if accelerator.is_main_process:
+        unwrapped_combined = accelerator.unwrap_model(training_model)
+        unet_final = unwrapped_combined.unet
+        decom_final = unwrapped_combined.decom_model
+
         if args.use_ema:
             logger.info("Saving EMA model as final model...")
-            ema_model.copy_to(model.parameters())
+            ema_model.copy_to(unet_final.parameters())
 
-        unet = accelerator.unwrap_model(model)
-        unet.save_pretrained(os.path.join(args.output_dir, "unet_final"))
+        unet_final.save_pretrained(os.path.join(args.output_dir, "unet_final"))
         
-        if decom_model is not None:
-            unwrapped_decom = accelerator.unwrap_model(decom_model)
-            torch.save(unwrapped_decom.state_dict(), os.path.join(args.output_dir, "unet_final", "decom_model.pth"))
+        if decom_final is not None:
+            torch.save(decom_final.state_dict(), os.path.join(args.output_dir, "unet_final", "decom_model.pth"))
 
         logger.info("Training Finished.")
 

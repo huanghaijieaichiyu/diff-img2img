@@ -4,3 +4,4 @@ accelerate launch diffusion_trainer.py \
         --batch_size 4 \
         --resolution 256 \
         --num_workers 8 \
+        --use_retinex \
