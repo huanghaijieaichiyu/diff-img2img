@@ -164,3 +164,4 @@ pyproject.toml
 run_app.py
 release.sh
 *.pdf
+初稿.latex

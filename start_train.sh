@@ -1,6 +1,6 @@
 accelerate launch diffusion_trainer.py \
-        --data_dir "/mnt/f/datasets/kitti_LOL" \
-        --epochs 30 \
+        --data_dir "your data" \
+        --epochs 50 \
         --batch_size 4 \
         --resolution 256 \
         --num_workers 8 \
