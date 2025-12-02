@@ -395,3 +395,34 @@ def compress_gif(input_path: str, output_path: str, max_size_mb: float = 1.0) ->
     except Exception as e:
         print(f"压缩GIF时发生错误: {str(e)}")
         return False
+
+# === SNR Helper Functions ===
+def compute_snr(noise_scheduler, timesteps):
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    if alphas_cumprod.device != timesteps.device:
+        alphas_cumprod = alphas_cumprod.to(timesteps.device)
+    sqrt_alphas_cumprod = alphas_cumprod[timesteps] ** 0.5
+    sqrt_one_minus_alphas_cumprod = (1.0 - alphas_cumprod[timesteps]) ** 0.5
+    snr = (sqrt_alphas_cumprod / sqrt_one_minus_alphas_cumprod) ** 2
+    return snr
+
+def compute_min_snr_loss_weights(noise_scheduler, timesteps, snr_gamma=5.0):
+    snr = compute_snr(noise_scheduler, timesteps)
+    prediction_type = getattr(noise_scheduler.config, "prediction_type", "epsilon")
+
+    if prediction_type == "v_prediction":
+        min_snr = torch.stack([snr, torch.ones_like(snr) * snr_gamma], dim=1).min(dim=1)[0]
+        weights = min_snr / (snr + 1)
+    elif prediction_type == "epsilon":
+        gamma_over_snr = snr_gamma / (snr + 1e-8)
+        weights = torch.stack([torch.ones_like(gamma_over_snr), gamma_over_snr], dim=1).min(dim=1)[0]
+    else:
+        raise ValueError(f"Unsupported prediction type: {prediction_type}")
+    return weights.detach()
+
+def charbonnier_loss_elementwise(pred, target, eps=1e-3):
+    """
+    Element-wise Charbonnier Loss (Smoothed L1)
+    sqrt((x-y)^2 + eps^2)
+    """
+    return torch.sqrt((pred - target)**2 + eps**2)
