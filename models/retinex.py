@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from .common import PSA, Conv, C2f
+from .common import Conv, C2f
 
 
 class DecomNet(nn.Module):

@@ -163,3 +163,4 @@ README_release.md
 pyproject.toml
 run_app.py
 release.sh
+*.pdf
