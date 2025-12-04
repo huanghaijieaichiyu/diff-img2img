@@ -27,6 +27,7 @@ from diffusers.utils import check_min_version
 from diffusers.training_utils import EMAModel
 
 from utils.misic import ssim, Save_path, compute_snr, compute_min_snr_loss_weights, charbonnier_loss_elementwise
+from utils.loss import FrequencyDomainLoss, EdgeLoss
 from datasets.data_set import LowLightDataset
 from models.retinex import DecomNet
 from models.diffusion import CombinedModel
@@ -172,6 +173,10 @@ def main():
         logger.info("Initializing Retinex Decomposition Network...")
         decom_model = DecomNet().to(accelerator.device)
         decom_model.train()
+
+    # Loss Functions
+    criterion_freq = FrequencyDomainLoss().to(accelerator.device)
+    criterion_edge = EdgeLoss().to(accelerator.device)
 
     # EMA Model
     if args.use_ema:
@@ -357,13 +362,34 @@ def main():
                 loss_elementwise = charbonnier_loss_elementwise(
                     model_pred, target)
 
-                # Weighted Mean
-                loss_diff = (loss_elementwise.mean(
+                # Weighted Mean (Pixel Loss) - Weight: 1.0
+                loss_pixel = (loss_elementwise.mean(
                     dim=[1, 2, 3]) * snr_weights).mean()
+                
+                # 6. Reconstruct x0 for Aux Losses (Frequency + Edge)
+                alphas_cumprod = noise_scheduler.alphas_cumprod.to(clean_images.device)
+                alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
+                beta_prod_t = 1 - alpha_prod_t
+                
+                if args.prediction_type == "epsilon":
+                    pred_original_sample = (noisy_images - beta_prod_t ** (0.5) * model_pred) / alpha_prod_t ** (0.5)
+                elif args.prediction_type == "v_prediction":
+                    pred_original_sample = alpha_prod_t ** (0.5) * noisy_images - beta_prod_t ** (0.5) * model_pred
+                else:
+                    pred_original_sample = model_pred # Should not happen given check above
+                
+                # Clamp to valid range for metric calculation logic
+                # Note: Diffusion models can predict values outside [-1, 1], but for loss calc we often keep them raw
+                # or clamp if the target is strictly bounded. Here clean_images is normalized [-1, 1].
+                
+                loss_freq = criterion_freq(pred_original_sample, clean_images)
+                loss_edge = criterion_edge(pred_original_sample, clean_images)
 
-                loss = loss_diff
+                # Total Loss Calculation
+                # Weights: Pixel=1.0, Freq=0.1, Edge=0.05
+                loss = loss_pixel + 0.1 * loss_freq + 0.05 * loss_edge
 
-                # Retinex Loss
+                # Retinex Loss (Weight: 0.1)
                 if args.use_retinex and r_low is not None and i_low is not None:
                     low_light_01 = (low_light_images / 2 + 0.5).clamp(0, 1)
                     clean_images_01 = (clean_images / 2 + 0.5).clamp(0, 1)
@@ -397,11 +423,14 @@ def main():
 
                 if accelerator.is_main_process:
                     logs = {
-                        "loss": loss_diff.item(),
+                        "loss": loss.item(),
+                        "loss_pix": loss_pixel.item(),
+                        "loss_freq": loss_freq.item(),
+                        "loss_edge": loss_edge.item(),
                         "lr": lr_scheduler.get_last_lr()[0]
                     }
                     if args.use_retinex and 'loss_retinex' in locals():
-                        logs["loss_retinex"] = loss_retinex.item()
+                        logs["loss_ret"] = loss_retinex.item()
 
                     progress_bar.set_postfix(**logs)
                     accelerator.log(logs, step=global_step)

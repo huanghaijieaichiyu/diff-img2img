@@ -1,5 +1,68 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FrequencyDomainLoss(nn.Module):
+    """
+    Frequency Domain Loss using Fast Fourier Transform (FFT).
+    Computes L1 loss between the amplitude and phase of the prediction and target.
+    """
+    def __init__(self, loss_type='l1', alpha=1.0, beta=1.0):
+        super(FrequencyDomainLoss, self).__init__()
+        self.loss_type = loss_type
+        self.alpha = alpha  # Weight for amplitude loss
+        self.beta = beta    # Weight for phase loss
+
+    def forward(self, pred, target):
+        # FFT
+        pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
+        target_fft = torch.fft.fft2(target, dim=(-2, -1))
+
+        pred_amp = torch.abs(pred_fft)
+        pred_phase = torch.angle(pred_fft)
+
+        target_amp = torch.abs(target_fft)
+        target_phase = torch.angle(target_fft)
+
+        if self.loss_type == 'l1':
+            loss_amp = F.l1_loss(pred_amp, target_amp)
+            loss_phase = F.l1_loss(pred_phase, target_phase)
+        else:
+            loss_amp = F.mse_loss(pred_amp, target_amp)
+            loss_phase = F.mse_loss(pred_phase, target_phase)
+
+        return self.alpha * loss_amp + self.beta * loss_phase
+
+
+class EdgeLoss(nn.Module):
+    """
+    Edge Loss using Sobel filters.
+    Computes L1 loss between the edge maps of prediction and target.
+    """
+    def __init__(self):
+        super(EdgeLoss, self).__init__()
+        k = torch.Tensor([[.125, .25, .125], [.25, .5, .25], [.125, .25, .125]])
+        self.kernel = torch.Tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
+        self.loss = nn.L1Loss()
+
+    def forward(self, pred, target):
+        b, c, h, w = pred.shape
+        
+        # Create Sobel kernels for each channel
+        # Vertical edges
+        kernel_v = self.kernel.expand(c, 1, 3, 3).to(pred.device)
+        # Horizontal edges
+        kernel_h = self.kernel.t().expand(c, 1, 3, 3).to(pred.device)
+        
+        pred_v = F.conv2d(pred, kernel_v, groups=c, padding=1)
+        pred_h = F.conv2d(pred, kernel_h, groups=c, padding=1)
+        
+        target_v = F.conv2d(target, kernel_v, groups=c, padding=1)
+        target_h = F.conv2d(target, kernel_h, groups=c, padding=1)
+        
+        loss = self.loss(pred_v, target_v) + self.loss(pred_h, target_h)
+        return loss
 
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441

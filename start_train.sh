@@ -1,5 +1,5 @@
 accelerate launch diffusion_trainer.py \
-        --data_dir "your data" \
+        --data_dir "/mnt/f/datasets/kitti_LOL" \
         --epochs 50 \
         --batch_size 4 \
         --resolution 256 \
@@ -8,3 +8,5 @@ accelerate launch diffusion_trainer.py \
         --use_retinex \
         --mixed_precision="fp16" \
         --prediction_type="v_prediction" \
+        --enable_xformers_memory_efficient_attention \
+        --gradient_accumulation_steps 4 \
