@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.utils import make_grid
 from tqdm.auto import tqdm
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -31,6 +32,7 @@ logger = get_logger(__name__, log_level="INFO")
 class DiffusionEngine:
     def __init__(self, args):
         self.args = args
+        self.best_psnr = -1.0
         
         # 1. Initialize Accelerator
         logging_dir = os.path.join(args.output_dir, "logs")
@@ -85,6 +87,11 @@ class DiffusionEngine:
             down_block_types=tuple(self.args.unet_down_block_types),
             up_block_types=tuple(self.args.unet_up_block_types)
         )
+
+        if self.args.enable_xformers_memory_efficient_attention:
+            if self.accelerator.is_main_process:
+                logger.info("Enabling xformers memory efficient attention")
+            self.unet.enable_xformers_memory_efficient_attention()
 
         self.decom_model = None
         if self.args.use_retinex:
@@ -173,7 +180,17 @@ class DiffusionEngine:
 
         # Trackers
         if self.accelerator.is_main_process:
-            self.accelerator.init_trackers(Path(self.args.output_dir).name, config=vars(self.args))
+            tracker_config = dict(vars(self.args))
+            # Filter configuration to satisfy TensorBoard requirements
+            for k, v in list(tracker_config.items()):
+                if not isinstance(v, (int, float, str, bool, torch.Tensor)):
+                    if isinstance(v, list):
+                        tracker_config[k] = str(v)
+                    elif v is None:
+                        tracker_config[k] = "None"
+                    else:
+                        del tracker_config[k]
+            self.accelerator.init_trackers(Path(self.args.output_dir).name, config=tracker_config)
 
         # Loop
         logger.info("***** Running training *****")
@@ -249,6 +266,13 @@ class DiffusionEngine:
             loss = loss_diffusion + loss_composite
 
             # Loss 3: Retinex
+            logs = {
+                "loss": loss.item(), 
+                "l_diff": loss_diffusion.item(), 
+                "l_comp": loss_composite.item(),
+                "lr": lr_scheduler.get_last_lr()[0]
+            }
+
             loss_retinex = 0.0
             if self.args.use_retinex and r_low is not None:
                 low_light_01 = (low_light_images / 2 + 0.5).clamp(0, 1)
@@ -259,6 +283,13 @@ class DiffusionEngine:
                           torch.mean(torch.abs(i_low[:, :, :, :-1] - i_low[:, :, :, 1:]))
                 loss_retinex = loss_recon + loss_reflectance + 0.1 * loss_tv
                 loss += 0.1 * loss_retinex
+                
+                logs.update({
+                    "l_ret": loss_retinex.item(),
+                    "l_rec": loss_recon.item(),
+                    "l_ref": loss_reflectance.item(),
+                    "l_tv": loss_tv.item()
+                })
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
@@ -268,7 +299,7 @@ class DiffusionEngine:
             lr_scheduler.step()
             optimizer.zero_grad()
 
-        return loss, {"loss": loss.item(), "l_diff": loss_diffusion.item(), "lr": lr_scheduler.get_last_lr()[0]}
+        return loss, logs
 
     def validate(self, step=None):
         logger.info(f"Running validation at step {step}...")
@@ -298,6 +329,10 @@ class DiffusionEngine:
         total_psnr, total_ssim = 0.0, 0.0
         num_samples = 0
         
+        # Prepare validation directory
+        val_dir = os.path.join(self.args.output_dir, "validation")
+        os.makedirs(val_dir, exist_ok=True)
+        
         with torch.no_grad():
             for i, (val_low, val_clean) in enumerate(eval_dataloader):
                 if i >= self.args.num_validation_images // self.args.batch_size: break
@@ -307,6 +342,22 @@ class DiffusionEngine:
                 
                 enhanced = self._inference_step(val_low, unet, decom, val_scheduler)
                 
+                # Save Visualization for the first batch
+                if i == 0:
+                    # Normalize to [0, 1] for visualization (assuming inputs are [-1, 1] for diff logic, but let's check)
+                    # Engine uses (x/2 + 0.5) so inputs seem to be [-1, 1]
+                    vis_low = (val_low / 2 + 0.5).clamp(0, 1)
+                    vis_clean = (val_clean / 2 + 0.5).clamp(0, 1)
+                    vis_enhanced = enhanced # already [0, 1] from inference_step
+                    
+                    # Create Grid: Top=Low, Mid=Enhanced, Bot=Clean
+                    grid = torch.cat([vis_low, vis_enhanced, vis_clean], dim=0)
+                    grid_image = make_grid(grid, nrow=vis_low.shape[0], padding=2)
+                    
+                    save_image_path = os.path.join(val_dir, f"val_step_{step}.png")
+                    transforms.ToPILImage()(grid_image).save(save_image_path)
+                    logger.info(f"Saved validation grid to {save_image_path}")
+
                 # Metrics (Images are [0, 1])
                 gt_images = (val_clean / 2 + 0.5).clamp(0, 1)
                 
@@ -319,6 +370,18 @@ class DiffusionEngine:
             avg_ssim = total_ssim / num_samples
             logger.info(f"Validation: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}")
             self.accelerator.log({"val/psnr": avg_psnr, "val/ssim": avg_ssim}, step=step)
+            
+            # Best Model Check
+            if avg_psnr > self.best_psnr:
+                self.best_psnr = avg_psnr
+                logger.info(f"New Best Model found (PSNR: {avg_psnr:.4f}). Saving...")
+                
+                best_model_dir = os.path.join(self.args.output_dir, "best_model")
+                os.makedirs(best_model_dir, exist_ok=True)
+                
+                unet.save_pretrained(os.path.join(best_model_dir, "unet_best"))
+                if decom:
+                    torch.save(decom.state_dict(), os.path.join(best_model_dir, "decom_model_best.pth"))
         
         # Restore EMA
         if self.args.use_ema:

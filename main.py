@@ -26,6 +26,8 @@ def get_args():
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--checkpointing_steps", type=int, default=1000)
+    parser.add_argument("--checkpoints_total_limit", type=int, default=None, help="Max number of checkpoints to keep")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint or 'latest'")
     parser.add_argument("--validation_steps", type=int, default=500)
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--lr_scheduler", type=str, default="constant_with_warmup")
@@ -42,6 +44,9 @@ def get_args():
     parser.add_argument("--unet_block_channels", nargs='+', type=int, default=[32, 64, 128, 256, 512])
     parser.add_argument("--unet_down_block_types", nargs='+', type=str, default=["DownBlock2D", "DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"])
     parser.add_argument("--unet_up_block_types", nargs='+', type=str, default=["AttnUpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"])
+    
+    # Optimization
+    parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Enable xformers memory efficient attention")
     
     # Predict/Validate Args
     parser.add_argument("--num_inference_steps", type=int, default=20)
