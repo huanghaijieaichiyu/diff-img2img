@@ -5,6 +5,12 @@ code by 黄小海 2025.3.3
 '''
 
 import argparse
+import sys
+import os
+
+# Add root to sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from ast import Is
 from cv2 import transform
 import torch

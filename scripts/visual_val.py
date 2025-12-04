@@ -1,5 +1,10 @@
 import torch
 import os
+import sys
+
+# Add root to sys.path if running standalone to find models
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from diffusers import UNet2DModel, DDPMScheduler
 from models.retinex import DecomNet
 from PIL import Image

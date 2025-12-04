@@ -1,4 +1,4 @@
-accelerate launch diffusion_trainer.py \
+accelerate launch main.py --mode train \
         --data_dir "/mnt/f/datasets/kitti_LOL" \
         --epochs 50 \
         --batch_size 4 \

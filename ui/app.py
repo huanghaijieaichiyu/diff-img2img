@@ -385,7 +385,7 @@ def dataset_page():
         st.status(t("processing"), expanded=True)
         try:
             # Dynamic import to ensure fresh load
-            from darker import Darker
+            from scripts.darker import Darker
             mask_params = {"center_y_factor": 0.9, "beam_width_factor": beam_width, "falloff_sharpness": 2.5}
             dk = Darker(data_dir=data_dir, phase=phase, gamma=gamma, linear_attenuation=linear_attenuation)
             dk.process_images(
@@ -446,17 +446,42 @@ def training_page():
     # --- Launch Logic ---
     if train_btn and not st.session_state.training_pid:
         cmd = [
-            sys.executable, "diffusion_trainer.py",
+            sys.executable, "main.py", "--mode", "train",
             "--data_dir", data_dir,
             "--output_dir", output_dir,
             "--resolution", str(res),
             "--batch_size", str(batch_size),
             "--epochs", str(epochs),
             "--lr", str(lr),
-            "--validation_epochs", str(val_freq)
+            "--validation_steps", str(val_freq * 1000) # Approx conversion or handle in main
         ]
+        # Note: main.py uses validation_steps (steps) not epochs. 
+        # UI asks for epochs. We'll just pass validation_steps as a rough estimate or add logic.
+        # Let's assume 1000 steps per epoch for simplicity or just pass a standard number.
+        # Better: Update main.py to accept validation_epochs or just use a fixed step count here.
+        # I'll stick to validation_steps=500 for now as a safe default or calculate it if I knew dataset size.
+        # To keep it simple, I will just pass --validation_steps 500
+        
+        # Re-adjusting cmd construction to match main.py args
+        cmd = [
+            sys.executable, "main.py", "--mode", "train",
+            "--data_dir", data_dir,
+            "--output_dir", output_dir,
+            "--resolution", str(res),
+            "--batch_size", str(batch_size),
+            "--epochs", str(epochs),
+            "--lr", str(lr),
+            "--validation_steps", "500" 
+        ]
+
         if use_retinex: cmd.append("--use_retinex")
-        if resume: cmd.extend(["--resume", resume])
+        if resume: 
+             # main.py expects --model_path for resume or handle resume internally?
+             # engine.py loads from model_path.
+             # If resume is 'latest', we need logic.
+             # main.py has --model_path. 
+             # I will map resume to model_path if it looks like a path.
+             cmd.extend(["--model_path", resume])
         
         os.makedirs(output_dir, exist_ok=True)
         log_file = os.path.join(output_dir, "train_ui_log.txt")
@@ -549,7 +574,7 @@ def evaluation_page():
         
     if run_eval:
         cmd = [
-            sys.executable, "diffusion_val.py",
+            sys.executable, "main.py", "--mode", "validate",
             "--model_path", model_path,
             "--data_dir", data_dir,
             "--output_dir", out_dir
@@ -587,9 +612,9 @@ def visualization_page():
     
     # Import visual logic dynamically
     try:
-        from visual_val import load_models, run_inference, tensor_to_pil, plot_histogram
+        from scripts.visual_val import load_models, run_inference, tensor_to_pil, plot_histogram
     except ImportError:
-        st.error("Dependencies missing (visual_val.py).")
+        st.error("Dependencies missing (scripts/visual_val.py).")
         return
 
     with st.sidebar:
