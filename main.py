@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import subprocess
+import random
 from core.engine import DiffusionEngine
 
 def get_args():
@@ -14,7 +15,7 @@ def get_args():
     parser.add_argument("--data_dir", type=str, default="../datasets/kitti_LOL")
     parser.add_argument("--output_dir", type=str, default="runs/exp1")
     parser.add_argument("--model_path", type=str, default=None, help="Path to pretrained model for predict/validate/resume")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=random.randint(0, 1000000), help="Random seed for reproducibility")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--report_to", type=str, default="tensorboard")

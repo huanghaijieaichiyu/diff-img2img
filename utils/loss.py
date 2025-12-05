@@ -7,6 +7,7 @@ class FrequencyDomainLoss(nn.Module):
     """
     Frequency Domain Loss using Fast Fourier Transform (FFT).
     Computes L1 loss between the amplitude and phase of the prediction and target.
+    Uses orthonormal normalization to ensure scale invariance.
     """
     def __init__(self, loss_type='l1', alpha=1.0, beta=1.0):
         super(FrequencyDomainLoss, self).__init__()
@@ -15,9 +16,9 @@ class FrequencyDomainLoss(nn.Module):
         self.beta = beta    # Weight for phase loss
 
     def forward(self, pred, target):
-        # FFT
-        pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
-        target_fft = torch.fft.fft2(target, dim=(-2, -1))
+        # FFT with ortho normalization for energy preservation
+        pred_fft = torch.fft.fft2(pred, dim=(-2, -1), norm='ortho')
+        target_fft = torch.fft.fft2(target, dim=(-2, -1), norm='ortho')
 
         pred_amp = torch.abs(pred_fft)
         pred_phase = torch.angle(pred_fft)
@@ -37,32 +38,57 @@ class FrequencyDomainLoss(nn.Module):
 
 class EdgeLoss(nn.Module):
     """
-    Edge Loss using Sobel filters.
+    Edge Loss using Sobel filters with pre-smoothing.
     Computes L1 loss between the edge maps of prediction and target.
+    Includes Gaussian blurring to suppress noise and improve robustness.
     """
     def __init__(self):
         super(EdgeLoss, self).__init__()
-        k = torch.Tensor([[.125, .25, .125], [.25, .5, .25], [.125, .25, .125]])
-        self.kernel = torch.Tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
+        # 3x3 Gaussian Kernel for smoothing
+        # approx sigma=0.85
+        self.gaussian_kernel = torch.Tensor([
+            [1/16, 2/16, 1/16],
+            [2/16, 4/16, 2/16],
+            [1/16, 2/16, 1/16]
+        ])
+        
+        # Sobel Kernels
+        self.sobel_kernel_x = torch.Tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
+        self.sobel_kernel_y = torch.Tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
+        
         self.loss = nn.L1Loss()
 
     def forward(self, pred, target):
         b, c, h, w = pred.shape
+        device = pred.device
         
-        # Create Sobel kernels for each channel
-        # Vertical edges
-        kernel_v = self.kernel.expand(c, 1, 3, 3).to(pred.device)
-        # Horizontal edges
-        kernel_h = self.kernel.t().expand(c, 1, 3, 3).to(pred.device)
+        # Prepare kernels
+        gaussian = self.gaussian_kernel.expand(c, 1, 3, 3).to(device)
+        sobel_x = self.sobel_kernel_x.expand(c, 1, 3, 3).to(device)
+        sobel_y = self.sobel_kernel_y.expand(c, 1, 3, 3).to(device)
         
-        pred_v = F.conv2d(pred, kernel_v, groups=c, padding=1)
-        pred_h = F.conv2d(pred, kernel_h, groups=c, padding=1)
+        # 1. Smooth images
+        # Use replication padding to reduce border artifacts
+        pad_p = (1, 1, 1, 1)
+        pred_smooth = F.conv2d(F.pad(pred, pad_p, mode='replicate'), gaussian, groups=c)
+        target_smooth = F.conv2d(F.pad(target, pad_p, mode='replicate'), gaussian, groups=c)
         
-        target_v = F.conv2d(target, kernel_v, groups=c, padding=1)
-        target_h = F.conv2d(target, kernel_h, groups=c, padding=1)
+        # 2. Compute Edges
+        # Apply Sobel X
+        pred_dx = F.conv2d(F.pad(pred_smooth, pad_p, mode='replicate'), sobel_x, groups=c)
+        target_dx = F.conv2d(F.pad(target_smooth, pad_p, mode='replicate'), sobel_x, groups=c)
         
-        loss = self.loss(pred_v, target_v) + self.loss(pred_h, target_h)
-        return loss
+        # Apply Sobel Y
+        pred_dy = F.conv2d(F.pad(pred_smooth, pad_p, mode='replicate'), sobel_y, groups=c)
+        target_dy = F.conv2d(F.pad(target_smooth, pad_p, mode='replicate'), sobel_y, groups=c)
+        
+        # 3. Compute Loss
+        # Combine gradients (magnitude) or sum losses separately
+        # Summing L1 losses of gradients is standard for Edge Loss
+        loss_x = self.loss(pred_dx, target_dx)
+        loss_y = self.loss(pred_dy, target_dy)
+        
+        return loss_x + loss_y
 
 
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
@@ -212,8 +238,8 @@ class CompositeLoss(nn.Module):
     def forward(self, pred, target):
         """
         Args:
-            pred: Predicted image (B, C, H, W)
-            target: Ground truth image (B, C, H, W)
+            pred: Predicted image (B, C, H, W) - Expected range roughly [-1, 1]
+            target: Ground truth image (B, C, H, W) - Expected range [-1, 1]
         """
         # Ensure inputs are on the same device
         if pred.device != target.device:
@@ -222,7 +248,12 @@ class CompositeLoss(nn.Module):
         l_char = self.char_loss(pred, target)
         l_edge = self.edge_loss(pred, target)
         l_freq = self.freq_loss(pred, target)
-        l_ssim = self.ssim_loss(pred, target)
+        
+        # Normalize to [0, 1] for SSIM calculation
+        # Diffusion models typically operate in [-1, 1]
+        pred_01 = (pred.clamp(-1, 1) + 1) / 2
+        target_01 = (target.clamp(-1, 1) + 1) / 2
+        l_ssim = self.ssim_loss(pred_01, target_01)
         
         total_loss = (self.w_char * l_char +
                       self.w_edge * l_edge +

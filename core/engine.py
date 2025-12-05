@@ -192,12 +192,33 @@ class DiffusionEngine:
                         del tracker_config[k]
             self.accelerator.init_trackers(Path(self.args.output_dir).name, config=tracker_config)
 
+        # Resume logic
+        global_step = 0
+        first_epoch = 0
+        if self.args.resume:
+            if self.args.resume == "latest":
+                # Get the most recent checkpoint
+                dirs = os.listdir(self.args.output_dir)
+                dirs = [d for d in dirs if d.startswith("checkpoint-")]
+                if len(dirs) > 0:
+                    dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+                    self.args.resume = os.path.join(self.args.output_dir, dirs[-1])
+                else:
+                    self.args.resume = None
+            
+            if self.args.resume and os.path.isdir(self.args.resume):
+                logger.info(f"Resuming training from checkpoint: {self.args.resume}")
+                self.accelerator.load_state(self.args.resume)
+                global_step = int(os.path.basename(self.args.resume).split("-")[1])
+                first_epoch = global_step // num_update_steps_per_epoch
+            else:
+                logger.info(f"Checkpoint {self.args.resume} not found. Starting from scratch.")
+
         # Loop
         logger.info("***** Running training *****")
-        global_step = 0
-        progress_bar = tqdm(range(global_step, self.args.max_train_steps), disable=not self.accelerator.is_local_main_process)
+        progress_bar = tqdm(range(global_step, self.args.max_train_steps), initial=global_step, total=self.args.max_train_steps, disable=not self.accelerator.is_local_main_process)
 
-        for epoch in range(self.args.epochs):
+        for epoch in range(first_epoch, self.args.epochs):
             self.training_model.train()
             for step, batch in enumerate(train_dataloader):
                 loss, logs = self._train_step(batch, optimizer, lr_scheduler)
@@ -219,6 +240,9 @@ class DiffusionEngine:
 
                 if global_step >= self.args.max_train_steps:
                     break
+            
+            if global_step >= self.args.max_train_steps:
+                break
         
         self.accelerator.end_training()
         self._save_final_model()
@@ -273,6 +297,10 @@ class DiffusionEngine:
                 "lr": lr_scheduler.get_last_lr()[0]
             }
 
+            # Add detailed composite logs
+            for k, v in loss_logs.items():
+                logs[k] = v.item() if isinstance(v, torch.Tensor) else v
+
             loss_retinex = 0.0
             if self.args.use_retinex and r_low is not None:
                 low_light_01 = (low_light_images / 2 + 0.5).clamp(0, 1)
@@ -290,14 +318,16 @@ class DiffusionEngine:
                     "l_ref": loss_reflectance.item(),
                     "l_tv": loss_tv.item()
                 })
+            
+            # Update total loss in logs
+            logs["loss"] = loss.item()
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
                 self.accelerator.clip_grad_norm_(self.training_model.parameters(), 5.0)
-
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
         return loss, logs
 
@@ -479,13 +509,20 @@ class DiffusionEngine:
     def _inference_step(self, low_light, unet, decom, scheduler):
         latents = torch.randn_like(low_light) * scheduler.init_noise_sigma
         
+        # Pre-compute Retinex decomposition (Optimization)
+        conditioning_extra = None
+        if decom is not None:
+            low_01 = (low_light / 2 + 0.5).clamp(0, 1)
+            with torch.no_grad():
+                r, i = decom(low_01)
+            # Normalize to [-1, 1]
+            conditioning_extra = torch.cat([r * 2 - 1, i * 2 - 1], dim=1)
+
         for t in scheduler.timesteps:
             latent_input = scheduler.scale_model_input(latents, t)
             
-            if decom is not None:
-                low_01 = (low_light / 2 + 0.5).clamp(0, 1)
-                r, i = decom(low_01)
-                model_input = torch.cat([latent_input, r * 2 - 1, i * 2 - 1], dim=1)
+            if conditioning_extra is not None:
+                model_input = torch.cat([latent_input, conditioning_extra], dim=1)
             else:
                 model_input = torch.cat([latent_input, low_light], dim=1)
             
