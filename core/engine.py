@@ -211,6 +211,15 @@ class DiffusionEngine:
                 self.accelerator.load_state(self.args.resume)
                 global_step = int(os.path.basename(self.args.resume).split("-")[1])
                 first_epoch = global_step // num_update_steps_per_epoch
+                
+                # Resume EMA
+                if self.args.use_ema and self.ema_model:
+                    ema_path = os.path.join(self.args.resume, "ema_model.pth")
+                    if os.path.exists(ema_path):
+                        self.ema_model.load_state_dict(torch.load(ema_path, map_location=self.accelerator.device))
+                        logger.info(f"Resumed EMA model from {ema_path}")
+                    else:
+                        logger.warning(f"EMA model enabled but not found at {ema_path}")
             else:
                 logger.info(f"Checkpoint {self.args.resume} not found. Starting from scratch.")
 
@@ -327,6 +336,11 @@ class DiffusionEngine:
                 self.accelerator.clip_grad_norm_(self.training_model.parameters(), 5.0)
                 optimizer.step()
                 lr_scheduler.step()
+                
+                # Update EMA
+                if self.args.use_ema and self.ema_model:
+                    self.ema_model.step(self.accelerator.unwrap_model(self.training_model).unet.parameters())
+                
                 optimizer.zero_grad()
 
         return loss, logs

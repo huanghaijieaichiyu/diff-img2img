@@ -3,94 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class FrequencyDomainLoss(nn.Module):
-    """
-    Frequency Domain Loss using Fast Fourier Transform (FFT).
-    Computes L1 loss between the amplitude and phase of the prediction and target.
-    Uses orthonormal normalization to ensure scale invariance.
-    """
-    def __init__(self, loss_type='l1', alpha=1.0, beta=1.0):
-        super(FrequencyDomainLoss, self).__init__()
-        self.loss_type = loss_type
-        self.alpha = alpha  # Weight for amplitude loss
-        self.beta = beta    # Weight for phase loss
-
-    def forward(self, pred, target):
-        # FFT with ortho normalization for energy preservation
-        pred_fft = torch.fft.fft2(pred, dim=(-2, -1), norm='ortho')
-        target_fft = torch.fft.fft2(target, dim=(-2, -1), norm='ortho')
-
-        pred_amp = torch.abs(pred_fft)
-        pred_phase = torch.angle(pred_fft)
-
-        target_amp = torch.abs(target_fft)
-        target_phase = torch.angle(target_fft)
-
-        if self.loss_type == 'l1':
-            loss_amp = F.l1_loss(pred_amp, target_amp)
-            loss_phase = F.l1_loss(pred_phase, target_phase)
-        else:
-            loss_amp = F.mse_loss(pred_amp, target_amp)
-            loss_phase = F.mse_loss(pred_phase, target_phase)
-
-        return self.alpha * loss_amp + self.beta * loss_phase
-
-
-class EdgeLoss(nn.Module):
-    """
-    Edge Loss using Sobel filters with pre-smoothing.
-    Computes L1 loss between the edge maps of prediction and target.
-    Includes Gaussian blurring to suppress noise and improve robustness.
-    """
-    def __init__(self):
-        super(EdgeLoss, self).__init__()
-        # 3x3 Gaussian Kernel for smoothing
-        # approx sigma=0.85
-        self.gaussian_kernel = torch.Tensor([
-            [1/16, 2/16, 1/16],
-            [2/16, 4/16, 2/16],
-            [1/16, 2/16, 1/16]
-        ])
-        
-        # Sobel Kernels
-        self.sobel_kernel_x = torch.Tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
-        self.sobel_kernel_y = torch.Tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
-        
-        self.loss = nn.L1Loss()
-
-    def forward(self, pred, target):
-        b, c, h, w = pred.shape
-        device = pred.device
-        
-        # Prepare kernels
-        gaussian = self.gaussian_kernel.expand(c, 1, 3, 3).to(device)
-        sobel_x = self.sobel_kernel_x.expand(c, 1, 3, 3).to(device)
-        sobel_y = self.sobel_kernel_y.expand(c, 1, 3, 3).to(device)
-        
-        # 1. Smooth images
-        # Use replication padding to reduce border artifacts
-        pad_p = (1, 1, 1, 1)
-        pred_smooth = F.conv2d(F.pad(pred, pad_p, mode='replicate'), gaussian, groups=c)
-        target_smooth = F.conv2d(F.pad(target, pad_p, mode='replicate'), gaussian, groups=c)
-        
-        # 2. Compute Edges
-        # Apply Sobel X
-        pred_dx = F.conv2d(F.pad(pred_smooth, pad_p, mode='replicate'), sobel_x, groups=c)
-        target_dx = F.conv2d(F.pad(target_smooth, pad_p, mode='replicate'), sobel_x, groups=c)
-        
-        # Apply Sobel Y
-        pred_dy = F.conv2d(F.pad(pred_smooth, pad_p, mode='replicate'), sobel_y, groups=c)
-        target_dy = F.conv2d(F.pad(target_smooth, pad_p, mode='replicate'), sobel_y, groups=c)
-        
-        # 3. Compute Loss
-        # Combine gradients (magnitude) or sum losses separately
-        # Summing L1 losses of gradients is standard for Edge Loss
-        loss_x = self.loss(pred_dx, target_dx)
-        loss_y = self.loss(pred_dy, target_dy)
-        
-        return loss_x + loss_y
-
-
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
     # return positive, negative label smoothing BCE targets
     return 1.0 - 0.5 * eps, 0.5 * eps
@@ -186,7 +98,7 @@ class SSIMLoss(nn.Module):
         else:
             window = self.create_window(self.window_size, channel)
             if img1.is_cuda:
-                window = window.cuda(img1.get_device())
+                window = window.to(img1.device)
             window = window.type_as(img1)
             self.window = window
             self.channel = channel
@@ -214,25 +126,17 @@ class CompositeLoss(nn.Module):
     Composite Loss for Low-Light Image Enhancement (Autonomous Driving).
     Combines:
     1. Pixel Loss (Charbonnier) - Robust reconstruction.
-    2. Edge Loss (Sobel) - Preserves lane lines/objects edges.
-    3. Frequency Loss (FFT) - Global consistency.
-    4. SSIM Loss - Structural similarity.
+    2. SSIM Loss - Structural similarity.
     """
     def __init__(self, 
                  w_char=1.0, 
-                 w_edge=0.0, # Disabled
-                 w_freq=0.0, # Disabled
                  w_ssim=0.1,
                  device='cuda'):
         super(CompositeLoss, self).__init__()
         self.w_char = w_char
-        self.w_edge = w_edge
-        self.w_freq = w_freq
         self.w_ssim = w_ssim
         
         self.char_loss = CharbonnierLoss()
-        # self.edge_loss = EdgeLoss()
-        # self.freq_loss = FrequencyDomainLoss()
         self.ssim_loss = SSIMLoss()
 
     def forward(self, pred, target):
@@ -246,10 +150,6 @@ class CompositeLoss(nn.Module):
             target = target.to(pred.device)
 
         l_char = self.char_loss(pred, target)
-        # l_edge = self.edge_loss(pred, target)
-        l_edge = torch.tensor(0.0, device=pred.device)
-        # l_freq = self.freq_loss(pred, target)
-        l_freq = torch.tensor(0.0, device=pred.device)
         
         # Normalize to [0, 1] for SSIM calculation
         # Diffusion models typically operate in [-1, 1]
@@ -258,18 +158,12 @@ class CompositeLoss(nn.Module):
         l_ssim = self.ssim_loss(pred_01, target_01)
         
         total_loss = (self.w_char * l_char +
-                      self.w_edge * l_edge +
-                      self.w_freq * l_freq +
                       self.w_ssim * l_ssim)
         
         logs = {
             'l_pix': l_char.detach(),
-            'l_edge': l_edge.detach(),
-            'l_freq': l_freq.detach(),
             'l_ssim': l_ssim.detach(),
             'l_total': total_loss.detach()
         }
         
         return total_loss, logs
-
-
