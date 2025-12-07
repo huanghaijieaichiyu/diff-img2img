@@ -20,7 +20,7 @@ from diffusers.training_utils import EMAModel
 from diffusers.optimization import get_scheduler
 from torcheval.metrics.functional import peak_signal_noise_ratio
 
-from utils.misic import ssim, Save_path, compute_snr, compute_min_snr_loss_weights, charbonnier_loss_elementwise
+from utils.misc import ssim, Save_path, compute_snr, compute_min_snr_loss_weights, charbonnier_loss_elementwise
 from utils.loss import CompositeLoss
 from datasets.data_set import LowLightDataset
 from models.retinex import DecomNet

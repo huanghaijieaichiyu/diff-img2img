@@ -73,7 +73,7 @@ class CharbonnierLoss(nn.Module):
 class SSIMLoss(nn.Module):
     """
     Structural Similarity (SSIM) Loss.
-    Implementation independent of utils.misic to avoid circular imports.
+    Implementation independent of utils.misc to avoid circular imports.
     """
     def __init__(self, window_size=11, channel=3):
         super(SSIMLoss, self).__init__()
