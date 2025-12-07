@@ -220,8 +220,8 @@ class CompositeLoss(nn.Module):
     """
     def __init__(self, 
                  w_char=1.0, 
-                 w_edge=0.05, 
-                 w_freq=0.01, 
+                 w_edge=0.0, # Disabled
+                 w_freq=0.0, # Disabled
                  w_ssim=0.1,
                  device='cuda'):
         super(CompositeLoss, self).__init__()
@@ -231,8 +231,8 @@ class CompositeLoss(nn.Module):
         self.w_ssim = w_ssim
         
         self.char_loss = CharbonnierLoss()
-        self.edge_loss = EdgeLoss()
-        self.freq_loss = FrequencyDomainLoss()
+        # self.edge_loss = EdgeLoss()
+        # self.freq_loss = FrequencyDomainLoss()
         self.ssim_loss = SSIMLoss()
 
     def forward(self, pred, target):
@@ -246,8 +246,10 @@ class CompositeLoss(nn.Module):
             target = target.to(pred.device)
 
         l_char = self.char_loss(pred, target)
-        l_edge = self.edge_loss(pred, target)
-        l_freq = self.freq_loss(pred, target)
+        # l_edge = self.edge_loss(pred, target)
+        l_edge = torch.tensor(0.0, device=pred.device)
+        # l_freq = self.freq_loss(pred, target)
+        l_freq = torch.tensor(0.0, device=pred.device)
         
         # Normalize to [0, 1] for SSIM calculation
         # Diffusion models typically operate in [-1, 1]
