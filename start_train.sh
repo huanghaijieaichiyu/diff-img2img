@@ -1,6 +1,6 @@
 accelerate launch main.py --mode train \
         --data_dir "/mnt/f/datasets/kitti_LOL" \
-        --epochs 50 \
+        --epochs 100 \
         --batch_size 4 \
         --resolution 256 \
         --num_workers 8 \

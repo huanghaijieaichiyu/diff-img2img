@@ -263,7 +263,7 @@ class DiffusionEngine:
         noise = torch.randn_like(clean_images)
         if self.args.offset_noise:
             offset_noise = torch.randn(clean_images.shape[0], clean_images.shape[1], 1, 1, device=clean_images.device)
-            noise = noise + 0.1 * offset_noise
+            noise = noise + self.args.offset_noise_scale * offset_noise
 
         bsz = clean_images.shape[0]
         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device).long()
@@ -318,8 +318,9 @@ class DiffusionEngine:
                 loss_reflectance = F.l1_loss(r_low, clean_images_01)
                 loss_tv = torch.mean(torch.abs(i_low[:, :, :-1, :] - i_low[:, :, 1:, :])) + \
                           torch.mean(torch.abs(i_low[:, :, :, :-1] - i_low[:, :, :, 1:]))
-                loss_retinex = loss_recon + loss_reflectance + 0.1 * loss_tv
-                loss += 0.1 * loss_retinex
+                loss_retinex = loss_recon + loss_reflectance + self.args.tv_loss_weight * loss_tv
+                loss_retinex = loss_recon + loss_reflectance + self.args.tv_loss_weight * loss_tv
+                loss += self.args.retinex_loss_weight * loss_retinex
                 
                 logs.update({
                     "l_ret": loss_retinex.item(),
@@ -333,7 +334,7 @@ class DiffusionEngine:
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self.training_model.parameters(), 5.0)
+                self.accelerator.clip_grad_norm_(self.training_model.parameters(), self.args.grad_clip_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 

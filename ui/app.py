@@ -87,6 +87,12 @@ TRANSLATIONS = {
         "launch_train": "🚀 Launch Training",
         "train_launched": "Training launched! Switch to 'Monitoring' tab.",
         "refresh_charts": "🔄 Refresh Charts",
+        "retinex_loss_weight": "Retinex Loss Weight",
+        "tv_loss_weight": "TV Loss Weight (Retinex)",
+        "grad_clip_norm": "Gradient Clip Norm",
+        "offset_noise_scale": "Offset Noise Scale",
+        "snr_gamma": "Min-SNR Gamma",
+        "adv_hyperparams": "🛠️ Advanced Hyperparameters",
         "terminal_output": "💻 Terminal Output",
         "eval_header": "📊 Evaluation",
         "eval_desc": "Calculate quantitative metrics (PSNR, SSIM, LPIPS) on the test set.",
@@ -176,6 +182,12 @@ TRANSLATIONS = {
         "launch_train": "🚀 启动训练",
         "train_launched": "训练已启动！切换到 '监控' 标签。",
         "refresh_charts": "🔄 刷新图表",
+        "retinex_loss_weight": "Retinex 损失权重",
+        "tv_loss_weight": "TV 损失权重 (Retinex)",
+        "grad_clip_norm": "梯度裁剪范数",
+        "offset_noise_scale": "偏移噪声缩放 (Offset Noise Scale)",
+        "snr_gamma": "Min-SNR Gamma",
+        "adv_hyperparams": "🛠️ 高级超参数",
         "terminal_output": "💻 终端输出",
         "eval_header": "📊 评估",
         "eval_desc": "在测试集上计算定量指标 (PSNR, SSIM, LPIPS)。",
@@ -216,29 +228,78 @@ st.set_page_config(
 # --- Custom CSS for Modern UI ---
 st.markdown("""
 <style>
+    /* Global Fonts */
+    html, body, [class*="css"] {
+        font-family: 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+    
+    /* Headings */
+    h1, h2, h3 {
+        font-weight: 700;
+        color: #1f2937;
+    }
+    
+    /* Buttons */
     .stButton button {
         width: 100%;
         border-radius: 8px;
-        font-weight: bold;
+        font-weight: 600;
+        border: none;
+        transition: all 0.2s ease-in-out;
+        padding: 0.6rem 1rem;
     }
-    .stSelectbox div[data-baseweb="select"] > div {
+    .stButton button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    
+    /* Inputs & Selects */
+    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div {
         border-radius: 8px;
+        border: 1px solid #e5e7eb;
     }
-    .stTextInput input {
-        border-radius: 8px;
+    .stTextInput input:focus, .stNumberInput input:focus {
+        border-color: #4f46e5;
+        box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
     }
+    
+    /* Expanders & Cards */
     div[data-testid="stExpander"] {
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        border-radius: 12px;
+        border: 1px solid #e5e7eb;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        background-color: #ffffff;
+        margin-bottom: 1rem;
     }
-    h1, h2, h3 {
-        font-family: 'Helvetica Neue', sans-serif;
-    }
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
+    
+    /* Metric Cards */
+    div[data-testid="metric-container"] {
+        background-color: #f9fafb;
+        padding: 1rem;
+        border-radius: 8px;
+        border: 1px solid #f3f4f6;
         text-align: center;
+        transition: transform 0.2s;
+    }
+    div[data-testid="metric-container"]:hover {
+        transform: scale(1.02);
+        border-color: #d1d5db;
+    }
+    
+    /* Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: #f8fafc;
+        border-right: 1px solid #e2e8f0;
+    }
+    
+    /* Custom Classes */
+    .metric-card {
+        background-color: #ffffff;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        text-align: center;
+        margin-bottom: 1rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -439,6 +500,17 @@ def training_page():
                 batch_size = st.number_input(t("batch_size"), value=4, min_value=1)
                 lr = st.number_input(t("lr"), value=1e-4, format="%.1e", step=1e-5)
                 val_freq = st.number_input(t("val_freq"), value=5, min_value=1)
+            
+            with st.expander(t("adv_hyperparams"), expanded=False):
+                ac1, ac2, ac3 = st.columns(3)
+                with ac1:
+                    retinex_loss_w = st.number_input(t("retinex_loss_weight"), value=0.1, step=0.01, format="%.2f")
+                    tv_loss_w = st.number_input(t("tv_loss_weight"), value=0.1, step=0.01, format="%.2f")
+                with ac2:
+                    grad_clip = st.number_input(t("grad_clip_norm"), value=5.0, step=0.1, format="%.1f")
+                    offset_noise = st.number_input(t("offset_noise_scale"), value=0.1, step=0.01, format="%.2f")
+                with ac3:
+                    snr_gamma = st.number_input(t("snr_gamma"), value=5.0, step=0.5, format="%.1f")
                 
             st.info(t("train_tip"))
             train_btn = st.form_submit_button(t("launch_train"), type="primary")
@@ -453,26 +525,17 @@ def training_page():
             "--batch_size", str(batch_size),
             "--epochs", str(epochs),
             "--lr", str(lr),
-            "--validation_steps", str(val_freq * 1000) # Approx conversion or handle in main
+            "--validation_steps", "500",
+            "--retinex_loss_weight", str(retinex_loss_w),
+            "--tv_loss_weight", str(tv_loss_w),
+            "--grad_clip_norm", str(grad_clip),
+            "--offset_noise_scale", str(offset_noise),
+            "--snr_gamma", str(snr_gamma)
         ]
-        # Note: main.py uses validation_steps (steps) not epochs. 
-        # UI asks for epochs. We'll just pass validation_steps as a rough estimate or add logic.
-        # Let's assume 1000 steps per epoch for simplicity or just pass a standard number.
-        # Better: Update main.py to accept validation_epochs or just use a fixed step count here.
-        # I'll stick to validation_steps=500 for now as a safe default or calculate it if I knew dataset size.
-        # To keep it simple, I will just pass --validation_steps 500
-        
-        # Re-adjusting cmd construction to match main.py args
-        cmd = [
-            sys.executable, "main.py", "--mode", "train",
-            "--data_dir", data_dir,
-            "--output_dir", output_dir,
-            "--resolution", str(res),
-            "--batch_size", str(batch_size),
-            "--epochs", str(epochs),
-            "--lr", str(lr),
-            "--validation_steps", "500" 
-        ]
+
+        # Enable offset noise flag if scale > 0
+        if offset_noise > 0:
+            cmd.append("--offset_noise")
 
         if use_retinex: cmd.append("--use_retinex")
         if resume: 

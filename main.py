@@ -36,6 +36,12 @@ def get_args():
     parser.add_argument("--offset_noise", action="store_true", help="Use offset noise")
     parser.add_argument("--snr_gamma", type=float, default=5.0)
     
+    # Custom Loss Weights and Training Hyperparameters
+    parser.add_argument("--retinex_loss_weight", type=float, default=0.1, help="Weight for the total Retinex loss.")
+    parser.add_argument("--tv_loss_weight", type=float, default=0.1, help="Weight for the Total Variation loss in Retinex.")
+    parser.add_argument("--grad_clip_norm", type=float, default=5.0, help="Gradient clipping norm.")
+    parser.add_argument("--offset_noise_scale", type=float, default=0.1, help="Scale for the offset noise if --offset_noise is used.")
+    
     # Model Args
     parser.add_argument("--use_retinex", action="store_true")
     parser.add_argument("--use_ema", action="store_true", default=True)
