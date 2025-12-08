@@ -22,39 +22,60 @@ class LowLightDataset(Dataset):
         self.data = []
 
         # === 1. 构建文件列表 (保持原逻辑不变) ===
-        if phase == "train":
-            subset = "our485"
-        elif phase == "test":
-            subset = "eval15"
+        if phase == "predict":
+            # 预测模式：直接加载目录下所有图片
+            valid_exts = ('.png', '.jpg', '.jpeg', '.bmp')
+            if os.path.exists(image_dir):
+                for root, _, files in os.walk(image_dir):
+                    for f in files:
+                        if f.lower().endswith(valid_exts):
+                            self.data.append(os.path.join(root, f))
+            self.data.sort()
+            if not self.data:
+                print(f"警告: 在 {image_dir} 中未找到图片。")
         else:
-            raise ValueError("phase must be 'train' or 'test'")
+            if phase == "train":
+                subset = "our485"
+            elif phase == "test":
+                subset = "eval15"
+            else:
+                raise ValueError("phase must be 'train', 'test' or 'predict'")
 
-        if subset == "eval15":
-            subset_dir = os.path.join(image_dir, "eval15")
-        elif subset == "our485":
-            subset_dir = os.path.join(image_dir, "our485")
+            if subset == "eval15":
+                subset_dir = os.path.join(image_dir, "eval15")
+            elif subset == "our485":
+                subset_dir = os.path.join(image_dir, "our485")
 
-        if os.path.exists(subset_dir):
-            high_dir = os.path.join(subset_dir, "high")
-            low_dir = os.path.join(subset_dir, "low")
-            # 过滤图片文件
-            image_names = [f for f in os.listdir(high_dir)
-                           if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
-            image_names.sort()
+            if os.path.exists(subset_dir):
+                high_dir = os.path.join(subset_dir, "high")
+                low_dir = os.path.join(subset_dir, "low")
+                # 过滤图片文件
+                image_names = [f for f in os.listdir(high_dir)
+                               if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+                image_names.sort()
 
-            for img_name in image_names:
-                low_path = os.path.join(low_dir, img_name)
-                high_path = os.path.join(high_dir, img_name)
-                # 简单检查低光文件是否存在
-                if os.path.exists(low_path):
-                    self.data.append((low_path, high_path))
-        else:
-            print(f"警告: 目录 {subset_dir} 不存在，数据集为空。")
+                for img_name in image_names:
+                    low_path = os.path.join(low_dir, img_name)
+                    high_path = os.path.join(high_dir, img_name)
+                    # 简单检查低光文件是否存在
+                    if os.path.exists(low_path):
+                        self.data.append((low_path, high_path))
+            else:
+                print(f"警告: 目录 {subset_dir} 不存在，数据集为空。")
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
+        if self.phase == "predict":
+            img_path = self.data[idx]
+            img = Image.open(img_path).convert("RGB")
+            # 预测时统一 Resize
+            img = TF.resize(img, (self.img_size, self.img_size))
+            img = TF.to_tensor(img)
+            img = TF.normalize(img, [0.5], [0.5])
+            return img
+
         low_img_path, high_img_path = self.data[idx]
 
         # === 2. 加载图像 ===

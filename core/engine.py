@@ -138,14 +138,27 @@ class DiffusionEngine:
 
         # Load DecomNet
         if self.decom_model is not None:
-            decom_path = os.path.join(path, "unet_final", "decom_model.pth")
-            if not os.path.exists(decom_path):
-                decom_path = os.path.join(path, "decom_model.pth")
+            # Candidates for DecomNet weights
+            candidates = [
+                os.path.join(path, "unet_final", "decom_model.pth"),
+                os.path.join(path, "decom_model.pth"),
+                os.path.join(path, "decom_model_best.pth"),
+                os.path.join(os.path.dirname(path), "decom_model.pth"),
+                os.path.join(os.path.dirname(path), "decom_model_best.pth"),
+            ]
             
-            if os.path.exists(decom_path):
-                self.decom_model.load_state_dict(torch.load(decom_path, map_location=self.accelerator.device))
-                logger.info("DecomNet loaded.")
-            else:
+            loaded = False
+            for decom_path in candidates:
+                if os.path.exists(decom_path):
+                    try:
+                        self.decom_model.load_state_dict(torch.load(decom_path, map_location=self.accelerator.device))
+                        logger.info(f"DecomNet loaded from {decom_path}.")
+                        loaded = True
+                        break
+                    except Exception as e:
+                        logger.warning(f"Found DecomNet at {decom_path} but failed to load: {e}")
+            
+            if not loaded:
                 logger.warning("DecomNet weights not found.")
 
     def train(self):
@@ -452,7 +465,7 @@ class DiffusionEngine:
 
     def _predict_image(self, scheduler):
         logger.info(f"Starting Image Prediction from {self.args.data_dir}")
-        dataset = LowLightDataset(image_dir=self.args.data_dir, img_size=self.args.resolution, phase="test")
+        dataset = LowLightDataset(image_dir=self.args.data_dir, img_size=self.args.resolution, phase="predict")
         dataloader = DataLoader(dataset, batch_size=self.args.batch_size, shuffle=False, num_workers=self.args.num_workers)
         
         out_dir = os.path.join(self.args.output_dir, 'predictions')
@@ -522,6 +535,7 @@ class DiffusionEngine:
         logger.info(f"\nVideo saved to {out_video}")
 
     def _inference_step(self, low_light, unet, decom, scheduler):
+        scheduler.set_timesteps(self.args.num_inference_steps)
         latents = torch.randn_like(low_light) * scheduler.init_noise_sigma
         
         # Pre-compute Retinex decomposition (Optimization)
