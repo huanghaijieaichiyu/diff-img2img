@@ -41,6 +41,7 @@ def get_args():
     parser.add_argument("--tv_loss_weight", type=float, default=0.1, help="Weight for the Total Variation loss in Retinex.")
     parser.add_argument("--grad_clip_norm", type=float, default=5.0, help="Gradient clipping norm.")
     parser.add_argument("--offset_noise_scale", type=float, default=0.1, help="Scale for the offset noise if --offset_noise is used.")
+    parser.add_argument("--online_synthesis", action="store_true", help="Enable on-the-fly random degradation synthesis during training (each epoch sees different low-light variants).")
     
     # Model Args
     parser.add_argument("--use_retinex", action="store_true")

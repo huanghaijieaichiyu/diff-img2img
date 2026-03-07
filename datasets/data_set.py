@@ -1,27 +1,42 @@
 import numpy as np
 import os
 import random
+import cv2
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import torchvision.transforms.functional as TF  # 关键引用：用于函数式变换
 from PIL import Image
 
+from scripts.darker import Darker
+
 
 class LowLightDataset(Dataset):
-    def __init__(self, image_dir, img_size=256, phase="train"):
+    def __init__(self, image_dir, img_size=256, phase="train",
+                 online_synthesis: bool = False,
+                 darker_ranges: dict = None):
         """
         Args:
             image_dir (string): 数据集根目录。
             img_size (int): 训练/测试时的图像分辨率。
-            phase (string): "train" 或 "test"。
+            phase (string): "train", "test" 或 "predict"。
+            online_synthesis (bool): 如果为 True，则在每次 __getitem__ 中
+                对 high 图像实时随机合成低光照退化，而非读取预生成的 low 图像。
+                仅在 phase="train" 时有效。
+            darker_ranges (dict): 自定义退化参数范围，传递给 Darker。
         """
         self.image_dir = image_dir
         self.img_size = img_size
         self.phase = phase
+        self.online_synthesis = online_synthesis and (phase == "train")
 
         self.data = []
 
-        # === 1. 构建文件列表 (保持原逻辑不变) ===
+        # 初始化在线合成引擎
+        self.darker = None
+        if self.online_synthesis:
+            self.darker = Darker(randomize=True, param_ranges=darker_ranges)
+
+        # === 1. 构建文件列表 ===
         if phase == "predict":
             # 预测模式：直接加载目录下所有图片
             valid_exts = ('.png', '.jpg', '.jpeg', '.bmp')
@@ -55,16 +70,29 @@ class LowLightDataset(Dataset):
                 image_names.sort()
 
                 for img_name in image_names:
-                    low_path = os.path.join(low_dir, img_name)
                     high_path = os.path.join(high_dir, img_name)
-                    # 简单检查低光文件是否存在
-                    if os.path.exists(low_path):
-                        self.data.append((low_path, high_path))
+                    if self.online_synthesis:
+                        # 在线合成模式：只需要 high 图像路径
+                        self.data.append((None, high_path))
+                    else:
+                        low_path = os.path.join(low_dir, img_name)
+                        if os.path.exists(low_path):
+                            self.data.append((low_path, high_path))
             else:
                 print(f"警告: 目录 {subset_dir} 不存在，数据集为空。")
 
     def __len__(self):
         return len(self.data)
+
+    def _online_degrade(self, high_pil: Image.Image) -> Image.Image:
+        """使用 Darker 引擎实时合成低光照退化图像。"""
+        # PIL -> BGR numpy
+        high_np = cv2.cvtColor(np.array(high_pil), cv2.COLOR_RGB2BGR)
+        # 应用随机退化
+        low_np = self.darker.degrade_single(high_np)
+        # BGR numpy -> PIL
+        low_pil = Image.fromarray(cv2.cvtColor(low_np, cv2.COLOR_BGR2RGB))
+        return low_pil
 
     def __getitem__(self, idx):
         if self.phase == "predict":
@@ -79,18 +107,20 @@ class LowLightDataset(Dataset):
         low_img_path, high_img_path = self.data[idx]
 
         # === 2. 加载图像 ===
-        # 必须确保转换为 RGB
-        low_img = Image.open(low_img_path).convert("RGB")
         high_img = Image.open(high_img_path).convert("RGB")
 
-        # === 3. 同步数据增强 (关键修改) ===
+        if self.online_synthesis:
+            # 在线合成：对 high 图像实时退化
+            low_img = self._online_degrade(high_img)
+        else:
+            low_img = Image.open(low_img_path).convert("RGB")
+
+        # === 3. 同步数据增强 ===
         if self.phase == "train":
             # A. 随机裁剪 (Random Crop)
-            # 获取随机裁剪参数
             i, j, h, w = transforms.RandomCrop.get_params(
                 low_img, output_size=(self.img_size, self.img_size))
 
-            # 对两张图应用【完全相同】的裁剪参数
             low_img = TF.crop(low_img, i, j, h, w)
             high_img = TF.crop(high_img, i, j, h, w)
 
@@ -100,7 +130,6 @@ class LowLightDataset(Dataset):
                 high_img = TF.hflip(high_img)
 
         else:
-            # 测试/验证阶段：统一 Resize 或 CenterCrop，不做随机操作
             low_img = TF.resize(low_img, (self.img_size, self.img_size))
             high_img = TF.resize(high_img, (self.img_size, self.img_size))
 
@@ -117,32 +146,30 @@ class LowLightDataset(Dataset):
 
 # 示例用法
 if __name__ == '__main__':
-    # 替换成你的真实路径
     data_dir = "../datasets/kitti_LOL"
 
-    # 只需要传入 img_size，内部会自动处理同步变换
     try:
+        # 在线合成模式测试
         train_dataset = LowLightDataset(
-            image_dir=data_dir, img_size=256, phase="train")
+            image_dir=data_dir, img_size=256, phase="train",
+            online_synthesis=True)
 
-        # 检查是否加载成功
         if len(train_dataset) > 0:
             train_loader = DataLoader(
                 train_dataset, batch_size=2, shuffle=True)
 
-            print("检查第一个 Batch 的数据对齐情况...")
+            print("检查第一个 Batch 的数据对齐情况 (在线合成模式)...")
             for low, high in train_loader:
                 print(
                     f"Low shape: {low.shape}, Range: [{low.min():.2f}, {low.max():.2f}]")
                 print(
                     f"High shape: {high.shape}, Range: [{high.min():.2f}, {high.max():.2f}]")
 
-                # 简单的肉眼验证：保存下来看看裁剪是否一致
                 transforms.ToPILImage()(
                     low[0]/2+0.5).save("debug_crop_low.png")
                 transforms.ToPILImage()(
                     high[0]/2+0.5).save("debug_crop_high.png")
-                print("已保存 debug_crop_low.png 和 debug_crop_high.png，请手动检查内容是否对应。")
+                print("已保存 debug_crop_low.png 和 debug_crop_high.png。")
                 break
         else:
             print(f"在 {data_dir} 未找到数据。")

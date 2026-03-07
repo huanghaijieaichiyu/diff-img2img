@@ -4,9 +4,9 @@ accelerate launch main.py --mode train \
         --batch_size 4 \
         --resolution 256 \
         --num_workers 8 \
-        --output_dir "runs/retinex" \
-        --use_retinex \
+        --output_dir "runs/no_retinex" \
         --mixed_precision="fp16" \
         --prediction_type="v_prediction" \
         --enable_xformers_memory_efficient_attention \
         --gradient_accumulation_steps 4 \
+        --online_synthesis \

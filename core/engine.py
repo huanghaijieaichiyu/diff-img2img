@@ -168,8 +168,10 @@ class DiffusionEngine:
         )
 
         # Dataloaders
+        online_syn = getattr(self.args, 'online_synthesis', False)
         train_dataset = LowLightDataset(
-            image_dir=self.args.data_dir, img_size=self.args.resolution, phase="train")
+            image_dir=self.args.data_dir, img_size=self.args.resolution, phase="train",
+            online_synthesis=online_syn)
         train_dataloader = DataLoader(
             train_dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=self.args.num_workers, pin_memory=True
         )
@@ -331,7 +333,6 @@ class DiffusionEngine:
                 loss_reflectance = F.l1_loss(r_low, clean_images_01)
                 loss_tv = torch.mean(torch.abs(i_low[:, :, :-1, :] - i_low[:, :, 1:, :])) + \
                           torch.mean(torch.abs(i_low[:, :, :, :-1] - i_low[:, :, :, 1:]))
-                loss_retinex = loss_recon + loss_reflectance + self.args.tv_loss_weight * loss_tv
                 loss_retinex = loss_recon + loss_reflectance + self.args.tv_loss_weight * loss_tv
                 loss += self.args.retinex_loss_weight * loss_retinex
                 

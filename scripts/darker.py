@@ -3,23 +3,70 @@ import os
 import numpy as np
 from tqdm import tqdm
 import random
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Any
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
+# ============================================================================
+#  Noise Models
+# ============================================================================
+
 def add_gaussian_noise(image: np.ndarray, mean: float = 0, sigma: float = 10) -> np.ndarray:
+    """Simple additive Gaussian noise (legacy, kept for compatibility)."""
     if image is None:
         return None
     img_float = image.astype(np.float32)
-    row, col, ch = img_float.shape
-    gauss = np.random.normal(mean, sigma, (row, col, ch))
+    gauss = np.random.normal(mean, sigma, img_float.shape)
     noisy = np.clip(img_float + gauss, 0, 255)
     return noisy.astype(np.uint8)
 
 
-def create_headlight_mask(height: int, width: int, center_y_factor=0.9, center_x_factor=0.5,
-                          beam_width_factor=0.6, falloff_sharpness=2.0, max_intensity=1.0) -> np.ndarray:
+def add_poisson_gaussian_noise(image: np.ndarray,
+                               k: float = 0.02,
+                               sigma_read: float = 5.0) -> np.ndarray:
+    """
+    Signal-dependent Poisson-Gaussian mixed noise model.
+    More realistic than pure Gaussian — models sensor physics:
+      - Poisson (shot noise): proportional to signal intensity
+      - Gaussian (read noise): additive, signal-independent
+
+    Args:
+        image: Input image [0, 255] uint8
+        k: Poisson noise scaling factor (higher = more shot noise)
+        sigma_read: Standard deviation of read noise (Gaussian)
+    """
+    if image is None:
+        return None
+    img_float = image.astype(np.float64)
+
+    # Shot noise (signal-dependent Poisson)
+    # Scale down, apply poisson, scale back
+    safe_img = np.maximum(img_float, 0)
+    if k > 0:
+        poisson_noise = np.random.poisson(safe_img * k) / k - img_float
+    else:
+        poisson_noise = 0
+
+    # Read noise (additive Gaussian, independent per channel)
+    read_noise = np.zeros_like(img_float)
+    for ch in range(img_float.shape[2]):
+        ch_sigma = sigma_read * random.uniform(0.8, 1.2)  # per-channel variation
+        read_noise[:, :, ch] = np.random.normal(0, ch_sigma, img_float.shape[:2])
+
+    noisy = img_float + poisson_noise + read_noise
+    return np.clip(noisy, 0, 255).astype(np.uint8)
+
+
+# ============================================================================
+#  Headlight / Light Source Simulation
+# ============================================================================
+
+def create_headlight_mask(height: int, width: int,
+                          center_y_factor=0.9, center_x_factor=0.5,
+                          beam_width_factor=0.6, falloff_sharpness=2.0,
+                          max_intensity=1.0) -> np.ndarray:
+    """Legacy single headlight mask (kept for compatibility)."""
     Y, X = np.ogrid[:height, :width]
     dist_y = np.maximum(0, (center_y_factor * height - Y) /
                         (center_y_factor * height))
@@ -28,22 +75,191 @@ def create_headlight_mask(height: int, width: int, center_y_factor=0.9, center_x
 
     falloff_y = np.exp(-falloff_sharpness * dist_y)
     falloff_x = np.exp(-falloff_sharpness * 0.5 *
-                       np.maximum(0, dist_x - (1-dist_y)*0.3)**2)
+                       np.maximum(0, dist_x - (1 - dist_y) * 0.3) ** 2)
 
     mask = np.clip(max_intensity * falloff_y * falloff_x, 0, 1)
-    return cv2.GaussianBlur(mask, (int(width*0.05) | 1, int(height*0.05) | 1), 0).astype(np.float32)
+    return cv2.GaussianBlur(mask, (int(width * 0.05) | 1, int(height * 0.05) | 1), 0).astype(np.float32)
 
+
+def create_random_headlight_mask(height: int, width: int,
+                                 num_lights: Optional[int] = None) -> np.ndarray:
+    """
+    Generate a randomized multi-source headlight mask.
+    Simulates varying positions, shapes, and intensities of light sources
+    as seen in real driving scenarios (oncoming cars, streetlights, reflections).
+
+    Args:
+        height, width: Image dimensions
+        num_lights: Number of light sources (None = random 0-4)
+    """
+    mask = np.zeros((height, width), dtype=np.float32)
+
+    if num_lights is None:
+        num_lights = random.randint(0, 4)
+
+    if num_lights == 0:
+        return mask
+
+    Y, X = np.ogrid[:height, :width]
+
+    for _ in range(num_lights):
+        # Randomize light source position (more likely in lower half)
+        cx = random.uniform(0.1, 0.9) * width
+        cy = random.uniform(0.4, 0.95) * height
+
+        # Randomize elliptical shape
+        radius_x = random.uniform(0.08, 0.35) * width
+        radius_y = random.uniform(0.06, 0.25) * height
+
+        # Compute normalized distance
+        dist = ((X - cx) / max(radius_x, 1)) ** 2 + ((Y - cy) / max(radius_y, 1)) ** 2
+
+        # Randomize falloff sharpness and intensity
+        sharpness = random.uniform(0.8, 3.5)
+        intensity = random.uniform(0.2, 1.0)
+
+        light = np.exp(-dist * sharpness) * intensity
+        mask = np.maximum(mask, light)
+
+    # Smooth the result
+    ksize_w = int(width * 0.04) | 1
+    ksize_h = int(height * 0.04) | 1
+    mask = cv2.GaussianBlur(mask, (ksize_w, ksize_h), 0)
+
+    return np.clip(mask, 0, 1).astype(np.float32)
+
+
+# ============================================================================
+#  Additional Degradation Effects
+# ============================================================================
+
+def apply_vignetting(image: np.ndarray, strength: float = 0.5) -> np.ndarray:
+    """
+    Simulate lens vignetting (darkened corners/edges).
+
+    Args:
+        image: Input image [0, 255] uint8
+        strength: Vignetting strength (0 = none, 1 = strong)
+    """
+    h, w = image.shape[:2]
+    Y, X = np.ogrid[:h, :w]
+
+    # Normalized distance from center
+    cy, cx = h / 2, w / 2
+    max_dist = np.sqrt(cx ** 2 + cy ** 2)
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2) / max_dist
+
+    # Smooth falloff
+    vignette = 1.0 - strength * (dist ** 2)
+    vignette = np.clip(vignette, 0, 1).astype(np.float32)
+
+    result = image.astype(np.float32) * vignette[:, :, np.newaxis]
+    return np.clip(result, 0, 255).astype(np.uint8)
+
+
+def apply_jpeg_artifact(image: np.ndarray, quality: int = 50) -> np.ndarray:
+    """
+    Simulate JPEG compression artifacts.
+
+    Args:
+        image: Input image [0, 255] uint8
+        quality: JPEG quality (lower = more artifacts)
+    """
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    _, encoded = cv2.imencode('.jpg', image, encode_param)
+    decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    return decoded
+
+
+def apply_motion_blur(image: np.ndarray,
+                      kernel_size: int = 7,
+                      angle: float = 0) -> np.ndarray:
+    """
+    Simulate motion blur caused by long exposure in low light.
+
+    Args:
+        image: Input image [0, 255] uint8
+        kernel_size: Blur kernel size (odd number)
+        angle: Motion direction in degrees
+    """
+    kernel_size = max(3, kernel_size | 1)  # ensure odd
+    kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+    kernel[kernel_size // 2, :] = 1.0
+    kernel /= kernel_size
+
+    # Rotate kernel by angle
+    center = (kernel_size // 2, kernel_size // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    kernel = cv2.warpAffine(kernel, M, (kernel_size, kernel_size))
+    kernel /= kernel.sum() + 1e-8
+
+    return cv2.filter2D(image, -1, kernel)
+
+
+# ============================================================================
+#  Main Darker Class
+# ============================================================================
 
 class Darker:
+    """
+    Enhanced low-light image synthesis engine with realistic degradation.
+
+    Supports two modes:
+      1. Offline batch processing (process_images) — for pre-generating datasets
+      2. Single-image processing (adjust_image / degrade_single) — for online synthesis
+
+    Key improvements over the original:
+      - Randomized degradation parameters per image
+      - Poisson-Gaussian mixed noise model
+      - Multi-source random headlight simulation
+      - Vignetting, motion blur, JPEG artifact simulation
+      - Configurable parameter ranges for diverse training data
+    """
+
+    # Default parameter ranges for randomized degradation
+    DEFAULT_RANGES = {
+        "gamma": (1.5, 4.0),
+        "linear_attenuation": (0.25, 0.7),
+        "saturation_factor": (0.4, 0.85),
+        "color_shift_factor": (0.0, 0.12),
+        "headlight_boost": (0.0, 0.9),
+        # Poisson-Gaussian noise
+        "noise_k": (0.005, 0.04),
+        "noise_sigma_read": (2.0, 15.0),
+        # Extra effects probabilities
+        "vignette_prob": 0.5,
+        "vignette_strength": (0.2, 0.6),
+        "motion_blur_prob": 0.2,
+        "motion_blur_kernel": (3, 9),
+        "jpeg_artifact_prob": 0.3,
+        "jpeg_quality": (40, 85),
+    }
+
     def __init__(self, data_dir: Optional[Union[str, Path]] = None,
-                 gamma: float = 2.5,  # SOTA style gamma correction
-                 linear_attenuation: float = 0.5,  # Linear scaling factor
-                 phase: str = "train"):
+                 gamma: float = 2.5,
+                 linear_attenuation: float = 0.5,
+                 phase: str = "train",
+                 randomize: bool = True,
+                 param_ranges: Optional[Dict[str, Any]] = None):
+        """
+        Args:
+            data_dir: Root directory of the dataset
+            gamma: Default gamma value (used when randomize=False)
+            linear_attenuation: Default attenuation (used when randomize=False)
+            phase: "train" or "test"
+            randomize: If True, randomize all degradation parameters per image
+            param_ranges: Custom parameter ranges (overrides DEFAULT_RANGES)
+        """
         self.gamma = gamma
         self.linear_attenuation = linear_attenuation
         self.phase = phase
+        self.randomize = randomize
         self.data_dir = Path(data_dir) if data_dir else None
-        self.mask_cache = {}
+
+        # Merge custom ranges with defaults
+        self.ranges = dict(self.DEFAULT_RANGES)
+        if param_ranges:
+            self.ranges.update(param_ranges)
 
         if self.data_dir:
             base_dir = "our485" if phase == "train" else "eval15"
@@ -51,70 +267,163 @@ class Darker:
             self.low_dir = self.data_dir / base_dir / "low"
             os.makedirs(self.low_dir, exist_ok=True)
 
-    def get_mask(self, h, w, **params):
-        key = (h, w)
-        if key not in self.mask_cache:
-            self.mask_cache[key] = create_headlight_mask(h, w, **params)
-        return self.mask_cache[key]
+    def _sample_params(self) -> dict:
+        """Sample random degradation parameters from configured ranges."""
+        r = self.ranges
+        return {
+            "gamma": random.uniform(*r["gamma"]),
+            "linear_attenuation": random.uniform(*r["linear_attenuation"]),
+            "saturation_factor": random.uniform(*r["saturation_factor"]),
+            "color_shift_factor": random.uniform(*r["color_shift_factor"]),
+            "headlight_boost": random.uniform(*r["headlight_boost"]),
+            "noise_k": random.uniform(*r["noise_k"]),
+            "noise_sigma_read": random.uniform(*r["noise_sigma_read"]),
+            "use_vignette": random.random() < r["vignette_prob"],
+            "vignette_strength": random.uniform(*r["vignette_strength"]),
+            "use_motion_blur": random.random() < r["motion_blur_prob"],
+            "motion_blur_kernel": random.choice(range(r["motion_blur_kernel"][0],
+                                                       r["motion_blur_kernel"][1] + 1, 2)),
+            "motion_blur_angle": random.uniform(0, 180),
+            "use_jpeg": random.random() < r["jpeg_artifact_prob"],
+            "jpeg_quality": random.randint(*r["jpeg_quality"]),
+        }
+
+    def degrade_single(self, img: np.ndarray, params: Optional[dict] = None) -> np.ndarray:
+        """
+        Apply full degradation pipeline to a single image.
+        This is the primary entry point for online (in-Dataset) synthesis.
+
+        Args:
+            img: Input BGR image [0, 255] uint8
+            params: Degradation parameters dict. If None, samples randomly.
+
+        Returns:
+            Degraded BGR image [0, 255] uint8
+        """
+        if img is None:
+            return None
+
+        if params is None:
+            params = self._sample_params() if self.randomize else {
+                "gamma": self.gamma,
+                "linear_attenuation": self.linear_attenuation,
+                "saturation_factor": 0.6,
+                "color_shift_factor": 0.1,
+                "headlight_boost": 0.5,
+                "noise_k": 0.02,
+                "noise_sigma_read": 5.0,
+                "use_vignette": False,
+                "vignette_strength": 0.0,
+                "use_motion_blur": False,
+                "motion_blur_kernel": 5,
+                "motion_blur_angle": 0,
+                "use_jpeg": False,
+                "jpeg_quality": 70,
+            }
+
+        h, w = img.shape[:2]
+        gamma = params["gamma"]
+        attenuation = params["linear_attenuation"]
+
+        # --- 1. Headlight mask ---
+        mask = create_random_headlight_mask(h, w)
+
+        # --- 2. Gamma + Attenuation in V channel ---
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
+        v = hsv[:, :, 2] / 255.0
+
+        v_dark = (v ** gamma) * attenuation
+
+        # --- 3. Headlight glow ---
+        boost = params["headlight_boost"]
+        v_final = v_dark * (1 - mask * boost) + v * (mask * boost)
+
+        hsv[:, :, 2] = np.clip(v_final * 255.0, 0, 255)
+
+        # --- 4. Saturation reduction ---
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * params["saturation_factor"], 0, 255)
+
+        adjusted = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
+
+        # --- 5. Color shift (Purkinje effect: blue shift in dark) ---
+        shift_factor = params["color_shift_factor"]
+        shift_map = shift_factor * (1.0 - mask) * np.mean(v_final) * 255
+        adjusted[:, :, 0] += shift_map     # Blue +
+        adjusted[:, :, 2] -= shift_map * 0.5  # Red -
+        adjusted = np.clip(adjusted, 0, 255).astype(np.uint8)
+
+        # --- 6. Vignetting ---
+        if params.get("use_vignette", False):
+            adjusted = apply_vignetting(adjusted, strength=params["vignette_strength"])
+
+        # --- 7. Motion blur ---
+        if params.get("use_motion_blur", False):
+            adjusted = apply_motion_blur(adjusted,
+                                         kernel_size=params["motion_blur_kernel"],
+                                         angle=params["motion_blur_angle"])
+
+        # --- 8. Realistic noise (Poisson-Gaussian) ---
+        adjusted = add_poisson_gaussian_noise(adjusted,
+                                              k=params["noise_k"],
+                                              sigma_read=params["noise_sigma_read"])
+
+        # --- 9. Optional JPEG compression artifact ---
+        if params.get("use_jpeg", False):
+            adjusted = apply_jpeg_artifact(adjusted, quality=params["jpeg_quality"])
+
+        return adjusted
 
     def adjust_image(self, img: np.ndarray, mask: np.ndarray,
                      saturation_factor: float = 0.6,
                      color_shift_factor: float = 0.1,
                      noise_sigma: float = 5.0,
                      headlight_boost: float = 0.8) -> np.ndarray:
-
+        """
+        Legacy API: apply degradation with explicit mask and simple Gaussian noise.
+        Kept for backward compatibility. For new code, prefer degrade_single().
+        """
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
         v = hsv[:, :, 2] / 255.0
 
-        # 1. Gamma Correction + Linear Attenuation (More realistic physics approximation)
-        # Low light = (High light)^Gamma * Attenuation
         v_dark = (v ** self.gamma) * self.linear_attenuation
 
-        # 2. Headlight Simulation
-        # Brighten areas based on mask
         mask_val = mask if mask.ndim == 2 else mask[:, :, 0]
         v_final = v_dark * (1 - mask_val * headlight_boost) + \
             v * (mask_val * headlight_boost)
 
         hsv[:, :, 2] = np.clip(v_final * 255.0, 0, 255)
-
-        # 3. Saturation adjustment
         hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation_factor, 0, 255)
 
         adjusted_bgr = cv2.cvtColor(hsv.astype(
             np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
 
-        # 4. Color Shift (Purkinje effect - blue shift in dark)
-        # Only shift in dark areas (low mask value)
         shift_map = color_shift_factor * \
             (1.0 - mask_val) * np.mean(v_final) * 255
-        adjusted_bgr[:, :, 0] += shift_map  # Blue +
-        adjusted_bgr[:, :, 2] -= shift_map * 0.5  # Red -
+        adjusted_bgr[:, :, 0] += shift_map
+        adjusted_bgr[:, :, 2] -= shift_map * 0.5
 
         adjusted_bgr = np.clip(adjusted_bgr, 0, 255).astype(np.uint8)
 
-        # 5. Noise
         if noise_sigma > 0:
             return add_gaussian_noise(adjusted_bgr, sigma=noise_sigma)
         return adjusted_bgr
 
-    def _process_single_image(self, filename: str, mask_params: dict, effect_params: dict):
-        """Helper function to process a single image in a worker process."""
+    def _process_single_image(self, filename: str):
+        """Process a single image with randomized or fixed degradation."""
         try:
             input_path = self.high_dir / filename
             img = cv2.imread(str(input_path))
             if img is None:
                 return
 
-            mask = self.get_mask(img.shape[0], img.shape[1], **mask_params)
-            dark = self.adjust_image(img, mask, **effect_params)
-
+            dark = self.degrade_single(img)
             output_path = self.low_dir / filename
             cv2.imwrite(str(output_path), dark)
         except Exception as e:
             print(f"Error processing {filename}: {e}")
 
-    def process_images(self, mask_params={}, num_workers: int = None, **effect_params):
+    def process_images(self, num_workers: int = None, **kwargs):
+        """Batch process all images in the dataset directory."""
         if not self.data_dir:
             raise RuntimeError("No data_dir provided")
 
@@ -127,61 +436,60 @@ class Darker:
             return
 
         if num_workers is None:
-            # Use all available cores
             num_workers = max(1, (os.cpu_count() or 1))
 
         print(f"Processing {len(files)} images with {num_workers} workers...")
+        print(f"Randomization: {'ON' if self.randomize else 'OFF'}")
+        print(f"Default gamma={self.gamma}, attenuation={self.linear_attenuation}")
 
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = [
-                executor.submit(self._process_single_image,
-                                f, mask_params, effect_params)
+                executor.submit(self._process_single_image, f)
                 for f in files
             ]
 
             for _ in tqdm(as_completed(futures), total=len(files), desc="Progress"):
                 pass
 
+        print(f"Done! Output saved to {self.low_dir}")
+
 
 if __name__ == '__main__':
-    # Configuration for realistic low-light synthesis
-    config = {
-        "gamma": 6.5,                # Higher = darker midtones
-        "linear_attenuation": 0.15,  # Global brightness scale
-        "headlight_boost": 0.9,      # Headlight brightness intensity
-        "noise_sigma": 8.0,          # Sensor noise
-        "saturation_factor": 0.5,    # Color washout
-        "color_shift_factor": 0.15,  # Blue tint strength
-        "mask_params": {
-            "center_y_factor": 0.9,
-            "beam_width_factor": 0.7,
-            "falloff_sharpness": 2.5
-        }
+    # =====================================================================
+    #  Configuration for realistic low-light synthesis
+    #  Key change: randomize=True enables per-image random degradation
+    # =====================================================================
+
+    data_dir = "/mnt/f/datasets/nuscenes_lol"  # Change to your dataset path
+
+    # Custom parameter ranges (optional, these are already the defaults)
+    custom_ranges = {
+        "gamma": (1.5, 4.0),              # Much lower than old 6.5
+        "linear_attenuation": (0.25, 0.7), # Higher than old 0.15
+        "saturation_factor": (0.4, 0.85),
+        "color_shift_factor": (0.0, 0.12),
+        "headlight_boost": (0.0, 0.9),
+        "noise_k": (0.005, 0.04),
+        "noise_sigma_read": (2.0, 15.0),
+        "vignette_prob": 0.5,
+        "vignette_strength": (0.2, 0.6),
+        "motion_blur_prob": 0.2,
+        "motion_blur_kernel": (3, 9),
+        "jpeg_artifact_prob": 0.3,
+        "jpeg_quality": (40, 85),
     }
 
-    # Separate parameters
-    init_keys = ['gamma', 'linear_attenuation']
-    init_params = {k: v for k, v in config.items() if k in init_keys}
-
-    mask_params = config.get('mask_params', {})
-
-    # Effect params are those not in init_keys and not mask_params
-    effect_params = {k: v for k, v in config.items(
-    ) if k not in init_keys and k != 'mask_params'}
-
-    # Note: Update data_dir to your actual dataset path
-    data_dir = "/mnt/f/datasets/nuscenes_lol"  # Change this to your dataset path
-
-    print(f"Initializing Darker with: {init_params}")
+    print("Initializing enhanced Darker with randomized degradation...")
     try:
-        darker = Darker(data_dir=data_dir, phase="train", **init_params)
-        darker.process_images(mask_params=mask_params, **effect_params)
+        darker = Darker(
+            data_dir=data_dir,
+            phase="train",
+            randomize=True,
+            param_ranges=custom_ranges,
+        )
+        darker.process_images()
 
-        # Also process test set if needed
-        # darker_test = Darker(data_dir=data_dir, phase="test", **init_params)
-        # darker_test.process_images(mask_params=mask_params, **effect_params)
-
-        print("Darker script completed.")
+        print("Darker script completed successfully.")
     except Exception as e:
         print(f"An error occurred: {e}")
         print("Please ensure your data_dir is correct.")
