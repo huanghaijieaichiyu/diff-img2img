@@ -3,58 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
-    # return positive, negative label smoothing BCE targets
-    return 1.0 - 0.5 * eps, 0.5 * eps
-
-
-class BCEBlurWithLogitsLoss(nn.Module):
-    # BCEwithLogitLoss() with reduced missing label effects.
-    def __init__(self, alpha=0.05):
-        super().__init__()
-        self.loss_fcn = nn.BCEWithLogitsLoss(reduction='none')  # must be nn.BCEWithLogitsLoss()
-        self.alpha = alpha
-        self.reduction = 'none'
-    def forward(self, pred, true):
-        loss = self.loss_fcn(pred, true)
-        pred = torch.sigmoid(pred)  # prob from logits
-        dx = pred - true  # reduce only missing label effects
-        # dx = (pred - true).abs()  # reduce missing label and false label effects
-        alpha_factor = 1 - torch.exp((dx - 1) / (self.alpha + 1e-4))
-        loss *= alpha_factor
-        return loss.mean()
-
-
-class FocalLoss(nn.Module):
-    # Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)
-    def __init__(self, loss_fcn, gamma=1.5, alpha=0.25):
-        super().__init__()
-        self.loss_fcn = loss_fcn  # must be nn.BCEWithLogitsLoss()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.reduction = loss_fcn.reduction
-        self.loss_fcn.reduction = 'none'  # required to apply FL to each element
-
-    def forward(self, pred, true):
-        loss = self.loss_fcn(pred, true)
-        # p_t = torch.exp(-loss)
-        # loss *= self.alpha * (1.000001 - p_t) ** self.gamma  # non-zero power for gradient stability
-
-        # TF implementation https://github.com/tensorflow/addons/blob/v0.7.1/tensorflow_addons/losses/focal_loss.py
-        pred_prob = torch.sigmoid(pred)  # prob from logits
-        p_t = true * pred_prob + (1 - true) * (1 - pred_prob)
-        alpha_factor = true * self.alpha + (1 - true) * (1 - self.alpha)
-        modulating_factor = (1.0 - p_t) ** self.gamma
-        loss *= alpha_factor * modulating_factor
-
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:  # 'none'
-            return loss
-
-
 class CharbonnierLoss(nn.Module):
     """
     Charbonnier Loss (L1 approximation) for robust regression.
@@ -73,7 +21,6 @@ class CharbonnierLoss(nn.Module):
 class SSIMLoss(nn.Module):
     """
     Structural Similarity (SSIM) Loss.
-    Implementation independent of utils.misc to avoid circular imports.
     """
     def __init__(self, window_size=11, channel=3):
         super(SSIMLoss, self).__init__()
@@ -121,23 +68,61 @@ class SSIMLoss(nn.Module):
         return 1 - ssim_map.mean()
 
 
+class LPIPSLoss(nn.Module):
+    """
+    Learned Perceptual Image Patch Similarity (LPIPS) Loss.
+    Uses a pre-trained VGG network to measure perceptual distance.
+    
+    This provides much better visual quality than pixel-only losses,
+    as it captures high-level texture and structural features.
+    """
+    def __init__(self, net='vgg'):
+        super(LPIPSLoss, self).__init__()
+        try:
+            import lpips
+            self.loss_fn = lpips.LPIPS(net=net, verbose=False)
+            # Freeze LPIPS network
+            for param in self.loss_fn.parameters():
+                param.requires_grad = False
+            self.available = True
+        except ImportError:
+            print("Warning: lpips package not found. LPIPS loss disabled.")
+            print("Install with: pip install lpips")
+            self.available = False
+    
+    def forward(self, pred, target):
+        """
+        Args:
+            pred, target: Images in [-1, 1] range, shape (B, C, H, W)
+        Returns:
+            Scalar LPIPS loss
+        """
+        if not self.available:
+            return torch.tensor(0.0, device=pred.device)
+        return self.loss_fn(pred, target).mean()
+
+
 class CompositeLoss(nn.Module):
     """
-    Composite Loss for Low-Light Image Enhancement (Autonomous Driving).
+    Composite Loss for Low-Light Image Enhancement.
     Combines:
     1. Pixel Loss (Charbonnier) - Robust reconstruction.
     2. SSIM Loss - Structural similarity.
+    3. LPIPS Loss - Perceptual quality (NEW).
     """
     def __init__(self, 
                  w_char=1.0, 
                  w_ssim=0.1,
+                 w_lpips=0.1,
                  device='cuda'):
         super(CompositeLoss, self).__init__()
         self.w_char = w_char
         self.w_ssim = w_ssim
+        self.w_lpips = w_lpips
         
         self.char_loss = CharbonnierLoss()
         self.ssim_loss = SSIMLoss()
+        self.lpips_loss = LPIPSLoss()
 
     def forward(self, pred, target):
         """
@@ -145,24 +130,27 @@ class CompositeLoss(nn.Module):
             pred: Predicted image (B, C, H, W) - Expected range roughly [-1, 1]
             target: Ground truth image (B, C, H, W) - Expected range [-1, 1]
         """
-        # Ensure inputs are on the same device
         if pred.device != target.device:
             target = target.to(pred.device)
 
         l_char = self.char_loss(pred, target)
         
         # Normalize to [0, 1] for SSIM calculation
-        # Diffusion models typically operate in [-1, 1]
         pred_01 = (pred.clamp(-1, 1) + 1) / 2
         target_01 = (target.clamp(-1, 1) + 1) / 2
         l_ssim = self.ssim_loss(pred_01, target_01)
         
+        # LPIPS expects [-1, 1] range directly
+        l_lpips = self.lpips_loss(pred.clamp(-1, 1), target.clamp(-1, 1))
+        
         total_loss = (self.w_char * l_char +
-                      self.w_ssim * l_ssim)
+                      self.w_ssim * l_ssim +
+                      self.w_lpips * l_lpips)
         
         logs = {
             'l_pix': l_char.detach(),
             'l_ssim': l_ssim.detach(),
+            'l_lpips': l_lpips.detach(),
             'l_total': total_loss.detach()
         }
         

@@ -447,15 +447,21 @@ def dataset_page():
         try:
             # Dynamic import to ensure fresh load
             from scripts.darker import Darker
-            mask_params = {"center_y_factor": 0.9, "beam_width_factor": beam_width, "falloff_sharpness": 2.5}
-            dk = Darker(data_dir=data_dir, phase=phase, gamma=gamma, linear_attenuation=linear_attenuation)
-            dk.process_images(
-                mask_params=mask_params, 
-                headlight_boost=headlight_boost,
-                noise_sigma=noise_sigma,
-                saturation_factor=saturation,
-                color_shift_factor=color_shift
+            # Use new Darker API with param_ranges
+            custom_ranges = {
+                "gamma": (gamma * 0.8, gamma * 1.2),
+                "linear_attenuation": (linear_attenuation * 0.8, linear_attenuation * 1.2),
+                "saturation_factor": (saturation * 0.8, min(saturation * 1.2, 1.0)),
+                "color_shift_factor": (0.0, color_shift),
+                "headlight_boost": (0.0, headlight_boost),
+                "noise_sigma_read": (noise_sigma * 0.5, noise_sigma * 1.5),
+            }
+            dk = Darker(
+                data_dir=data_dir, phase=phase, 
+                gamma=gamma, linear_attenuation=linear_attenuation,
+                randomize=True, param_ranges=custom_ranges
             )
+            dk.process_images()
             st.success(t("synthesis_complete"))
         except Exception as e:
             st.error(f"Error: {e}")
@@ -517,8 +523,9 @@ def training_page():
     
     # --- Launch Logic ---
     if train_btn and not st.session_state.training_pid:
+        # Use accelerate launch for mixed precision / distributed support
         cmd = [
-            sys.executable, "main.py", "--mode", "train",
+            "accelerate", "launch", "main.py", "--mode", "train",
             "--data_dir", data_dir,
             "--output_dir", output_dir,
             "--resolution", str(res),
@@ -530,7 +537,8 @@ def training_page():
             "--tv_loss_weight", str(tv_loss_w),
             "--grad_clip_norm", str(grad_clip),
             "--offset_noise_scale", str(offset_noise),
-            "--snr_gamma", str(snr_gamma)
+            "--snr_gamma", str(snr_gamma),
+            "--online_synthesis",
         ]
 
         # Enable offset noise flag if scale > 0

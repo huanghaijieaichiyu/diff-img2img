@@ -15,7 +15,7 @@ def get_args():
     parser.add_argument("--data_dir", type=str, default="../datasets/kitti_LOL")
     parser.add_argument("--output_dir", type=str, default="runs/exp1")
     parser.add_argument("--model_path", type=str, default=None, help="Path to pretrained model for predict/validate/resume")
-    parser.add_argument("--seed", type=int, default=random.randint(0, 1000000), help="Random seed for reproducibility")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"])
     parser.add_argument("--report_to", type=str, default="tensorboard")
@@ -42,6 +42,7 @@ def get_args():
     parser.add_argument("--grad_clip_norm", type=float, default=5.0, help="Gradient clipping norm.")
     parser.add_argument("--offset_noise_scale", type=float, default=0.1, help="Scale for the offset noise if --offset_noise is used.")
     parser.add_argument("--online_synthesis", action="store_true", help="Enable on-the-fly random degradation synthesis during training (each epoch sees different low-light variants).")
+    parser.add_argument("--freeze_decom_steps", type=int, default=0, help="Freeze DecomNet for the first N training steps. 0 = no freeze (default). Recommended: 1000-5000 for pre-training stability.")
     
     # Model Args
     parser.add_argument("--use_retinex", action="store_true")
@@ -58,7 +59,7 @@ def get_args():
     
     # Predict/Validate Args
     parser.add_argument("--num_inference_steps", type=int, default=20)
-    parser.add_argument("--num_validation_images", type=int, default=4)
+    parser.add_argument("--num_validation_images", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     
     # UI specific (dummy to avoid crash if passed)

@@ -1,22 +1,19 @@
-# Diff-Img2Img Studio: Low-Light Image Enhancement
+# Diff-Img2Img: Low-Light Image Enhancement with Retinex-Diffusion
 
 [![Model Download](https://img.shields.io/badge/Model%20Download-Cloud-blue?style=flat-square&logo=icloud)](https://cloud.189.cn/web/share?code=AJ7fUzBbuUzm) (Access Code: q2u9)
-[![GitHub Repo stars](https://img.shields.io/github/stars/yourusername/INR2RGB?style=social)](https://github.com/yourusername/INR2RGB)
 
-This is a Deep Learning project based on **PyTorch** and **Diffusers**, focusing on low-light image enhancement using **Conditional Diffusion Models**. It integrates **Retinex Theory** to decompose images into reflectance and illumination components for more stable training and better structural preservation.
-
-The project features a unified engine and a comprehensive **Web UI (Diff-Img2Img Studio)** for data preparation, training, evaluation, and visualization.
+A **Conditional Diffusion Model** framework for low-light image enhancement, integrating **Retinex Theory** for physically-grounded illumination decomposition. Built with PyTorch and 🤗 Diffusers.
 
 ## ✨ Key Features
 
--   **Unified Engine**: A robust `DiffusionEngine` (in `core/engine.py`) handling training, validation, and inference with `accelerate` support.
--   **Web UI Studio**: A Streamlit-based dashboard covering the entire workflow:
-    -   **Dataset Synthesis**: Physics-based low-light simulation (Gamma, Noise, Headlights) via `Darker` engine.
-    -   **Training**: Real-time monitoring of loss and learning rates.
-    -   **Evaluation**: PSNR, SSIM, and LPIPS metrics.
-    -   **Visualization**: Side-by-side comparison of enhanced images.
--   **Advanced Loss Functions**: Combines **Charbonnier Loss** (Pixel), **SSIM Loss** (Structure), **Edge Loss**, and **Frequency Loss**.
--   **Retinex-Diffusion**: Decomposes low-light images to guide the diffusion process.
+| Feature | Description |
+|---------|-------------|
+| **Retinex-Diffusion Architecture** | DecomNet decomposes images into Reflectance/Illumination, conditioning the diffusion UNet for stable training |
+| **Physics-Based Data Synthesis** | `Darker` engine with Poisson-Gaussian noise, multi-source headlights, vignetting, motion blur, JPEG artifacts |
+| **Online Synthesis** | On-the-fly random degradation during training — each epoch sees different low-light variants |
+| **Advanced Losses** | Charbonnier (pixel) + SSIM (structure) + **LPIPS** (perceptual) composite loss |
+| **Min-SNR Weighting** | Stabilized diffusion training via Min-SNR-γ loss weighting |
+| **Web UI Studio** | Full-stack Streamlit dashboard: data prep → training → evaluation → visualization |
 
 ## 🖼️ Gallery
 
@@ -26,105 +23,163 @@ The project features a unified engine and a comprehensive **Web UI (Diff-Img2Img
 
 ## 🛠️ Requirements
 
--   Python 3.8+
--   PyTorch 2.0+
--   CUDA (Recommended)
+- Python 3.10+
+- PyTorch 2.0+ with CUDA
+- ~6GB VRAM (batch_size=4, resolution=256)
 
-## 🚀 Installation
-
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/yourusername/Diff-Img2Img.git
-    cd Diff-Img2Img
-    ```
-
-2.  **Create environment:**
-    ```bash
-    conda create -n diff-img2img python=3.10
-    conda activate diff-img2img
-    ```
-
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-## 🖥️ Usage (Web UI)
-
-The recommended way to use the project is via the Web UI.
+## 🚀 Quick Start
 
 ```bash
-# Launch the Studio
-python main.py --mode ui
-```
-*(Or directly: `streamlit run ui/app.py`)*
+# 1. Clone & setup
+git clone https://github.com/yourusername/diff-img2img.git
+cd diff-img2img
+conda create -n diff-img2img python=3.10 && conda activate diff-img2img
+pip install -r requirements.txt
 
-Open your browser at `http://localhost:8501`.
+# 2. Prepare dataset (synthesize low-light from normal images)
+python scripts/darker.py
 
-## 💻 Usage (CLI)
-
-You can also use the unified `main.py` entry point for all operations.
-
-### 1. Training
-
-```bash
+# 3. Train
 accelerate launch main.py --mode train \
-    --data_dir ../datasets/kitti_LOL \
-    --output_dir runs/experiment_1 \
-    --resolution 256 \
+    --data_dir "../datasets/kitti_LOL" \
+    --output_dir "runs/retinex_exp" \
+    --use_retinex \
+    --online_synthesis \
+    --epochs 100 \
     --batch_size 4 \
-    --epochs 50 \
-    --use_retinex
-```
+    --resolution 256
 
-### 2. Prediction (Inference)
-
-**Single Image / Folder:**
-```bash
+# 4. Predict
 python main.py --mode predict \
-    --model_path runs/experiment_1 \
+    --model_path runs/retinex_exp \
     --data_dir ../datasets/test_images \
     --output_dir predictions \
     --use_retinex
 ```
 
-**Video:**
+## 💻 CLI Reference
+
+### Training
+
 ```bash
+accelerate launch main.py --mode train \
+    --data_dir "../datasets/kitti_LOL" \
+    --output_dir "runs/experiment" \
+    --use_retinex \
+    --online_synthesis \
+    --freeze_decom_steps 2000 \
+    --epochs 100 \
+    --batch_size 4 \
+    --resolution 256 \
+    --mixed_precision fp16 \
+    --prediction_type v_prediction \
+    --gradient_accumulation_steps 4
+```
+
+**Key training flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--use_retinex` | off | Enable Retinex decomposition conditioning |
+| `--online_synthesis` | off | On-the-fly random degradation (recommended) |
+| `--freeze_decom_steps` | 0 | Freeze DecomNet for first N steps |
+| `--prediction_type` | v_prediction | Diffusion target type |
+| `--offset_noise` | off | Enable offset noise for better dark regions |
+| `--checkpoints_total_limit` | None | Auto-delete old checkpoints (e.g., 5) |
+
+### Prediction
+
+```bash
+# Images
 python main.py --mode predict \
-    --model_path runs/experiment_1 \
-    --video_path input_video.mp4 \
-    --output_dir video_results \
+    --model_path runs/experiment \
+    --data_dir test_images/ \
+    --output_dir results/ \
+    --use_retinex
+
+# Video
+python main.py --mode predict \
+    --model_path runs/experiment \
+    --video_path input.mp4 \
+    --output_dir video_results/ \
     --use_retinex
 ```
 
-### 3. Validation
+### Validation
 
 ```bash
 python main.py --mode validate \
-    --model_path runs/experiment_1 \
-    --data_dir ../datasets/kitti_LOL \
+    --model_path runs/experiment \
+    --data_dir "../datasets/kitti_LOL" \
     --use_retinex
+# Metrics saved to: runs/experiment/metrics.txt (PSNR, SSIM, LPIPS)
+```
+
+### Web UI
+
+```bash
+python main.py --mode ui
+# Or directly: streamlit run ui/app.py
 ```
 
 ## 📂 Project Structure
 
 ```
-/
-├── core/               # Core engine and logic
-│   └── engine.py       # DiffusionEngine class
-├── models/             # Neural network architectures
-│   ├── diffusion.py    # Conditional UNet wrapper
-│   └── retinex.py      # DecomNet for Retinex decomposition
-├── ui/                 # Streamlit Web UI
-│   └── app.py
-├── scripts/            # Utility scripts
-│   ├── darker.py       # Data synthesis engine
-│   └── visual_val.py   # Visualization helpers
-├── datasets/           # Data loading logic
-├── utils/              # Helper functions (Loss, Metrics)
-├── main.py             # Unified entry point
-└── legacy/             # Old standalone scripts (deprecated)
+diff-img2img/
+├── core/
+│   └── engine.py           # DiffusionEngine: train, validate, predict
+├── models/
+│   ├── common.py           # Conv, C2f, ConvTranspose building blocks
+│   ├── diffusion.py        # CombinedModel (UNet + DecomNet wrapper)
+│   └── retinex.py          # DecomNet for Retinex decomposition
+├── datasets/
+│   └── data_set.py         # LowLightDataset (supports online_synthesis)
+├── scripts/
+│   ├── darker.py           # Physics-based degradation engine
+│   └── visual_val.py       # Visualization & inference helpers
+├── utils/
+│   ├── loss.py             # Charbonnier + SSIM + LPIPS losses
+│   └── misc.py             # SSIM, SNR helpers, seed utils
+├── ui/
+│   └── app.py              # Streamlit Web UI
+├── notebooks/
+│   └── train_test_notebook.ipynb  # Interactive tutorial
+├── main.py                 # Unified CLI entry point
+├── start_train.sh          # Training launch script
+└── accelerate_config.yaml  # HF Accelerate config
 ```
+
+## 🔬 Architecture
+
+```
+Input (Low-Light) ──┐
+                    ├─→ DecomNet ──→ Reflectance (R) + Illumination (I)
+                    │                      │
+                    │           ┌───────────┤
+                    │           ▼           ▼
+                    │    ┌──────────────────────┐
+ Noise (z_t) ──────┼──→│  Conditional UNet2D   │──→ Predicted noise/velocity
+                    │    │  (concat: z_t, R, I) │
+                    │    └──────────────────────┘
+                    │
+                    └─→ Composite Loss (Charbonnier + SSIM + LPIPS)
+                        Retinex Loss (Recon + Reflectance + TV)
+                        Diffusion Loss (Min-SNR weighted)
+```
+
+## 📊 Dataset Format
+
+```
+your_dataset/
+├── our485/          # Training split (485 pairs)
+│   ├── high/        # Normal-light ground truth
+│   └── low/         # Low-light images (can be auto-generated)
+└── eval15/          # Test split (15 pairs)
+    ├── high/
+    └── low/
+```
+
+> **Tip**: With `--online_synthesis`, you only need the `high/` directory — low-light images are synthesized on-the-fly.
 
 ## 📄 License
 

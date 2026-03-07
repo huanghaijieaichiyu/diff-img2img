@@ -2,6 +2,7 @@ import os
 import logging
 import math
 import random
+import shutil
 from pathlib import Path
 import cv2
 import numpy as np
@@ -102,6 +103,13 @@ class DiffusionEngine:
         if self.args.model_path:
             self._load_checkpoint(self.args.model_path)
 
+        # Optionally freeze DecomNet for the first N steps
+        self.freeze_decom_steps = getattr(self.args, 'freeze_decom_steps', 0)
+        if self.decom_model and self.freeze_decom_steps > 0:
+            logger.info(f"Freezing DecomNet for the first {self.freeze_decom_steps} steps.")
+            for param in self.decom_model.parameters():
+                param.requires_grad = False
+
         # Create Combined Model for Training
         self.training_model = CombinedModel(self.unet, self.decom_model)
         
@@ -172,8 +180,18 @@ class DiffusionEngine:
         train_dataset = LowLightDataset(
             image_dir=self.args.data_dir, img_size=self.args.resolution, phase="train",
             online_synthesis=online_syn)
+
+        def worker_init_fn(worker_id):
+            """Ensure each worker has a unique random seed for online synthesis."""
+            seed = (self.args.seed or 42) + worker_id
+            random.seed(seed)
+            import numpy as np
+            np.random.seed(seed)
+
         train_dataloader = DataLoader(
-            train_dataset, batch_size=self.args.batch_size, shuffle=True, num_workers=self.args.num_workers, pin_memory=True
+            train_dataset, batch_size=self.args.batch_size, shuffle=True,
+            num_workers=self.args.num_workers, pin_memory=True,
+            worker_init_fn=worker_init_fn if online_syn else None
         )
         
         # LR Scheduler
@@ -262,6 +280,14 @@ class DiffusionEngine:
                     if global_step % self.args.checkpointing_steps == 0:
                         self._save_checkpoint(global_step)
 
+                    # Unfreeze DecomNet after freeze_decom_steps
+                    if self.freeze_decom_steps > 0 and global_step == self.freeze_decom_steps:
+                        decom = self.accelerator.unwrap_model(self.training_model).decom_model
+                        if decom:
+                            logger.info(f"Unfreezing DecomNet at step {global_step}.")
+                            for param in decom.parameters():
+                                param.requires_grad = True
+
                 if global_step >= self.args.max_train_steps:
                     break
             
@@ -305,9 +331,12 @@ class DiffusionEngine:
             beta_prod_t = 1 - alpha_prod_t
             
             if self.args.prediction_type == "epsilon":
-                pred_x0 = (noisy_images - beta_prod_t ** (0.5) * model_pred) / alpha_prod_t ** (0.5)
+                pred_x0 = (noisy_images - beta_prod_t ** (0.5) * model_pred) / (alpha_prod_t ** (0.5) + 1e-8)
             else:
                 pred_x0 = alpha_prod_t ** (0.5) * noisy_images - beta_prod_t ** (0.5) * model_pred
+            
+            # Clamp for numerical stability (avoid extreme values at high timesteps)
+            pred_x0 = pred_x0.clamp(-1, 1)
             
             loss_composite, loss_logs = self.criterion(pred_x0, clean_images)
             
@@ -385,8 +414,18 @@ class DiffusionEngine:
         val_scheduler = DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config)
         val_scheduler.set_timesteps(self.args.num_inference_steps)
 
-        total_psnr, total_ssim = 0.0, 0.0
+        total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
         num_samples = 0
+        lpips_available = False
+        
+        # Try to load LPIPS metric
+        try:
+            import lpips
+            lpips_fn = lpips.LPIPS(net='vgg', verbose=False).to(self.accelerator.device)
+            lpips_fn.eval()
+            lpips_available = True
+        except ImportError:
+            logger.warning("lpips not installed. Skipping LPIPS metric. Install with: pip install lpips")
         
         # Prepare validation directory
         val_dir = os.path.join(self.args.output_dir, "validation")
@@ -403,13 +442,10 @@ class DiffusionEngine:
                 
                 # Save Visualization for the first batch
                 if i == 0:
-                    # Normalize to [0, 1] for visualization (assuming inputs are [-1, 1] for diff logic, but let's check)
-                    # Engine uses (x/2 + 0.5) so inputs seem to be [-1, 1]
                     vis_low = (val_low / 2 + 0.5).clamp(0, 1)
                     vis_clean = (val_clean / 2 + 0.5).clamp(0, 1)
-                    vis_enhanced = enhanced # already [0, 1] from inference_step
+                    vis_enhanced = enhanced  # already [0, 1] from inference_step
                     
-                    # Create Grid: Top=Low, Mid=Enhanced, Bot=Clean
                     grid = torch.cat([vis_low, vis_enhanced, vis_clean], dim=0)
                     grid_image = make_grid(grid, nrow=vis_low.shape[0], padding=2)
                     
@@ -419,16 +455,40 @@ class DiffusionEngine:
 
                 # Metrics (Images are [0, 1])
                 gt_images = (val_clean / 2 + 0.5).clamp(0, 1)
+                bsz = val_low.shape[0]
                 
-                total_psnr += peak_signal_noise_ratio(enhanced, gt_images, data_range=1.0).item() * val_low.shape[0]
-                total_ssim += ssim(enhanced, gt_images).item() * val_low.shape[0]
-                num_samples += val_low.shape[0]
+                total_psnr += peak_signal_noise_ratio(enhanced, gt_images, data_range=1.0).item() * bsz
+                total_ssim += ssim(enhanced, gt_images).item() * bsz
+                
+                if lpips_available:
+                    # LPIPS expects [-1, 1]
+                    enhanced_11 = enhanced * 2 - 1
+                    gt_11 = gt_images * 2 - 1
+                    total_lpips += lpips_fn(enhanced_11, gt_11).mean().item() * bsz
+                
+                num_samples += bsz
         
         if num_samples > 0:
             avg_psnr = total_psnr / num_samples
             avg_ssim = total_ssim / num_samples
-            logger.info(f"Validation: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}")
-            self.accelerator.log({"val/psnr": avg_psnr, "val/ssim": avg_ssim}, step=step)
+            avg_lpips = total_lpips / num_samples if lpips_available else 0.0
+            
+            log_msg = f"Validation: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}"
+            log_dict = {"val/psnr": avg_psnr, "val/ssim": avg_ssim}
+            if lpips_available:
+                log_msg += f", LPIPS={avg_lpips:.4f}"
+                log_dict["val/lpips"] = avg_lpips
+            logger.info(log_msg)
+            self.accelerator.log(log_dict, step=step)
+            
+            # Save metrics to file for UI and external tools
+            metrics_path = os.path.join(self.args.output_dir, "metrics.txt")
+            with open(metrics_path, 'w') as f:
+                f.write(f"PSNR: {avg_psnr:.4f}\n")
+                f.write(f"SSIM: {avg_ssim:.4f}\n")
+                if lpips_available:
+                    f.write(f"LPIPS: {avg_lpips:.4f}\n")
+                f.write(f"Step: {step}\n")
             
             # Best Model Check
             if avg_psnr > self.best_psnr:
@@ -566,6 +626,20 @@ class DiffusionEngine:
         self.accelerator.save_state(save_path)
         if self.args.use_ema:
             torch.save(self.ema_model.state_dict(), os.path.join(save_path, "ema_model.pth"))
+        
+        # Checkpoint cleanup: keep only the most recent N checkpoints
+        total_limit = getattr(self.args, 'checkpoints_total_limit', None)
+        if total_limit is not None and self.accelerator.is_main_process:
+            checkpoints = sorted(
+                [d for d in os.listdir(self.args.output_dir) if d.startswith("checkpoint-")],
+                key=lambda x: int(x.split("-")[1])
+            )
+            if len(checkpoints) > total_limit:
+                num_to_remove = len(checkpoints) - total_limit
+                for ckpt in checkpoints[:num_to_remove]:
+                    ckpt_path = os.path.join(self.args.output_dir, ckpt)
+                    logger.info(f"Removing old checkpoint: {ckpt_path}")
+                    shutil.rmtree(ckpt_path)
 
     def _save_final_model(self):
         if self.accelerator.is_main_process:

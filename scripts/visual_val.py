@@ -82,21 +82,22 @@ def run_inference(models, t_low, num_inference_steps, device):
     # Init Noise
     latents = torch.randn_like(t_low) * scheduler.init_noise_sigma
     
+    # Pre-compute Retinex decomposition OUTSIDE the loop (optimization)
+    conditioning_extra = None
+    if decom is not None:
+        low_light_01 = (t_low / 2 + 0.5).clamp(0, 1)
+        with torch.no_grad():
+            r_low, i_low = decom(low_light_01)
+        r_low_norm = r_low * 2.0 - 1.0
+        i_low_norm = i_low * 2.0 - 1.0
+        conditioning_extra = torch.cat([r_low_norm, i_low_norm], dim=1)
+    
     with torch.no_grad():
         for t in scheduler.timesteps:
             latent_model_input = scheduler.scale_model_input(latents, t)
             
-            if decom is not None:
-                # Retinex Decomposition
-                # Input to DecomNet should be [0, 1]
-                low_light_01 = (t_low / 2 + 0.5).clamp(0, 1)
-                r_low, i_low = decom(low_light_01)
-                
-                # Normalize R/I to [-1, 1] for UNet
-                r_low_norm = r_low * 2.0 - 1.0
-                i_low_norm = i_low * 2.0 - 1.0
-                
-                model_input = torch.cat([latent_model_input, r_low_norm, i_low_norm], dim=1)
+            if conditioning_extra is not None:
+                model_input = torch.cat([latent_model_input, conditioning_extra], dim=1)
             else:
                 model_input = torch.cat([latent_model_input, t_low], dim=1)
             
