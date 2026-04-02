@@ -1,44 +1,85 @@
-import os
+import csv
+import json
 import logging
 import math
+import os
 import random
 import shutil
+import sys
+import time
 from pathlib import Path
+
 import cv2
 import numpy as np
+import psutil
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, get_worker_info
 from torchvision import transforms
 from torchvision.utils import make_grid
 from tqdm.auto import tqdm
+
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from diffusers import UNet2DModel, DDPMScheduler
+from diffusers import DDPMScheduler, UNet2DModel
+from diffusers.optimization import get_scheduler
 from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from diffusers.training_utils import EMAModel
-from diffusers.optimization import get_scheduler
 from torcheval.metrics.functional import peak_signal_noise_ratio
 
-from utils.misc import ssim, Save_path, compute_snr, compute_min_snr_loss_weights, charbonnier_loss_elementwise
-from utils.loss import CompositeLoss
 from datasets.data_set import LowLightDataset
-from models.retinex import DecomNet
+from models.conditioning import PyramidConditionAdapter
 from models.diffusion import CombinedModel
+from models.retinex import DecomNet
+from utils.loss import CompositeLoss
+from utils.metrics import SemanticFeatureMetric, try_compute_niqe
+from utils.misc import charbonnier_loss_elementwise, compute_min_snr_loss_weights, ssim
+from utils.train_display import create_training_display
 from utils.video_writer import video_writer
 
 logger = get_logger(__name__, log_level="INFO")
+
 
 class DiffusionEngine:
     def __init__(self, args):
         self.args = args
         self.best_psnr = -1.0
-        
-        # 1. Initialize Accelerator
+        self.csv_fields = [
+            "step",
+            "epoch",
+            "phase",
+            "loss",
+            "lr",
+            "l_diff",
+            "l_x0",
+            "x0_w",
+            "l_ret",
+            "l_recon_low",
+            "l_recon_high",
+            "l_consistency",
+            "l_exposure",
+            "l_tv",
+            "data_time",
+            "compute_time",
+            "iter_time",
+            "data_wait_ratio",
+            "samples_per_sec",
+            "cpu_percent",
+            "cpu_rss_gb",
+            "gpu_allocated_gb",
+            "gpu_reserved_gb",
+            "gpu_max_reserved_gb",
+        ]
+        self.process = psutil.Process(os.getpid())
+        self.process.cpu_percent(None)
+        self.latest_validation_metrics = {}
+        self.status_json_path = os.path.join(args.output_dir, "training_status.json")
+
         logging_dir = os.path.join(args.output_dir, "logs")
         accelerator_project_config = ProjectConfiguration(
-            project_dir=args.output_dir, logging_dir=logging_dir
+            project_dir=args.output_dir,
+            logging_dir=logging_dir,
         )
         self.accelerator = Accelerator(
             gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -47,7 +88,6 @@ class DiffusionEngine:
             project_config=accelerator_project_config,
         )
 
-        # 2. Logging Setup
         logging.basicConfig(
             format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
             datefmt="%m/%d/%Y %H:%M:%S",
@@ -57,27 +97,22 @@ class DiffusionEngine:
 
         if args.seed is not None:
             set_seed(args.seed)
-        
+
         if self.accelerator.is_main_process:
             os.makedirs(args.output_dir, exist_ok=True)
 
-        # 3. Model Setup
+        self.metrics_csv_path = os.path.join(args.output_dir, "training_metrics.csv")
         self._setup_models()
-        
-        # 4. Scheduler Setup
+
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=1000,
             beta_schedule="squaredcos_cap_v2",
-            prediction_type=args.prediction_type
+            prediction_type=args.prediction_type,
         )
-        
-        # 5. Loss Setup (Only needed for training, but harmless to init)
         self.criterion = CompositeLoss(device=self.accelerator.device).to(self.accelerator.device)
 
     def _setup_models(self):
-        # Input channels: 3 (Noisy) + [3 (Reflectance) + 1 (Illumination) if Retinex else 3 (Low Light)]
-        input_channels = 7 if self.args.use_retinex else 6
-
+        input_channels = 10
         logger.info(f"Initializing UNet (Input Channels={input_channels})...")
         self.unet = UNet2DModel(
             sample_size=self.args.resolution,
@@ -86,7 +121,7 @@ class DiffusionEngine:
             layers_per_block=self.args.unet_layers_per_block,
             block_out_channels=self.args.unet_block_channels,
             down_block_types=tuple(self.args.unet_down_block_types),
-            up_block_types=tuple(self.args.unet_up_block_types)
+            up_block_types=tuple(self.args.unet_up_block_types),
         )
 
         if self.args.enable_xformers_memory_efficient_attention:
@@ -96,24 +131,31 @@ class DiffusionEngine:
 
         self.decom_model = None
         if self.args.use_retinex:
-            logger.info("Initializing Retinex Decomposition Network...")
+            logger.info("Initializing Retinex decomposition network...")
             self.decom_model = DecomNet().to(self.accelerator.device)
-        
-        # Load Pretrained/Checkpoint if provided
+
+        self.condition_adapter = PyramidConditionAdapter(
+            block_channels=self.args.unet_block_channels,
+            cond_out_channels=7,
+            base_channels=self.args.base_condition_channels,
+            use_retinex=self.args.use_retinex,
+            conditioning_space=self.args.conditioning_space,
+        ).to(self.accelerator.device)
+
         if self.args.model_path:
             self._load_checkpoint(self.args.model_path)
 
-        # Optionally freeze DecomNet for the first N steps
-        self.freeze_decom_steps = getattr(self.args, 'freeze_decom_steps', 0)
-        if self.decom_model and self.freeze_decom_steps > 0:
-            logger.info(f"Freezing DecomNet for the first {self.freeze_decom_steps} steps.")
-            for param in self.decom_model.parameters():
-                param.requires_grad = False
+        if self.args.use_retinex and self.args.decom_warmup_steps > 0:
+            self._set_trainable(self.unet, False)
+            self._set_trainable(self.condition_adapter, False)
 
-        # Create Combined Model for Training
-        self.training_model = CombinedModel(self.unet, self.decom_model)
-        
-        # EMA Setup
+        self.training_model = CombinedModel(
+            self.unet,
+            self.decom_model,
+            self.condition_adapter,
+            conditioning_space=self.args.conditioning_space,
+        )
+
         self.ema_model = None
         if self.args.use_ema:
             logger.info("Initializing EMA model...")
@@ -125,529 +167,1024 @@ class DiffusionEngine:
             )
             self.ema_model.to(self.accelerator.device)
 
+    @staticmethod
+    def _set_trainable(module, trainable: bool):
+        if module is None:
+            return
+        for parameter in module.parameters():
+            parameter.requires_grad = trainable
+
+    def _candidate_paths(self, path: str, filename: str):
+        return [
+            os.path.join(path, "unet_final", filename),
+            os.path.join(path, filename),
+            os.path.join(os.path.dirname(path), filename),
+        ]
+
     def _load_checkpoint(self, path):
         logger.info(f"Loading model from {path}...")
-        
-        # Load UNet
+
         unet_path = os.path.join(path, "unet_final")
         if not os.path.exists(unet_path):
-            unet_path = path # Fallback
-        
+            unet_path = os.path.join(path, "unet_best")
+        if not os.path.exists(unet_path):
+            unet_path = path
+
         try:
-            # Load state dict directly if it's a full model save, or use from_pretrained
             self.unet = UNet2DModel.from_pretrained(unet_path, use_safetensors=True)
-        except:
+        except Exception:
             try:
                 self.unet = UNet2DModel.from_pretrained(unet_path, use_safetensors=False)
-            except Exception as e:
-                logger.warning(f"Could not load UNet from {unet_path}: {e}")
+            except Exception as exc:
+                logger.warning(f"Could not load UNet from {unet_path}: {exc}")
 
         self.unet.to(self.accelerator.device)
 
-        # Load DecomNet
         if self.decom_model is not None:
-            # Candidates for DecomNet weights
-            candidates = [
-                os.path.join(path, "unet_final", "decom_model.pth"),
-                os.path.join(path, "decom_model.pth"),
-                os.path.join(path, "decom_model_best.pth"),
-                os.path.join(os.path.dirname(path), "decom_model.pth"),
-                os.path.join(os.path.dirname(path), "decom_model_best.pth"),
-            ]
-            
             loaded = False
-            for decom_path in candidates:
+            for decom_path in self._candidate_paths(path, "decom_model.pth") + self._candidate_paths(path, "decom_model_best.pth"):
                 if os.path.exists(decom_path):
                     try:
                         self.decom_model.load_state_dict(torch.load(decom_path, map_location=self.accelerator.device))
                         logger.info(f"DecomNet loaded from {decom_path}.")
                         loaded = True
                         break
-                    except Exception as e:
-                        logger.warning(f"Found DecomNet at {decom_path} but failed to load: {e}")
-            
+                    except Exception as exc:
+                        logger.warning(f"Failed to load DecomNet from {decom_path}: {exc}")
             if not loaded:
                 logger.warning("DecomNet weights not found.")
 
+        loaded_adapter = False
+        adapter_candidates = (
+            self._candidate_paths(path, "condition_adapter.pth") +
+            self._candidate_paths(path, "condition_adapter_best.pth") +
+            self._candidate_paths(path, "condition_adapter_final.pth")
+        )
+        for adapter_path in adapter_candidates:
+            if os.path.exists(adapter_path):
+                try:
+                    self.condition_adapter.load_state_dict(
+                        torch.load(adapter_path, map_location=self.accelerator.device),
+                        strict=False,
+                    )
+                    logger.info(f"Condition adapter loaded from {adapter_path}.")
+                    loaded_adapter = True
+                    break
+                except Exception as exc:
+                    logger.warning(f"Failed to load condition adapter from {adapter_path}: {exc}")
+        if not loaded_adapter:
+            logger.warning("Condition adapter weights not found.")
+
+    def _worker_init_fn(self, worker_id: int):
+        worker_info = get_worker_info()
+        worker_seed = worker_info.seed if worker_info is not None else (self.args.seed or 42) + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed % (2 ** 32 - 1))
+
+    def _collect_runtime_metrics(self, data_time: float, compute_time: float, batch_size: int) -> dict:
+        iter_time = max(data_time + compute_time, 1e-8)
+        metrics = {
+            "data_time": data_time,
+            "compute_time": compute_time,
+            "iter_time": iter_time,
+            "data_wait_ratio": data_time / iter_time,
+            "samples_per_sec": (batch_size * max(1, self.accelerator.num_processes)) / iter_time,
+            "cpu_percent": self.process.cpu_percent(None),
+            "cpu_rss_gb": self.process.memory_info().rss / (1024 ** 3),
+        }
+
+        if torch.cuda.is_available():
+            device = self.accelerator.device
+            metrics.update({
+                "gpu_allocated_gb": torch.cuda.memory_allocated(device) / (1024 ** 3),
+                "gpu_reserved_gb": torch.cuda.memory_reserved(device) / (1024 ** 3),
+                "gpu_max_reserved_gb": torch.cuda.max_memory_reserved(device) / (1024 ** 3),
+            })
+        else:
+            metrics.update({
+                "gpu_allocated_gb": 0.0,
+                "gpu_reserved_gb": 0.0,
+                "gpu_max_reserved_gb": 0.0,
+            })
+        return metrics
+
+    def _write_status_snapshot(self, logs: dict):
+        if not self.accelerator.is_main_process:
+            return
+
+        payload = dict(logs)
+        payload.update({
+            "train_profile": self.args.train_profile,
+            "mixed_precision": self.args.mixed_precision,
+            "use_retinex": self.args.use_retinex,
+        })
+        payload.update(self.latest_validation_metrics)
+
+        with open(self.status_json_path, "w") as status_file:
+            json.dump(payload, status_file, indent=2)
+
+    def _append_training_metrics(self, step: int, phase: str, logs: dict):
+        if not self.accelerator.is_main_process:
+            return
+
+        row = {key: logs.get(key, "") for key in self.csv_fields}
+        row["step"] = step
+        row["phase"] = phase
+
+        file_exists = os.path.exists(self.metrics_csv_path)
+        with open(self.metrics_csv_path, "a", newline="") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=self.csv_fields)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+        self._write_status_snapshot(row)
+
+    def _should_log_step(self, step: int, terminal_step: int | None = None) -> bool:
+        interval = max(1, int(getattr(self.args, "log_interval", 10)))
+        if step <= 1:
+            return True
+        if terminal_step is not None and step >= terminal_step:
+            return True
+        return step % interval == 0
+
+    def _x0_branch_weight(self, global_step: int) -> float:
+        if global_step < self.args.decom_warmup_steps:
+            return 0.0
+        if self.args.x0_loss_warmup_steps <= 0:
+            return self.args.x0_loss_weight
+        progress = (global_step - self.args.decom_warmup_steps + 1) / float(self.args.x0_loss_warmup_steps)
+        progress = max(0.0, min(1.0, progress))
+        return self.args.x0_loss_weight * progress
+
+    def _residual_target(self, clean_images: torch.Tensor, low_light_images: torch.Tensor) -> torch.Tensor:
+        return (clean_images - low_light_images) * self.args.residual_scale
+
+    def _decode_residual(self, low_light_images: torch.Tensor, residual_pred: torch.Tensor) -> torch.Tensor:
+        residual = residual_pred / max(self.args.residual_scale, 1e-6)
+        return (low_light_images + residual).clamp(-1, 1)
+
+    def _reconstruct_x0(self, noisy_target: torch.Tensor, model_pred: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(noisy_target.device)
+        alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
+        beta_prod_t = 1 - alpha_prod_t
+
+        if self.args.prediction_type == "epsilon":
+            pred_x0 = (noisy_target - beta_prod_t.sqrt() * model_pred) / (alpha_prod_t.sqrt() + 1e-8)
+        else:
+            pred_x0 = alpha_prod_t.sqrt() * noisy_target - beta_prod_t.sqrt() * model_pred
+        return pred_x0
+
+    @staticmethod
+    def _tv_loss(image: torch.Tensor) -> torch.Tensor:
+        return (
+            torch.mean(torch.abs(image[:, :, :-1, :] - image[:, :, 1:, :])) +
+            torch.mean(torch.abs(image[:, :, :, :-1] - image[:, :, :, 1:]))
+        )
+
+    def _compute_retinex_losses(self, aux: dict):
+        device = self.accelerator.device
+        zero = torch.tensor(0.0, device=device)
+
+        if not self.args.use_retinex or aux.get("r_low") is None or aux.get("i_low") is None:
+            return {
+                "retinex_total": zero,
+                "l_recon_low": zero,
+                "l_recon_high": zero,
+                "l_consistency": zero,
+                "l_exposure": zero,
+                "l_tv": zero,
+            }
+
+        low_light_01 = aux["low_light_01"]
+        r_low = aux["r_low"]
+        i_low = aux["i_low"]
+        recon_low = F.l1_loss(r_low * i_low, low_light_01)
+
+        r_high = aux.get("r_high")
+        i_high = aux.get("i_high")
+        clean_01 = aux.get("clean_images_01")
+
+        if r_high is None or i_high is None or clean_01 is None:
+            return {
+                "retinex_total": recon_low,
+                "l_recon_low": recon_low,
+                "l_recon_high": zero,
+                "l_consistency": zero,
+                "l_exposure": zero,
+                "l_tv": self._tv_loss(i_low),
+            }
+
+        recon_high = F.l1_loss(r_high * i_high, clean_01)
+        consistency = F.l1_loss(r_low, r_high)
+        tv_loss = self._tv_loss(i_low) + self._tv_loss(i_high)
+
+        mean_i_low = i_low.mean(dim=(1, 2, 3))
+        mean_i_high = i_high.mean(dim=(1, 2, 3))
+        exposure = F.relu(0.05 - (mean_i_high - mean_i_low)).mean()
+
+        total = (
+            recon_low +
+            recon_high +
+            self.args.retinex_consistency_weight * consistency +
+            self.args.tv_loss_weight * tv_loss +
+            self.args.retinex_exposure_weight * exposure
+        )
+
+        return {
+            "retinex_total": total,
+            "l_recon_low": recon_low,
+            "l_recon_high": recon_high,
+            "l_consistency": consistency,
+            "l_exposure": exposure,
+            "l_tv": tv_loss,
+        }
+
     def train(self):
-        # Optimizer
         optimizer = torch.optim.AdamW(
-            self.training_model.parameters(), lr=self.args.lr, weight_decay=1e-2, eps=1e-08
+            self.training_model.parameters(),
+            lr=self.args.lr,
+            weight_decay=1e-2,
+            eps=1e-08,
         )
 
-        # Dataloaders
-        online_syn = getattr(self.args, 'online_synthesis', False)
         train_dataset = LowLightDataset(
-            image_dir=self.args.data_dir, img_size=self.args.resolution, phase="train",
-            online_synthesis=online_syn)
-
-        def worker_init_fn(worker_id):
-            """Ensure each worker has a unique random seed for online synthesis."""
-            seed = (self.args.seed or 42) + worker_id
-            random.seed(seed)
-            import numpy as np
-            np.random.seed(seed)
-
-        train_dataloader = DataLoader(
-            train_dataset, batch_size=self.args.batch_size, shuffle=True,
-            num_workers=self.args.num_workers, pin_memory=True,
-            worker_init_fn=worker_init_fn if online_syn else None
+            image_dir=self.args.data_dir,
+            img_size=self.args.resolution,
+            phase="train",
+            online_synthesis=self.args.online_synthesis,
         )
-        
-        # LR Scheduler
+        train_loader_kwargs = {
+            "batch_size": self.args.batch_size,
+            "shuffle": True,
+            "num_workers": self.args.num_workers,
+            "pin_memory": True,
+            "drop_last": True,
+            "worker_init_fn": self._worker_init_fn,
+        }
+        if self.args.num_workers > 0:
+            train_loader_kwargs["persistent_workers"] = True
+            train_loader_kwargs["prefetch_factor"] = 4
+        train_dataloader = DataLoader(train_dataset, **train_loader_kwargs)
+
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / self.args.gradient_accumulation_steps)
         if self.args.max_train_steps is None:
             self.args.max_train_steps = self.args.epochs * num_update_steps_per_epoch
-        
+
+        warmup_steps = self.args.decom_warmup_steps if self.args.use_retinex and self.decom_model is not None else 0
+        total_training_steps = self.args.max_train_steps + warmup_steps
+
         lr_scheduler = get_scheduler(
             self.args.lr_scheduler,
             optimizer=optimizer,
             num_warmup_steps=self.args.lr_warmup_steps * self.args.gradient_accumulation_steps,
-            num_training_steps=self.args.max_train_steps * self.args.gradient_accumulation_steps,
+            num_training_steps=total_training_steps * self.args.gradient_accumulation_steps,
         )
 
-        # Prepare
         self.training_model, optimizer, train_dataloader, lr_scheduler = self.accelerator.prepare(
-            self.training_model, optimizer, train_dataloader, lr_scheduler
+            self.training_model,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
         )
 
-        # Trackers
         if self.accelerator.is_main_process:
             tracker_config = dict(vars(self.args))
-            # Filter configuration to satisfy TensorBoard requirements
-            for k, v in list(tracker_config.items()):
-                if not isinstance(v, (int, float, str, bool, torch.Tensor)):
-                    if isinstance(v, list):
-                        tracker_config[k] = str(v)
-                    elif v is None:
-                        tracker_config[k] = "None"
+            for key, value in list(tracker_config.items()):
+                if not isinstance(value, (int, float, str, bool, torch.Tensor)):
+                    if isinstance(value, list):
+                        tracker_config[key] = str(value)
+                    elif value is None:
+                        tracker_config[key] = "None"
                     else:
-                        del tracker_config[k]
+                        del tracker_config[key]
             self.accelerator.init_trackers(Path(self.args.output_dir).name, config=tracker_config)
 
-        # Resume logic
         global_step = 0
         first_epoch = 0
         if self.args.resume:
             if self.args.resume == "latest":
-                # Get the most recent checkpoint
-                dirs = os.listdir(self.args.output_dir)
-                dirs = [d for d in dirs if d.startswith("checkpoint-")]
-                if len(dirs) > 0:
-                    dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-                    self.args.resume = os.path.join(self.args.output_dir, dirs[-1])
+                checkpoints = [d for d in os.listdir(self.args.output_dir) if d.startswith("checkpoint-")]
+                if checkpoints:
+                    checkpoints = sorted(checkpoints, key=lambda item: int(item.split("-")[1]))
+                    self.args.resume = os.path.join(self.args.output_dir, checkpoints[-1])
                 else:
                     self.args.resume = None
-            
+
             if self.args.resume and os.path.isdir(self.args.resume):
                 logger.info(f"Resuming training from checkpoint: {self.args.resume}")
                 self.accelerator.load_state(self.args.resume)
                 global_step = int(os.path.basename(self.args.resume).split("-")[1])
-                first_epoch = global_step // num_update_steps_per_epoch
-                
-                # Resume EMA
-                if self.args.use_ema and self.ema_model:
+                completed_joint_steps = max(0, global_step - warmup_steps)
+                first_epoch = completed_joint_steps // max(1, num_update_steps_per_epoch)
+
+                if self.args.use_ema and self.ema_model is not None:
                     ema_path = os.path.join(self.args.resume, "ema_model.pth")
                     if os.path.exists(ema_path):
                         self.ema_model.load_state_dict(torch.load(ema_path, map_location=self.accelerator.device))
-                        logger.info(f"Resumed EMA model from {ema_path}")
-                    else:
-                        logger.warning(f"EMA model enabled but not found at {ema_path}")
-            else:
-                logger.info(f"Checkpoint {self.args.resume} not found. Starting from scratch.")
 
-        # Loop
+        if global_step >= warmup_steps:
+            self._set_trainable(self.accelerator.unwrap_model(self.training_model).unet, True)
+            self._set_trainable(self.accelerator.unwrap_model(self.training_model).condition_adapter, True)
+
         logger.info("***** Running training *****")
-        progress_bar = tqdm(range(global_step, self.args.max_train_steps), initial=global_step, total=self.args.max_train_steps, disable=not self.accelerator.is_local_main_process)
+        rich_enabled = self.accelerator.is_local_main_process and sys.stdout.isatty()
+        use_tqdm = False
+        progress_bar = tqdm(
+            range(global_step, total_training_steps),
+            initial=global_step,
+            total=total_training_steps,
+            disable=not use_tqdm,
+        )
+        live_display = create_training_display(total_steps=total_training_steps, enabled=rich_enabled)
+        live_display.start()
 
+        self.training_model.train()
+        train_iterator = iter(train_dataloader)
+        last_iter_end = time.perf_counter()
+        accum_data_time = 0.0
+        accum_compute_time = 0.0
+        accum_samples = 0
+        while global_step < warmup_steps:
+            try:
+                batch = next(train_iterator)
+            except StopIteration:
+                train_iterator = iter(train_dataloader)
+                batch = next(train_iterator)
+
+            data_time = time.perf_counter() - last_iter_end
+            compute_start = time.perf_counter()
+            _, logs = self._train_step(
+                batch,
+                optimizer,
+                lr_scheduler,
+                global_step=global_step,
+                phase="decom_warmup",
+                joint_step=0,
+            )
+            compute_time = time.perf_counter() - compute_start
+            batch_size = batch[0].shape[0]
+            accum_data_time += data_time
+            accum_compute_time += compute_time
+            accum_samples += batch_size
+
+            if self.accelerator.sync_gradients:
+                runtime_metrics = self._collect_runtime_metrics(
+                    data_time=accum_data_time,
+                    compute_time=accum_compute_time,
+                    batch_size=accum_samples,
+                )
+                logs.update(runtime_metrics)
+                logs.update(self.latest_validation_metrics)
+                progress_bar.update(1)
+                global_step += 1
+                logs["epoch"] = 0
+                logs["step"] = global_step
+                logs["phase"] = "decom_warmup"
+                numeric_logs = {k: v for k, v in logs.items() if isinstance(v, (int, float))}
+                if self.accelerator.is_main_process and self._should_log_step(global_step, terminal_step=warmup_steps):
+                    live_display.update(logs)
+                    if not rich_enabled:
+                        logger.info(
+                            f"[warmup] step={global_step}/{total_training_steps} "
+                            f"loss={logs['loss']:.4f} l_ret={logs['l_ret']:.4f} "
+                            f"samples/s={logs['samples_per_sec']:.2f} "
+                            f"data={logs['data_time']:.3f}s compute={logs['compute_time']:.3f}s "
+                            f"cpu={logs['cpu_percent']:.1f}% gpu={logs['gpu_reserved_gb']:.2f}GB"
+                        )
+                    self.accelerator.log(numeric_logs, step=global_step)
+                    self._append_training_metrics(global_step, "decom_warmup", numeric_logs)
+                last_iter_end = time.perf_counter()
+                accum_data_time = 0.0
+                accum_compute_time = 0.0
+                accum_samples = 0
+
+        if warmup_steps > 0:
+            logger.info("Retinex warmup finished. Unfreezing diffusion backbone and condition adapter.")
+            unwrapped = self.accelerator.unwrap_model(self.training_model)
+            self._set_trainable(unwrapped.unet, True)
+            self._set_trainable(unwrapped.condition_adapter, True)
+
+        completed_joint_steps = max(0, global_step - warmup_steps)
+        accum_data_time = 0.0
+        accum_compute_time = 0.0
+        accum_samples = 0
         for epoch in range(first_epoch, self.args.epochs):
             self.training_model.train()
-            for step, batch in enumerate(train_dataloader):
-                loss, logs = self._train_step(batch, optimizer, lr_scheduler)
-                
+            for batch in train_dataloader:
+                if completed_joint_steps >= self.args.max_train_steps:
+                    break
+
+                data_time = time.perf_counter() - last_iter_end
+                compute_start = time.perf_counter()
+                _, logs = self._train_step(
+                    batch,
+                    optimizer,
+                    lr_scheduler,
+                    global_step=global_step,
+                    phase="joint",
+                    joint_step=completed_joint_steps,
+                )
+                compute_time = time.perf_counter() - compute_start
+                batch_size = batch[0].shape[0]
+                accum_data_time += data_time
+                accum_compute_time += compute_time
+                accum_samples += batch_size
+
                 if self.accelerator.sync_gradients:
+                    runtime_metrics = self._collect_runtime_metrics(
+                        data_time=accum_data_time,
+                        compute_time=accum_compute_time,
+                        batch_size=accum_samples,
+                    )
+                    logs.update(runtime_metrics)
+                    logs.update(self.latest_validation_metrics)
                     progress_bar.update(1)
                     global_step += 1
-                    if self.accelerator.is_main_process:
-                        progress_bar.set_postfix(**logs)
-                        self.accelerator.log(logs, step=global_step)
+                    completed_joint_steps += 1
 
-                    # Validation
-                    if global_step % self.args.validation_steps == 0:
+                    logs["epoch"] = epoch + 1
+                    logs["step"] = global_step
+                    logs["phase"] = "joint"
+                    numeric_logs = {k: v for k, v in logs.items() if isinstance(v, (int, float))}
+                    if self.accelerator.is_main_process and self._should_log_step(global_step, terminal_step=total_training_steps):
+                        live_display.update(logs)
+                        if not rich_enabled:
+                            logger.info(
+                                f"[joint] epoch={epoch + 1} step={global_step}/{total_training_steps} "
+                                f"loss={logs['loss']:.4f} l_diff={logs['l_diff']:.4f} "
+                                f"l_x0={logs['l_x0']:.4f} l_ret={logs['l_ret']:.4f} "
+                                f"samples/s={logs['samples_per_sec']:.2f} "
+                                f"data={logs['data_time']:.3f}s compute={logs['compute_time']:.3f}s "
+                                f"cpu={logs['cpu_percent']:.1f}% gpu={logs['gpu_reserved_gb']:.2f}GB"
+                            )
+                        self.accelerator.log(numeric_logs, step=global_step)
+                        self._append_training_metrics(global_step, "joint", numeric_logs)
+
+                    if global_step > 0 and self.args.validation_steps > 0 and global_step % self.args.validation_steps == 0:
                         self.validate(step=global_step)
 
-                    # Checkpoint
-                    if global_step % self.args.checkpointing_steps == 0:
+                    if global_step > 0 and self.args.checkpointing_steps > 0 and global_step % self.args.checkpointing_steps == 0:
                         self._save_checkpoint(global_step)
+                    last_iter_end = time.perf_counter()
+                    accum_data_time = 0.0
+                    accum_compute_time = 0.0
+                    accum_samples = 0
 
-                    # Unfreeze DecomNet after freeze_decom_steps
-                    if self.freeze_decom_steps > 0 and global_step == self.freeze_decom_steps:
-                        decom = self.accelerator.unwrap_model(self.training_model).decom_model
-                        if decom:
-                            logger.info(f"Unfreezing DecomNet at step {global_step}.")
-                            for param in decom.parameters():
-                                param.requires_grad = True
-
-                if global_step >= self.args.max_train_steps:
-                    break
-            
-            if global_step >= self.args.max_train_steps:
+            if completed_joint_steps >= self.args.max_train_steps:
                 break
-        
+
+        live_display.stop()
         self.accelerator.end_training()
-        self._save_final_model()
+        self._save_final_model(global_step=global_step)
 
-    def _train_step(self, batch, optimizer, lr_scheduler):
+    def _train_step(self, batch, optimizer, lr_scheduler, global_step: int, phase: str, joint_step: int):
         low_light_images, clean_images = batch
-        
-        # Noise Injection
-        noise = torch.randn_like(clean_images)
-        if self.args.offset_noise:
-            offset_noise = torch.randn(clean_images.shape[0], clean_images.shape[1], 1, 1, device=clean_images.device)
-            noise = noise + self.args.offset_noise_scale * offset_noise
-
-        bsz = clean_images.shape[0]
-        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_images.device).long()
-        noisy_images = self.noise_scheduler.add_noise(clean_images, noise, timesteps)
 
         with self.accelerator.accumulate(self.training_model):
-            model_pred, r_low, i_low = self.training_model(low_light_images, noisy_images, timesteps)
+            if phase == "decom_warmup":
+                _, aux = self.training_model(
+                    low_light_images,
+                    clean_images=clean_images,
+                    decomposition_only=True,
+                )
+                retinex_losses = self._compute_retinex_losses(aux)
+                loss = retinex_losses["retinex_total"]
 
-            # Target
+                self.accelerator.backward(loss)
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(self.training_model.parameters(), self.args.grad_clip_norm)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
+
+                logs = {
+                    "loss": loss.item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "l_ret": retinex_losses["retinex_total"].item(),
+                    "l_recon_low": retinex_losses["l_recon_low"].item(),
+                    "l_recon_high": retinex_losses["l_recon_high"].item(),
+                    "l_consistency": retinex_losses["l_consistency"].item(),
+                    "l_exposure": retinex_losses["l_exposure"].item(),
+                    "l_tv": retinex_losses["l_tv"].item(),
+                }
+                return loss, logs
+
+            residual_target = self._residual_target(clean_images, low_light_images)
+
+            noise = torch.randn_like(residual_target)
+            if self.args.offset_noise:
+                offset_noise = torch.randn(
+                    residual_target.shape[0],
+                    residual_target.shape[1],
+                    1,
+                    1,
+                    device=residual_target.device,
+                )
+                noise = noise + self.args.offset_noise_scale * offset_noise
+
+            bsz = residual_target.shape[0]
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (bsz,),
+                device=residual_target.device,
+            ).long()
+            noisy_target = self.noise_scheduler.add_noise(residual_target, noise, timesteps)
+
+            model_pred, aux = self.training_model(
+                low_light_images,
+                noisy_target,
+                timesteps,
+                clean_images=clean_images,
+            )
+
             if self.args.prediction_type == "epsilon":
                 target = noise
             else:
-                target = self.noise_scheduler.get_velocity(clean_images, noise, timesteps)
+                target = self.noise_scheduler.get_velocity(residual_target, noise, timesteps)
 
-            # Loss 1: Diffusion Loss
             snr_weights = compute_min_snr_loss_weights(self.noise_scheduler, timesteps, self.args.snr_gamma)
             loss_diff_elem = charbonnier_loss_elementwise(model_pred, target)
             loss_diffusion = (loss_diff_elem.mean(dim=[1, 2, 3]) * snr_weights).mean()
 
-            # Loss 2: Composite Loss (Reconstruction)
-            # Reconstruct x0
-            alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(clean_images.device)
-            alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
-            beta_prod_t = 1 - alpha_prod_t
-            
-            if self.args.prediction_type == "epsilon":
-                pred_x0 = (noisy_images - beta_prod_t ** (0.5) * model_pred) / (alpha_prod_t ** (0.5) + 1e-8)
-            else:
-                pred_x0 = alpha_prod_t ** (0.5) * noisy_images - beta_prod_t ** (0.5) * model_pred
-            
-            # Clamp for numerical stability (avoid extreme values at high timesteps)
-            pred_x0 = pred_x0.clamp(-1, 1)
-            
-            loss_composite, loss_logs = self.criterion(pred_x0, clean_images)
-            
-            loss = loss_diffusion + loss_composite
+            pred_residual = self._reconstruct_x0(noisy_target, model_pred, timesteps)
+            pred_clean = self._decode_residual(low_light_images, pred_residual)
 
-            # Loss 3: Retinex
-            logs = {
-                "loss": loss.item(), 
-                "l_diff": loss_diffusion.item(), 
-                "l_comp": loss_composite.item(),
-                "lr": lr_scheduler.get_last_lr()[0]
-            }
+            x0_weight = self._x0_branch_weight(global_step)
+            timestep_mask = timesteps <= self.args.x0_loss_t_max
+            x0_loss = torch.tensor(0.0, device=clean_images.device)
+            if x0_weight > 0.0 and torch.any(timestep_mask):
+                x0_loss, _ = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
 
-            # Add detailed composite logs
-            for k, v in loss_logs.items():
-                logs[k] = v.item() if isinstance(v, torch.Tensor) else v
+            loss = loss_diffusion + x0_weight * x0_loss
 
-            loss_retinex = 0.0
-            if self.args.use_retinex and r_low is not None:
-                low_light_01 = (low_light_images / 2 + 0.5).clamp(0, 1)
-                clean_images_01 = (clean_images / 2 + 0.5).clamp(0, 1)
-                loss_recon = F.l1_loss(r_low * i_low, low_light_01)
-                loss_reflectance = F.l1_loss(r_low, clean_images_01)
-                loss_tv = torch.mean(torch.abs(i_low[:, :, :-1, :] - i_low[:, :, 1:, :])) + \
-                          torch.mean(torch.abs(i_low[:, :, :, :-1] - i_low[:, :, :, 1:]))
-                loss_retinex = loss_recon + loss_reflectance + self.args.tv_loss_weight * loss_tv
-                loss += self.args.retinex_loss_weight * loss_retinex
-                
-                logs.update({
-                    "l_ret": loss_retinex.item(),
-                    "l_rec": loss_recon.item(),
-                    "l_ref": loss_reflectance.item(),
-                    "l_tv": loss_tv.item()
-                })
-            
-            # Update total loss in logs
-            logs["loss"] = loss.item()
+            retinex_losses = self._compute_retinex_losses(aux)
+            if self.args.use_retinex:
+                if joint_step < self.args.joint_retinex_ramp_steps:
+                    weak_consistency = 0.25 * retinex_losses["l_consistency"]
+                    loss = loss + self.args.retinex_loss_weight * weak_consistency
+                else:
+                    loss = loss + self.args.retinex_loss_weight * retinex_losses["retinex_total"]
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
                 self.accelerator.clip_grad_norm_(self.training_model.parameters(), self.args.grad_clip_norm)
                 optimizer.step()
                 lr_scheduler.step()
-                
-                # Update EMA
-                if self.args.use_ema and self.ema_model:
+                if self.args.use_ema and self.ema_model is not None:
                     self.ema_model.step(self.accelerator.unwrap_model(self.training_model).unet.parameters())
-                
                 optimizer.zero_grad()
 
-        return loss, logs
+            logs = {
+                "loss": loss.item(),
+                "lr": lr_scheduler.get_last_lr()[0],
+                "l_diff": loss_diffusion.item(),
+                "l_x0": x0_loss.item(),
+                "x0_w": x0_weight,
+                "l_ret": retinex_losses["retinex_total"].item(),
+                "l_recon_low": retinex_losses["l_recon_low"].item(),
+                "l_recon_high": retinex_losses["l_recon_high"].item(),
+                "l_consistency": retinex_losses["l_consistency"].item(),
+                "l_exposure": retinex_losses["l_exposure"].item(),
+                "l_tv": retinex_losses["l_tv"].item(),
+            }
+            return loss, logs
+
+    def _inference_step(self, low_light, unet, decom, condition_adapter, scheduler, num_inference_steps=None):
+        step_count = num_inference_steps or self.args.num_inference_steps
+        scheduler.set_timesteps(step_count)
+        latents = torch.randn_like(low_light) * scheduler.init_noise_sigma
+        inference_model = CombinedModel(
+            unet,
+            decom_model=decom,
+            condition_adapter=condition_adapter,
+            conditioning_space=self.args.conditioning_space,
+        )
+
+        for timestep in scheduler.timesteps:
+            latent_input = scheduler.scale_model_input(latents, timestep)
+            model_input, aux = inference_model.build_model_input(low_light, latent_input)
+            noise_pred = inference_model.run_unet(model_input, timestep, aux)
+            latents = scheduler.step(noise_pred, timestep, latents).prev_sample
+
+        enhanced = self._decode_residual(low_light, latents)
+        return (enhanced / 2 + 0.5).clamp(0, 1)
+
+    def _save_validation_grid(self, step, step_count, low_01, enhanced_01, clean_01):
+        if not self.accelerator.is_main_process:
+            return
+
+        val_dir = os.path.join(self.args.output_dir, "validation")
+        os.makedirs(val_dir, exist_ok=True)
+
+        grid = torch.cat([low_01, enhanced_01, clean_01], dim=0)
+        grid_image = make_grid(grid, nrow=low_01.shape[0], padding=2)
+        grid_path = os.path.join(val_dir, f"val_step_{step}_steps_{step_count}.png")
+        transforms.ToPILImage()(grid_image).save(grid_path)
+        logger.info(f"Saved validation grid to {grid_path}")
+
+    def _validate_for_step_count(
+        self,
+        eval_dataloader,
+        unet,
+        decom,
+        condition_adapter,
+        step_count: int,
+        step=None,
+        lpips_fn=None,
+        semantic_metric=None,
+    ):
+        scheduler = DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config)
+
+        total_psnr = 0.0
+        total_ssim = 0.0
+        total_lpips = 0.0
+        total_semantic = 0.0
+        total_niqe = 0.0
+        niqe_count = 0
+        total_elapsed = 0.0
+        num_samples = 0
+        saved_grid = False
+
+        with torch.no_grad():
+            for val_low, val_clean in eval_dataloader:
+                if self.accelerator.is_main_process and num_samples >= self.args.num_validation_images:
+                    break
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.accelerator.device)
+                start_time = time.perf_counter()
+                enhanced = self._inference_step(val_low, unet, decom, condition_adapter, scheduler, num_inference_steps=step_count)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(self.accelerator.device)
+                elapsed = time.perf_counter() - start_time
+
+                elapsed_tensor = torch.tensor([elapsed], device=val_low.device)
+                gathered_elapsed = self.accelerator.gather_for_metrics(elapsed_tensor)
+                gathered_low = self.accelerator.gather_for_metrics(val_low)
+                gathered_clean = self.accelerator.gather_for_metrics(val_clean)
+                gathered_enhanced = self.accelerator.gather_for_metrics(enhanced)
+
+                if not self.accelerator.is_main_process:
+                    continue
+
+                remaining = self.args.num_validation_images - num_samples
+                if remaining <= 0:
+                    break
+
+                gathered_low = gathered_low[:remaining]
+                gathered_clean = gathered_clean[:remaining]
+                gathered_enhanced = gathered_enhanced[:remaining]
+
+                low_01 = (gathered_low / 2 + 0.5).clamp(0, 1)
+                clean_01 = (gathered_clean / 2 + 0.5).clamp(0, 1)
+                enhanced_01 = gathered_enhanced
+
+                batch_size = enhanced_01.shape[0]
+                total_psnr += peak_signal_noise_ratio(enhanced_01, clean_01, data_range=1.0).item() * batch_size
+                total_ssim += ssim(enhanced_01, clean_01).item() * batch_size
+
+                if lpips_fn is not None:
+                    enhanced_11 = enhanced_01 * 2 - 1
+                    clean_11 = clean_01 * 2 - 1
+                    total_lpips += lpips_fn(enhanced_11, clean_11).mean().item() * batch_size
+
+                if semantic_metric is not None and semantic_metric.available:
+                    semantic_distance = semantic_metric.compute(enhanced_01.to(self.accelerator.device), clean_01.to(self.accelerator.device))
+                    if semantic_distance is not None:
+                        total_semantic += semantic_distance * batch_size
+
+                if self.args.nr_metric == "niqe":
+                    niqe_score = try_compute_niqe(enhanced_01)
+                    if niqe_score is not None:
+                        total_niqe += niqe_score * batch_size
+                        niqe_count += batch_size
+
+                total_elapsed += float(gathered_elapsed.max().item())
+                num_samples += batch_size
+
+                if not saved_grid and step_count == self.args.num_inference_steps:
+                    self._save_validation_grid(step, step_count, low_01, enhanced_01, clean_01)
+                    saved_grid = True
+
+        if not self.accelerator.is_main_process or num_samples == 0:
+            return None
+
+        metrics = {
+            "psnr": total_psnr / num_samples,
+            "ssim": total_ssim / num_samples,
+            "lpips": total_lpips / num_samples if lpips_fn is not None else None,
+            "semantic_distance": total_semantic / num_samples if semantic_metric is not None and semantic_metric.available else None,
+            "niqe": total_niqe / niqe_count if niqe_count > 0 else None,
+            "seconds_per_image": total_elapsed / num_samples,
+        }
+        return metrics
 
     def validate(self, step=None):
         logger.info(f"Running validation at step {step}...")
-        
-        # Setup Val Loader (Lazy load)
+
         eval_dataset = LowLightDataset(
-            image_dir=self.args.data_dir, img_size=self.args.resolution, phase="test")
-        eval_dataloader = DataLoader(
-            eval_dataset, batch_size=self.args.batch_size, shuffle=False, num_workers=self.args.num_workers
+            image_dir=self.args.data_dir,
+            img_size=self.args.resolution,
+            phase="test",
         )
-        
-        # Unwrap
-        unet = self.accelerator.unwrap_model(self.training_model).unet
-        decom = self.accelerator.unwrap_model(self.training_model).decom_model
-        
-        if self.args.use_ema:
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=self.args.batch_size,
+            shuffle=False,
+            num_workers=self.args.num_workers,
+        )
+        eval_dataloader = self.accelerator.prepare(eval_dataloader)
+
+        unwrapped = self.accelerator.unwrap_model(self.training_model)
+        unet = unwrapped.unet
+        decom = unwrapped.decom_model
+        condition_adapter = unwrapped.condition_adapter
+
+        if self.args.use_ema and self.ema_model is not None:
             self.ema_model.store(unet.parameters())
             self.ema_model.copy_to(unet.parameters())
-        
-        unet.eval()
-        if decom: decom.eval()
-        
-        # Scheduler for Inference
-        val_scheduler = DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config)
-        val_scheduler.set_timesteps(self.args.num_inference_steps)
 
-        total_psnr, total_ssim, total_lpips = 0.0, 0.0, 0.0
-        num_samples = 0
-        lpips_available = False
-        
-        # Try to load LPIPS metric
+        unet.eval()
+        if decom is not None:
+            decom.eval()
+        if condition_adapter is not None:
+            condition_adapter.eval()
+
+        lpips_fn = None
         try:
             import lpips
-            lpips_fn = lpips.LPIPS(net='vgg', verbose=False).to(self.accelerator.device)
-            lpips_fn.eval()
-            lpips_available = True
-        except ImportError:
-            logger.warning("lpips not installed. Skipping LPIPS metric. Install with: pip install lpips")
-        
-        # Prepare validation directory
-        val_dir = os.path.join(self.args.output_dir, "validation")
-        os.makedirs(val_dir, exist_ok=True)
-        
-        with torch.no_grad():
-            for i, (val_low, val_clean) in enumerate(eval_dataloader):
-                if i >= self.args.num_validation_images // self.args.batch_size: break
-                
-                val_low = val_low.to(self.accelerator.device)
-                val_clean = val_clean.to(self.accelerator.device)
-                
-                enhanced = self._inference_step(val_low, unet, decom, val_scheduler)
-                
-                # Save Visualization for the first batch
-                if i == 0:
-                    vis_low = (val_low / 2 + 0.5).clamp(0, 1)
-                    vis_clean = (val_clean / 2 + 0.5).clamp(0, 1)
-                    vis_enhanced = enhanced  # already [0, 1] from inference_step
-                    
-                    grid = torch.cat([vis_low, vis_enhanced, vis_clean], dim=0)
-                    grid_image = make_grid(grid, nrow=vis_low.shape[0], padding=2)
-                    
-                    save_image_path = os.path.join(val_dir, f"val_step_{step}.png")
-                    transforms.ToPILImage()(grid_image).save(save_image_path)
-                    logger.info(f"Saved validation grid to {save_image_path}")
 
-                # Metrics (Images are [0, 1])
-                gt_images = (val_clean / 2 + 0.5).clamp(0, 1)
-                bsz = val_low.shape[0]
-                
-                total_psnr += peak_signal_noise_ratio(enhanced, gt_images, data_range=1.0).item() * bsz
-                total_ssim += ssim(enhanced, gt_images).item() * bsz
-                
-                if lpips_available:
-                    # LPIPS expects [-1, 1]
-                    enhanced_11 = enhanced * 2 - 1
-                    gt_11 = gt_images * 2 - 1
-                    total_lpips += lpips_fn(enhanced_11, gt_11).mean().item() * bsz
-                
-                num_samples += bsz
-        
-        if num_samples > 0:
-            avg_psnr = total_psnr / num_samples
-            avg_ssim = total_ssim / num_samples
-            avg_lpips = total_lpips / num_samples if lpips_available else 0.0
-            
-            log_msg = f"Validation: PSNR={avg_psnr:.4f}, SSIM={avg_ssim:.4f}"
-            log_dict = {"val/psnr": avg_psnr, "val/ssim": avg_ssim}
-            if lpips_available:
-                log_msg += f", LPIPS={avg_lpips:.4f}"
-                log_dict["val/lpips"] = avg_lpips
-            logger.info(log_msg)
-            self.accelerator.log(log_dict, step=step)
-            
-            # Save metrics to file for UI and external tools
+            lpips_fn = lpips.LPIPS(net="vgg", verbose=False).to(self.accelerator.device)
+            lpips_fn.eval()
+        except ImportError:
+            logger.warning("lpips not installed. Skipping LPIPS metric.")
+
+        semantic_metric = SemanticFeatureMetric(self.accelerator.device, backbone=self.args.semantic_backbone)
+
+        benchmark_steps = []
+        for step_count in self.args.benchmark_inference_steps + [self.args.num_inference_steps]:
+            if step_count not in benchmark_steps:
+                benchmark_steps.append(step_count)
+
+        validation_results = {}
+        if self.accelerator.is_main_process:
+            logger.info(f"Benchmarking validation at inference steps: {benchmark_steps}")
+
+        for step_count in benchmark_steps:
+            result = self._validate_for_step_count(
+                eval_dataloader,
+                unet,
+                decom,
+                condition_adapter,
+                step_count=step_count,
+                step=step,
+                lpips_fn=lpips_fn,
+                semantic_metric=semantic_metric,
+            )
+            if result is not None:
+                validation_results[step_count] = result
+
+        if self.accelerator.is_main_process and validation_results:
+            primary_metrics = validation_results.get(self.args.num_inference_steps, next(iter(validation_results.values())))
+            self.latest_validation_metrics = {
+                "val_psnr": primary_metrics.get("psnr"),
+                "val_ssim": primary_metrics.get("ssim"),
+                "val_lpips": primary_metrics.get("lpips"),
+                "val_step": step,
+            }
+
+            log_dict = {}
+            lines = []
+            for step_count, metrics in validation_results.items():
+                lines.append(f"[steps={step_count}]")
+                lines.append(f"PSNR: {metrics['psnr']:.4f}")
+                lines.append(f"SSIM: {metrics['ssim']:.4f}")
+                lines.append(f"SecondsPerImage: {metrics['seconds_per_image']:.6f}")
+
+                log_dict[f"val/psnr_{step_count}step"] = metrics["psnr"]
+                log_dict[f"val/ssim_{step_count}step"] = metrics["ssim"]
+                log_dict[f"val/sec_per_image_{step_count}step"] = metrics["seconds_per_image"]
+
+                if metrics["lpips"] is not None:
+                    lines.append(f"LPIPS: {metrics['lpips']:.4f}")
+                    log_dict[f"val/lpips_{step_count}step"] = metrics["lpips"]
+                if metrics["semantic_distance"] is not None:
+                    lines.append(f"SemanticDistance: {metrics['semantic_distance']:.4f}")
+                    log_dict[f"val/semantic_distance_{step_count}step"] = metrics["semantic_distance"]
+                if metrics["niqe"] is not None:
+                    lines.append(f"NIQE: {metrics['niqe']:.4f}")
+                    log_dict[f"val/niqe_{step_count}step"] = metrics["niqe"]
+                lines.append("")
+
+            self.accelerator.log(log_dict, step=step or 0)
+            self._write_status_snapshot({
+                "step": step or 0,
+                "phase": "validation",
+                **self.latest_validation_metrics,
+            })
+
             metrics_path = os.path.join(self.args.output_dir, "metrics.txt")
-            with open(metrics_path, 'w') as f:
-                f.write(f"PSNR: {avg_psnr:.4f}\n")
-                f.write(f"SSIM: {avg_ssim:.4f}\n")
-                if lpips_available:
-                    f.write(f"LPIPS: {avg_lpips:.4f}\n")
-                f.write(f"Step: {step}\n")
-            
-            # Best Model Check
-            if avg_psnr > self.best_psnr:
-                self.best_psnr = avg_psnr
-                logger.info(f"New Best Model found (PSNR: {avg_psnr:.4f}). Saving...")
-                
-                best_model_dir = os.path.join(self.args.output_dir, "best_model")
-                os.makedirs(best_model_dir, exist_ok=True)
-                
-                unet.save_pretrained(os.path.join(best_model_dir, "unet_best"))
-                if decom:
-                    torch.save(decom.state_dict(), os.path.join(best_model_dir, "decom_model_best.pth"))
-        
-        # Restore EMA
-        if self.args.use_ema:
+            with open(metrics_path, "w") as metrics_file:
+                metrics_file.write("\n".join(lines).strip() + "\n")
+                metrics_file.write(f"Step: {step}\n")
+
+            if primary_metrics["psnr"] > self.best_psnr:
+                self.best_psnr = primary_metrics["psnr"]
+                logger.info(f"New best model found (PSNR: {primary_metrics['psnr']:.4f}). Saving...")
+                self._save_model_bundle(
+                    os.path.join(self.args.output_dir, "best_model"),
+                    unet,
+                    decom,
+                    condition_adapter,
+                    prefix="best",
+                    step=step,
+                    metrics=primary_metrics,
+                )
+
+        if self.args.use_ema and self.ema_model is not None:
             self.ema_model.restore(unet.parameters())
-        
+
         self.training_model.train()
+        self.accelerator.wait_for_everyone()
+        return validation_results
 
     def predict(self):
-        """
-        Unified prediction method for both Image folders and Videos.
-        """
         self.unet.eval()
-        if self.decom_model: self.decom_model.eval()
-        
-        # Scheduler
-        val_scheduler = DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config)
-        val_scheduler.set_timesteps(self.args.num_inference_steps)
-        
-        if hasattr(self.args, 'video_path') and self.args.video_path:
-            self._predict_video(val_scheduler)
+        if self.decom_model is not None:
+            self.decom_model.eval()
+        if self.condition_adapter is not None:
+            self.condition_adapter.eval()
+
+        scheduler = DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config)
+
+        if self.args.video_path:
+            self._predict_video(scheduler)
         else:
-            self._predict_image(val_scheduler)
+            self._predict_image(scheduler)
 
     def _predict_image(self, scheduler):
-        logger.info(f"Starting Image Prediction from {self.args.data_dir}")
+        logger.info(f"Starting image prediction from {self.args.data_dir}")
         dataset = LowLightDataset(image_dir=self.args.data_dir, img_size=self.args.resolution, phase="predict")
         dataloader = DataLoader(dataset, batch_size=self.args.batch_size, shuffle=False, num_workers=self.args.num_workers)
-        
-        out_dir = os.path.join(self.args.output_dir, 'predictions')
+
+        out_dir = os.path.join(self.args.output_dir, "predictions")
         os.makedirs(out_dir, exist_ok=True)
-        
-        idx = 0
+
         to_pil = transforms.ToPILImage()
-        
+        index = 0
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Predicting"):
-                # Handle both (low, clean) or just low
                 low_light = batch[0] if isinstance(batch, (list, tuple)) else batch
                 low_light = low_light.to(self.accelerator.device)
-                
-                enhanced = self._inference_step(low_light, self.unet, self.decom_model, scheduler)
-                
-                for i in range(enhanced.shape[0]):
-                    img = to_pil(enhanced[i].cpu())
-                    img.save(os.path.join(out_dir, f"enhanced_{idx:05d}.png"))
-                    idx += 1
-        logger.info(f"Saved results to {out_dir}")
+                enhanced = self._inference_step(
+                    low_light,
+                    self.unet,
+                    self.decom_model,
+                    self.condition_adapter,
+                    scheduler,
+                    num_inference_steps=self.args.num_inference_steps,
+                )
+
+                for item in enhanced:
+                    to_pil(item.cpu()).save(os.path.join(out_dir, f"enhanced_{index:05d}.png"))
+                    index += 1
+
+        logger.info(f"Saved prediction results to {out_dir}")
 
     def _predict_video(self, scheduler):
-        logger.info(f"Starting Video Prediction: {self.args.video_path}")
+        logger.info(f"Starting video prediction: {self.args.video_path}")
         if not os.path.exists(self.args.video_path):
             raise FileNotFoundError(f"Video not found: {self.args.video_path}")
-            
-        cap = cv2.VideoCapture(self.args.video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        
-        frames_dir = os.path.join(self.args.output_dir, 'video_frames')
+
+        capture = cv2.VideoCapture(self.args.video_path)
+        fps = capture.get(cv2.CAP_PROP_FPS)
+
+        frames_dir = os.path.join(self.args.output_dir, "video_frames")
         os.makedirs(frames_dir, exist_ok=True)
-        
+
         transform = transforms.Compose([
             transforms.ToPILImage(),
             transforms.Resize((self.args.resolution, self.args.resolution)),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ])
-        
-        idx = 0
+
+        frame_index = 0
         with torch.no_grad():
             while True:
-                ret, frame = cap.read()
-                if not ret: break
-                
-                # Preprocess
+                success, frame = capture.read()
+                if not success:
+                    break
+
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 input_tensor = transform(frame_rgb).unsqueeze(0).to(self.accelerator.device)
-                
-                # Inference
-                enhanced = self._inference_step(input_tensor, self.unet, self.decom_model, scheduler)
-                
-                # Save
+                enhanced = self._inference_step(
+                    input_tensor,
+                    self.unet,
+                    self.decom_model,
+                    self.condition_adapter,
+                    scheduler,
+                    num_inference_steps=self.args.num_inference_steps,
+                )
+
                 enhanced_np = enhanced.squeeze(0).cpu().numpy().transpose(1, 2, 0)
                 enhanced_bgr = cv2.cvtColor((enhanced_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-                cv2.imwrite(os.path.join(frames_dir, f"frame_{idx:06d}.png"), enhanced_bgr)
-                
-                idx += 1
-                print(f"Processed frame {idx}", end='\r')
-        
-        cap.release()
-        
-        # Synthesize
+                cv2.imwrite(os.path.join(frames_dir, f"frame_{frame_index:06d}.png"), enhanced_bgr)
+                frame_index += 1
+
+        capture.release()
+
         out_video = os.path.join(self.args.output_dir, "enhanced.mp4")
         video_writer(frames_dir, out_video, fps=fps)
-        logger.info(f"\nVideo saved to {out_video}")
+        logger.info(f"Video saved to {out_video}")
 
-    def _inference_step(self, low_light, unet, decom, scheduler):
-        scheduler.set_timesteps(self.args.num_inference_steps)
-        latents = torch.randn_like(low_light) * scheduler.init_noise_sigma
-        
-        # Pre-compute Retinex decomposition (Optimization)
-        conditioning_extra = None
-        if decom is not None:
-            low_01 = (low_light / 2 + 0.5).clamp(0, 1)
-            with torch.no_grad():
-                r, i = decom(low_01)
-            # Normalize to [-1, 1]
-            conditioning_extra = torch.cat([r * 2 - 1, i * 2 - 1], dim=1)
-
-        for t in scheduler.timesteps:
-            latent_input = scheduler.scale_model_input(latents, t)
-            
-            if conditioning_extra is not None:
-                model_input = torch.cat([latent_input, conditioning_extra], dim=1)
+    def _model_metadata(self, step=None, metrics=None):
+        serializable_args = {}
+        for key, value in vars(self.args).items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                serializable_args[key] = value
+            elif isinstance(value, list):
+                serializable_args[key] = value
             else:
-                model_input = torch.cat([latent_input, low_light], dim=1)
-            
-            noise_pred = unet(model_input, t).sample
-            latents = scheduler.step(noise_pred, t, latents).prev_sample
-            
-        return (latents / 2 + 0.5).clamp(0, 1)
+                serializable_args[key] = str(value)
+
+        return {
+            "step": step,
+            "ema_enabled": self.args.use_ema,
+            "best_psnr": self.best_psnr,
+            "metrics": metrics or {},
+            "args": serializable_args,
+        }
+
+    def _save_model_bundle(self, base_dir, unet, decom, condition_adapter, prefix: str, step=None, metrics=None):
+        if not self.accelerator.is_main_process:
+            return
+
+        os.makedirs(base_dir, exist_ok=True)
+        unet_dirname = f"unet_{prefix}"
+        decom_filename = f"decom_model_{prefix}.pth"
+        adapter_filename = f"condition_adapter_{prefix}.pth"
+        metadata_filename = f"{prefix}_metadata.json"
+
+        if prefix == "final":
+            unet_dirname = "unet_final"
+            decom_filename = "decom_model.pth"
+            adapter_filename = "condition_adapter.pth"
+            metadata_filename = "metadata.json"
+
+        unet.save_pretrained(os.path.join(base_dir, unet_dirname))
+
+        if decom is not None:
+            torch.save(decom.state_dict(), os.path.join(base_dir, decom_filename))
+        if condition_adapter is not None:
+            torch.save(condition_adapter.state_dict(), os.path.join(base_dir, adapter_filename))
+
+        metadata_path = os.path.join(base_dir, metadata_filename)
+        with open(metadata_path, "w") as metadata_file:
+            json.dump(self._model_metadata(step=step, metrics=metrics), metadata_file, indent=2)
 
     def _save_checkpoint(self, step):
         save_path = os.path.join(self.args.output_dir, f"checkpoint-{step}")
         self.accelerator.save_state(save_path)
-        if self.args.use_ema:
+
+        if self.args.use_ema and self.ema_model is not None:
             torch.save(self.ema_model.state_dict(), os.path.join(save_path, "ema_model.pth"))
-        
-        # Checkpoint cleanup: keep only the most recent N checkpoints
-        total_limit = getattr(self.args, 'checkpoints_total_limit', None)
+
+        unwrapped = self.accelerator.unwrap_model(self.training_model)
+        if unwrapped.decom_model is not None:
+            torch.save(unwrapped.decom_model.state_dict(), os.path.join(save_path, "decom_model.pth"))
+        if unwrapped.condition_adapter is not None:
+            torch.save(unwrapped.condition_adapter.state_dict(), os.path.join(save_path, "condition_adapter.pth"))
+
+        with open(os.path.join(save_path, "checkpoint_metadata.json"), "w") as metadata_file:
+            json.dump(self._model_metadata(step=step), metadata_file, indent=2)
+
+        total_limit = getattr(self.args, "checkpoints_total_limit", None)
         if total_limit is not None and self.accelerator.is_main_process:
             checkpoints = sorted(
-                [d for d in os.listdir(self.args.output_dir) if d.startswith("checkpoint-")],
-                key=lambda x: int(x.split("-")[1])
+                [item for item in os.listdir(self.args.output_dir) if item.startswith("checkpoint-")],
+                key=lambda item: int(item.split("-")[1]),
             )
             if len(checkpoints) > total_limit:
-                num_to_remove = len(checkpoints) - total_limit
-                for ckpt in checkpoints[:num_to_remove]:
-                    ckpt_path = os.path.join(self.args.output_dir, ckpt)
-                    logger.info(f"Removing old checkpoint: {ckpt_path}")
-                    shutil.rmtree(ckpt_path)
+                for checkpoint_name in checkpoints[: len(checkpoints) - total_limit]:
+                    checkpoint_path = os.path.join(self.args.output_dir, checkpoint_name)
+                    logger.info(f"Removing old checkpoint: {checkpoint_path}")
+                    shutil.rmtree(checkpoint_path)
 
-    def _save_final_model(self):
-        if self.accelerator.is_main_process:
-            unet = self.accelerator.unwrap_model(self.training_model).unet
-            if self.args.use_ema:
-                self.ema_model.copy_to(unet.parameters())
-            unet.save_pretrained(os.path.join(self.args.output_dir, "unet_final"))
-            if self.decom_model:
-                torch.save(self.accelerator.unwrap_model(self.training_model).decom_model.state_dict(), 
-                           os.path.join(self.args.output_dir, "unet_final", "decom_model.pth"))
+    def _save_final_model(self, global_step=None):
+        if not self.accelerator.is_main_process:
+            return
 
+        unwrapped = self.accelerator.unwrap_model(self.training_model)
+        if self.args.use_ema and self.ema_model is not None:
+            self.ema_model.copy_to(unwrapped.unet.parameters())
+
+        self._save_model_bundle(
+            self.args.output_dir,
+            unwrapped.unet,
+            unwrapped.decom_model,
+            unwrapped.condition_adapter,
+            prefix="final",
+            step=global_step,
+        )

@@ -95,7 +95,14 @@ def create_random_headlight_mask(height: int, width: int,
     mask = np.zeros((height, width), dtype=np.float32)
 
     if num_lights is None:
-        num_lights = random.randint(0, 4)
+        area_ratio = min(1.0, (height * width) / float(512 * 512))
+        if area_ratio < 0.35:
+            max_lights = 1
+        elif area_ratio < 0.75:
+            max_lights = 2
+        else:
+            max_lights = 4
+        num_lights = random.randint(0, max_lights)
 
     if num_lights == 0:
         return mask
@@ -127,6 +134,33 @@ def create_random_headlight_mask(height: int, width: int,
     mask = cv2.GaussianBlur(mask, (ksize_w, ksize_h), 0)
 
     return np.clip(mask, 0, 1).astype(np.float32)
+
+
+def enforce_reasonable_exposure(source: np.ndarray,
+                                degraded: np.ndarray,
+                                min_ratio: float = 0.10,
+                                max_ratio: float = 0.55) -> np.ndarray:
+    """
+    Keep synthesized low-light samples inside a practical luminance range.
+    This prevents extremely dark or barely-darkened outliers.
+    """
+    source_gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    degraded_gray = cv2.cvtColor(degraded, cv2.COLOR_BGR2GRAY).astype(np.float32)
+
+    source_mean = max(source_gray.mean(), 1.0)
+    degraded_mean = degraded_gray.mean()
+    ratio = degraded_mean / source_mean
+
+    adjusted = degraded.astype(np.float32)
+
+    if ratio < min_ratio:
+        alpha = min(1.0, (min_ratio - ratio) / max(min_ratio, 1e-6))
+        adjusted = adjusted * (1.0 - alpha) + source.astype(np.float32) * alpha * 0.35
+    elif ratio > max_ratio:
+        scale = max_ratio / max(ratio, 1e-6)
+        adjusted = adjusted * scale
+
+    return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
 # ============================================================================
@@ -345,9 +379,10 @@ class Darker:
 
         adjusted = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
 
-        # --- 5. Color shift (Purkinje effect: blue shift in dark) ---
+        # --- 5. Color shift (Purkinje effect: stronger in locally darker regions) ---
         shift_factor = params["color_shift_factor"]
-        shift_map = shift_factor * (1.0 - mask) * np.mean(v_final) * 255
+        local_darkness = np.clip(1.0 - v_final, 0.0, 1.0)
+        shift_map = shift_factor * (1.0 - mask) * local_darkness * 255
         adjusted[:, :, 0] += shift_map     # Blue +
         adjusted[:, :, 2] -= shift_map * 0.5  # Red -
         adjusted = np.clip(adjusted, 0, 255).astype(np.uint8)
@@ -371,7 +406,7 @@ class Darker:
         if params.get("use_jpeg", False):
             adjusted = apply_jpeg_artifact(adjusted, quality=params["jpeg_quality"])
 
-        return adjusted
+        return enforce_reasonable_exposure(img, adjusted)
 
     def adjust_image(self, img: np.ndarray, mask: np.ndarray,
                      saturation_factor: float = 0.6,

@@ -1,178 +1,157 @@
-import numpy as np
 import os
 import random
+from typing import Optional
+
 import cv2
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-import torchvision.transforms.functional as TF  # 关键引用：用于函数式变换
-from PIL import Image
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 from scripts.darker import Darker
 
 
+VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
+
+
+def _normalize_to_model_space(image_rgb: np.ndarray) -> torch.Tensor:
+    image_tensor = torch.from_numpy(np.ascontiguousarray(image_rgb.transpose(2, 0, 1))).float() / 255.0
+    return image_tensor.mul(2.0).sub(1.0)
+
+
+def _resize_rgb(image_rgb: np.ndarray, size: int) -> np.ndarray:
+    interpolation = cv2.INTER_AREA if min(image_rgb.shape[:2]) >= size else cv2.INTER_LINEAR
+    return cv2.resize(image_rgb, (size, size), interpolation=interpolation)
+
+
 class LowLightDataset(Dataset):
-    def __init__(self, image_dir, img_size=256, phase="train",
-                 online_synthesis: bool = False,
-                 darker_ranges: dict = None):
-        """
-        Args:
-            image_dir (string): 数据集根目录。
-            img_size (int): 训练/测试时的图像分辨率。
-            phase (string): "train", "test" 或 "predict"。
-            online_synthesis (bool): 如果为 True，则在每次 __getitem__ 中
-                对 high 图像实时随机合成低光照退化，而非读取预生成的 low 图像。
-                仅在 phase="train" 时有效。
-            darker_ranges (dict): 自定义退化参数范围，传递给 Darker。
-        """
+    def __init__(
+        self,
+        image_dir,
+        img_size=256,
+        phase="train",
+        online_synthesis: bool = False,
+        darker_ranges: Optional[dict] = None,
+    ):
         self.image_dir = image_dir
         self.img_size = img_size
         self.phase = phase
         self.online_synthesis = online_synthesis and (phase == "train")
-
+        self.darker_ranges = darker_ranges
+        self.darker = None
         self.data = []
 
-        # 初始化在线合成引擎
-        self.darker = None
-        if self.online_synthesis:
-            self.darker = Darker(randomize=True, param_ranges=darker_ranges)
-
-        # === 1. 构建文件列表 ===
         if phase == "predict":
-            # 预测模式：直接加载目录下所有图片
-            valid_exts = ('.png', '.jpg', '.jpeg', '.bmp')
             if os.path.exists(image_dir):
                 for root, _, files in os.walk(image_dir):
-                    for f in files:
-                        if f.lower().endswith(valid_exts):
-                            self.data.append(os.path.join(root, f))
+                    for filename in files:
+                        if filename.lower().endswith(VALID_EXTENSIONS):
+                            self.data.append(os.path.join(root, filename))
             self.data.sort()
             if not self.data:
                 print(f"警告: 在 {image_dir} 中未找到图片。")
+            return
+
+        if phase == "train":
+            subset = "our485"
+        elif phase == "test":
+            subset = "eval15"
         else:
-            if phase == "train":
-                subset = "our485"
-            elif phase == "test":
-                subset = "eval15"
+            raise ValueError("phase must be 'train', 'test' or 'predict'")
+
+        subset_dir = os.path.join(image_dir, subset)
+        if not os.path.exists(subset_dir):
+            print(f"警告: 目录 {subset_dir} 不存在，数据集为空。")
+            return
+
+        high_dir = os.path.join(subset_dir, "high")
+        low_dir = os.path.join(subset_dir, "low")
+        image_names = [
+            filename for filename in os.listdir(high_dir)
+            if filename.lower().endswith(VALID_EXTENSIONS)
+        ]
+        image_names.sort()
+
+        for image_name in image_names:
+            high_path = os.path.join(high_dir, image_name)
+            if self.online_synthesis:
+                self.data.append((None, high_path))
             else:
-                raise ValueError("phase must be 'train', 'test' or 'predict'")
-
-            if subset == "eval15":
-                subset_dir = os.path.join(image_dir, "eval15")
-            elif subset == "our485":
-                subset_dir = os.path.join(image_dir, "our485")
-
-            if os.path.exists(subset_dir):
-                high_dir = os.path.join(subset_dir, "high")
-                low_dir = os.path.join(subset_dir, "low")
-                # 过滤图片文件
-                image_names = [f for f in os.listdir(high_dir)
-                               if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
-                image_names.sort()
-
-                for img_name in image_names:
-                    high_path = os.path.join(high_dir, img_name)
-                    if self.online_synthesis:
-                        # 在线合成模式：只需要 high 图像路径
-                        self.data.append((None, high_path))
-                    else:
-                        low_path = os.path.join(low_dir, img_name)
-                        if os.path.exists(low_path):
-                            self.data.append((low_path, high_path))
-            else:
-                print(f"警告: 目录 {subset_dir} 不存在，数据集为空。")
+                low_path = os.path.join(low_dir, image_name)
+                if os.path.exists(low_path):
+                    self.data.append((low_path, high_path))
 
     def __len__(self):
         return len(self.data)
 
-    def _online_degrade(self, high_pil: Image.Image) -> Image.Image:
-        """使用 Darker 引擎实时合成低光照退化图像。"""
-        # PIL -> BGR numpy
-        high_np = cv2.cvtColor(np.array(high_pil), cv2.COLOR_RGB2BGR)
-        # 应用随机退化
-        low_np = self.darker.degrade_single(high_np)
-        # BGR numpy -> PIL
-        low_pil = Image.fromarray(cv2.cvtColor(low_np, cv2.COLOR_BGR2RGB))
-        return low_pil
+    def _get_darker(self):
+        if self.darker is None:
+            self.darker = Darker(randomize=True, param_ranges=self.darker_ranges)
+        return self.darker
+
+    @staticmethod
+    def _read_rgb(path: str) -> np.ndarray:
+        image_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image_bgr is None:
+            raise FileNotFoundError(f"Failed to read image: {path}")
+        return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+    def _random_crop_coords(self, height: int, width: int):
+        crop_h = min(self.img_size, height)
+        crop_w = min(self.img_size, width)
+        top = 0 if height == crop_h else random.randint(0, height - crop_h)
+        left = 0 if width == crop_w else random.randint(0, width - crop_w)
+        return top, left, crop_h, crop_w
+
+    def _train_online_pair(self, high_rgb: np.ndarray):
+        height, width = high_rgb.shape[:2]
+        top, left, crop_h, crop_w = self._random_crop_coords(height, width)
+        high_patch = high_rgb[top:top + crop_h, left:left + crop_w]
+        high_patch = _resize_rgb(high_patch, self.img_size) if high_patch.shape[:2] != (self.img_size, self.img_size) else high_patch
+
+        darker = self._get_darker()
+        low_patch_bgr = darker.degrade_single(cv2.cvtColor(high_patch, cv2.COLOR_RGB2BGR))
+        low_patch = cv2.cvtColor(low_patch_bgr, cv2.COLOR_BGR2RGB)
+
+        if random.random() > 0.5:
+            low_patch = np.flip(low_patch, axis=1).copy()
+            high_patch = np.flip(high_patch, axis=1).copy()
+
+        return low_patch, high_patch
+
+    def _train_precomputed_pair(self, low_rgb: np.ndarray, high_rgb: np.ndarray):
+        height, width = low_rgb.shape[:2]
+        top, left, crop_h, crop_w = self._random_crop_coords(height, width)
+        low_patch = low_rgb[top:top + crop_h, left:left + crop_w]
+        high_patch = high_rgb[top:top + crop_h, left:left + crop_w]
+
+        if low_patch.shape[:2] != (self.img_size, self.img_size):
+            low_patch = _resize_rgb(low_patch, self.img_size)
+            high_patch = _resize_rgb(high_patch, self.img_size)
+
+        if random.random() > 0.5:
+            low_patch = np.flip(low_patch, axis=1).copy()
+            high_patch = np.flip(high_patch, axis=1).copy()
+
+        return low_patch, high_patch
 
     def __getitem__(self, idx):
         if self.phase == "predict":
-            img_path = self.data[idx]
-            img = Image.open(img_path).convert("RGB")
-            # 预测时统一 Resize
-            img = TF.resize(img, (self.img_size, self.img_size))
-            img = TF.to_tensor(img)
-            img = TF.normalize(img, [0.5], [0.5])
-            return img
+            image_rgb = self._read_rgb(self.data[idx])
+            image_rgb = _resize_rgb(image_rgb, self.img_size)
+            return _normalize_to_model_space(image_rgb)
 
-        low_img_path, high_img_path = self.data[idx]
+        low_path, high_path = self.data[idx]
+        high_rgb = self._read_rgb(high_path)
 
-        # === 2. 加载图像 ===
-        high_img = Image.open(high_img_path).convert("RGB")
-
-        if self.online_synthesis:
-            # 在线合成：对 high 图像实时退化
-            low_img = self._online_degrade(high_img)
-        else:
-            low_img = Image.open(low_img_path).convert("RGB")
-
-        # === 3. 同步数据增强 ===
         if self.phase == "train":
-            # A. 随机裁剪 (Random Crop)
-            i, j, h, w = transforms.RandomCrop.get_params(
-                low_img, output_size=(self.img_size, self.img_size))
-
-            low_img = TF.crop(low_img, i, j, h, w)
-            high_img = TF.crop(high_img, i, j, h, w)
-
-            # B. 随机水平翻转 (Random Horizontal Flip)
-            if random.random() > 0.5:
-                low_img = TF.hflip(low_img)
-                high_img = TF.hflip(high_img)
-
+            if self.online_synthesis:
+                low_rgb, high_rgb = self._train_online_pair(high_rgb)
+            else:
+                low_rgb = self._read_rgb(low_path)
+                low_rgb, high_rgb = self._train_precomputed_pair(low_rgb, high_rgb)
         else:
-            low_img = TF.resize(low_img, (self.img_size, self.img_size))
-            high_img = TF.resize(high_img, (self.img_size, self.img_size))
+            low_rgb = self._read_rgb(low_path)
+            low_rgb = _resize_rgb(low_rgb, self.img_size)
+            high_rgb = _resize_rgb(high_rgb, self.img_size)
 
-        # === 4. 转为 Tensor 并归一化 ===
-        low_img = TF.to_tensor(low_img)
-        high_img = TF.to_tensor(high_img)
-
-        # 归一化到 [-1, 1] (Diffusion 模型标准)
-        low_img = TF.normalize(low_img, [0.5], [0.5])
-        high_img = TF.normalize(high_img, [0.5], [0.5])
-
-        return low_img, high_img
-
-
-# 示例用法
-if __name__ == '__main__':
-    data_dir = "../datasets/kitti_LOL"
-
-    try:
-        # 在线合成模式测试
-        train_dataset = LowLightDataset(
-            image_dir=data_dir, img_size=256, phase="train",
-            online_synthesis=True)
-
-        if len(train_dataset) > 0:
-            train_loader = DataLoader(
-                train_dataset, batch_size=2, shuffle=True)
-
-            print("检查第一个 Batch 的数据对齐情况 (在线合成模式)...")
-            for low, high in train_loader:
-                print(
-                    f"Low shape: {low.shape}, Range: [{low.min():.2f}, {low.max():.2f}]")
-                print(
-                    f"High shape: {high.shape}, Range: [{high.min():.2f}, {high.max():.2f}]")
-
-                transforms.ToPILImage()(
-                    low[0]/2+0.5).save("debug_crop_low.png")
-                transforms.ToPILImage()(
-                    high[0]/2+0.5).save("debug_crop_high.png")
-                print("已保存 debug_crop_low.png 和 debug_crop_high.png。")
-                break
-        else:
-            print(f"在 {data_dir} 未找到数据。")
-
-    except Exception as e:
-        print(f"发生错误: {e}")
+        return _normalize_to_model_space(low_rgb), _normalize_to_model_space(high_rgb)

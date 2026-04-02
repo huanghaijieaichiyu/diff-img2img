@@ -11,7 +11,7 @@ A **Conditional Diffusion Model** framework for low-light image enhancement, int
 | **Retinex-Diffusion Architecture** | DecomNet decomposes images into Reflectance/Illumination, conditioning the diffusion UNet for stable training |
 | **Physics-Based Data Synthesis** | `Darker` engine with Poisson-Gaussian noise, multi-source headlights, vignetting, motion blur, JPEG artifacts |
 | **Online Synthesis** | On-the-fly random degradation during training — each epoch sees different low-light variants |
-| **Advanced Losses** | Charbonnier (pixel) + SSIM (structure) + **LPIPS** (perceptual) composite loss |
+| **Advanced Losses** | Min-SNR weighted diffusion loss + low-timestep Charbonnier/SSIM/LPIPS reconstruction branch |
 | **Min-SNR Weighting** | Stabilized diffusion training via Min-SNR-γ loss weighting |
 | **Web UI Studio** | Full-stack Streamlit dashboard: data prep → training → evaluation → visualization |
 
@@ -37,20 +37,20 @@ conda create -n diff-img2img python=3.10 && conda activate diff-img2img
 pip install -r requirements.txt
 
 # 2. Prepare dataset (synthesize low-light from normal images)
-python scripts/darker.py
+python3 scripts/darker.py
 
 # 3. Train
 accelerate launch main.py --mode train \
     --data_dir "../datasets/kitti_LOL" \
     --output_dir "runs/retinex_exp" \
     --use_retinex \
-    --online_synthesis \
     --epochs 100 \
     --batch_size 4 \
-    --resolution 256
+    --resolution 256 \
+    --train_profile auto
 
 # 4. Predict
-python main.py --mode predict \
+python3 main.py --mode predict \
     --model_path runs/retinex_exp \
     --data_dir ../datasets/test_images \
     --output_dir predictions \
@@ -66,39 +66,35 @@ accelerate launch main.py --mode train \
     --data_dir "../datasets/kitti_LOL" \
     --output_dir "runs/experiment" \
     --use_retinex \
-    --online_synthesis \
-    --freeze_decom_steps 2000 \
     --epochs 100 \
     --batch_size 4 \
     --resolution 256 \
     --mixed_precision fp16 \
-    --prediction_type v_prediction \
-    --gradient_accumulation_steps 4
+    --train_profile auto
 ```
 
 **Key training flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--train_profile` | auto | High-level training preset (`auto` or `debug_online`) |
+| `--log_interval` | 10 | How often to refresh training summaries |
 | `--use_retinex` | off | Enable Retinex decomposition conditioning |
-| `--online_synthesis` | off | On-the-fly random degradation (recommended) |
-| `--freeze_decom_steps` | 0 | Freeze DecomNet for first N steps |
-| `--prediction_type` | v_prediction | Diffusion target type |
-| `--offset_noise` | off | Enable offset noise for better dark regions |
-| `--checkpoints_total_limit` | None | Auto-delete old checkpoints (e.g., 5) |
+| `--ema` / `--no-ema` | `--ema` | Enable or disable EMA |
+| `--mixed_precision` | fp16 | Mixed precision policy |
 
 ### Prediction
 
 ```bash
 # Images
-python main.py --mode predict \
+python3 main.py --mode predict \
     --model_path runs/experiment \
     --data_dir test_images/ \
     --output_dir results/ \
     --use_retinex
 
 # Video
-python main.py --mode predict \
+python3 main.py --mode predict \
     --model_path runs/experiment \
     --video_path input.mp4 \
     --output_dir video_results/ \
@@ -108,7 +104,7 @@ python main.py --mode predict \
 ### Validation
 
 ```bash
-python main.py --mode validate \
+python3 main.py --mode validate \
     --model_path runs/experiment \
     --data_dir "../datasets/kitti_LOL" \
     --use_retinex
@@ -118,7 +114,7 @@ python main.py --mode validate \
 ### Web UI
 
 ```bash
-python main.py --mode ui
+python3 main.py --mode ui
 # Or directly: streamlit run ui/app.py
 ```
 
@@ -133,7 +129,7 @@ diff-img2img/
 │   ├── diffusion.py        # CombinedModel (UNet + DecomNet wrapper)
 │   └── retinex.py          # DecomNet for Retinex decomposition
 ├── datasets/
-│   └── data_set.py         # LowLightDataset (supports online_synthesis)
+│   └── data_set.py         # LowLightDataset (supports profile-driven data loading)
 ├── scripts/
 │   ├── darker.py           # Physics-based degradation engine
 │   └── visual_val.py       # Visualization & inference helpers
@@ -179,7 +175,7 @@ your_dataset/
     └── low/
 ```
 
-> **Tip**: With `--online_synthesis`, you only need the `high/` directory — low-light images are synthesized on-the-fly.
+> **Tip**: `--train_profile auto` prefers precomputed low/high pairs. Use `--train_profile debug_online` when you explicitly want online degradation experiments.
 
 ## 📄 License
 

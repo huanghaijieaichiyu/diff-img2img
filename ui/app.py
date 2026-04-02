@@ -1,4 +1,5 @@
 import streamlit as st
+import json
 import os
 import subprocess
 import signal
@@ -10,6 +11,7 @@ import threading
 import queue
 import pandas as pd
 import plotly.express as px
+import torch
 import yaml
 from concurrent.futures import ProcessPoolExecutor
 
@@ -82,17 +84,11 @@ TRANSLATIONS = {
         "epochs": "Epochs",
         "batch_size": "Batch Size",
         "lr": "Learning Rate",
-        "val_freq": "Validation Frequency (Epochs)",
+        "train_profile": "Training Profile",
         "train_tip": "💡 **Tip:** Ensure your GPU has enough VRAM for Batch Size > 1 at 512px.",
         "launch_train": "🚀 Launch Training",
         "train_launched": "Training launched! Switch to 'Monitoring' tab.",
         "refresh_charts": "🔄 Refresh Charts",
-        "retinex_loss_weight": "Retinex Loss Weight",
-        "tv_loss_weight": "TV Loss Weight (Retinex)",
-        "grad_clip_norm": "Gradient Clip Norm",
-        "offset_noise_scale": "Offset Noise Scale",
-        "snr_gamma": "Min-SNR Gamma",
-        "adv_hyperparams": "🛠️ Advanced Hyperparameters",
         "terminal_output": "💻 Terminal Output",
         "eval_header": "📊 Evaluation",
         "eval_desc": "Calculate quantitative metrics (PSNR, SSIM, LPIPS) on the test set.",
@@ -177,17 +173,11 @@ TRANSLATIONS = {
         "epochs": "轮数 (Epochs)",
         "batch_size": "批次大小",
         "lr": "学习率",
-        "val_freq": "验证频率 (Epochs)",
+        "train_profile": "训练配置",
         "train_tip": "💡 **提示：** 确保您的 GPU 显存足以在 512px 下支持批次大小 > 1。",
         "launch_train": "🚀 启动训练",
         "train_launched": "训练已启动！切换到 '监控' 标签。",
         "refresh_charts": "🔄 刷新图表",
-        "retinex_loss_weight": "Retinex 损失权重",
-        "tv_loss_weight": "TV 损失权重 (Retinex)",
-        "grad_clip_norm": "梯度裁剪范数",
-        "offset_noise_scale": "偏移噪声缩放 (Offset Noise Scale)",
-        "snr_gamma": "Min-SNR Gamma",
-        "adv_hyperparams": "🛠️ 高级超参数",
         "terminal_output": "💻 终端输出",
         "eval_header": "📊 评估",
         "eval_desc": "在测试集上计算定量指标 (PSNR, SSIM, LPIPS)。",
@@ -313,6 +303,8 @@ if 'training_log_file' not in st.session_state:
     st.session_state.training_log_file = None
 if 'training_csv_file' not in st.session_state:
     st.session_state.training_csv_file = None
+if 'training_status_file' not in st.session_state:
+    st.session_state.training_status_file = None
 if 'language' not in st.session_state:
     st.session_state.language = "en"
 
@@ -355,6 +347,15 @@ def read_log_file(file_path, num_lines=100):
             lines = f.readlines()
             return "".join(lines[-num_lines:])
     except Exception as e: return f"Error reading log: {e}"
+
+def read_status_file(file_path):
+    if not file_path or not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 # --- Pages ---
 
@@ -505,18 +506,7 @@ def training_page():
                 epochs = st.number_input(t("epochs"), value=50, min_value=1)
                 batch_size = st.number_input(t("batch_size"), value=4, min_value=1)
                 lr = st.number_input(t("lr"), value=1e-4, format="%.1e", step=1e-5)
-                val_freq = st.number_input(t("val_freq"), value=5, min_value=1)
-            
-            with st.expander(t("adv_hyperparams"), expanded=False):
-                ac1, ac2, ac3 = st.columns(3)
-                with ac1:
-                    retinex_loss_w = st.number_input(t("retinex_loss_weight"), value=0.1, step=0.01, format="%.2f")
-                    tv_loss_w = st.number_input(t("tv_loss_weight"), value=0.1, step=0.01, format="%.2f")
-                with ac2:
-                    grad_clip = st.number_input(t("grad_clip_norm"), value=5.0, step=0.1, format="%.1f")
-                    offset_noise = st.number_input(t("offset_noise_scale"), value=0.1, step=0.01, format="%.2f")
-                with ac3:
-                    snr_gamma = st.number_input(t("snr_gamma"), value=5.0, step=0.5, format="%.1f")
+                train_profile = st.selectbox(t("train_profile"), ["auto", "debug_online"], index=0)
                 
             st.info(t("train_tip"))
             train_btn = st.form_submit_button(t("launch_train"), type="primary")
@@ -532,34 +522,21 @@ def training_page():
             "--batch_size", str(batch_size),
             "--epochs", str(epochs),
             "--lr", str(lr),
-            "--validation_steps", "500",
-            "--retinex_loss_weight", str(retinex_loss_w),
-            "--tv_loss_weight", str(tv_loss_w),
-            "--grad_clip_norm", str(grad_clip),
-            "--offset_noise_scale", str(offset_noise),
-            "--snr_gamma", str(snr_gamma),
-            "--online_synthesis",
+            "--train_profile", train_profile,
         ]
-
-        # Enable offset noise flag if scale > 0
-        if offset_noise > 0:
-            cmd.append("--offset_noise")
 
         if use_retinex: cmd.append("--use_retinex")
         if resume: 
-             # main.py expects --model_path for resume or handle resume internally?
-             # engine.py loads from model_path.
-             # If resume is 'latest', we need logic.
-             # main.py has --model_path. 
-             # I will map resume to model_path if it looks like a path.
-             cmd.extend(["--model_path", resume])
+             cmd.extend(["--resume", resume])
         
         os.makedirs(output_dir, exist_ok=True)
         log_file = os.path.join(output_dir, "train_ui_log.txt")
         csv_file = os.path.join(output_dir, "training_metrics.csv")
+        status_file = os.path.join(output_dir, "training_status.json")
         
         st.session_state.training_log_file = log_file
         st.session_state.training_csv_file = csv_file
+        st.session_state.training_status_file = status_file
         
         try:
             # Start subprocess
@@ -594,19 +571,46 @@ def training_page():
             with c_charts:
                 st.subheader(t("results")) # Metrics
                 csv_path = st.session_state.training_csv_file
+                status = read_status_file(st.session_state.training_status_file)
+                if status:
+                    metrics_cols = st.columns(4)
+                    metrics_cols[0].metric("Phase", str(status.get("phase", "-")))
+                    metrics_cols[1].metric("Loss", f"{status.get('loss', 0.0):.4f}" if isinstance(status.get("loss"), (int, float)) else "-")
+                    metrics_cols[2].metric("Samples/s", f"{status.get('samples_per_sec', 0.0):.2f}" if isinstance(status.get("samples_per_sec"), (int, float)) else "-")
+                    metrics_cols[3].metric("GPU Reserved", f"{status.get('gpu_reserved_gb', 0.0):.2f} GB" if isinstance(status.get("gpu_reserved_gb"), (int, float)) else "-")
+
+                    resource_cols = st.columns(4)
+                    resource_cols[0].metric("Data Time", f"{status.get('data_time', 0.0):.3f} s" if isinstance(status.get("data_time"), (int, float)) else "-")
+                    resource_cols[1].metric("Compute Time", f"{status.get('compute_time', 0.0):.3f} s" if isinstance(status.get("compute_time"), (int, float)) else "-")
+                    resource_cols[2].metric("CPU %", f"{status.get('cpu_percent', 0.0):.1f}" if isinstance(status.get("cpu_percent"), (int, float)) else "-")
+                    resource_cols[3].metric("CPU RSS", f"{status.get('cpu_rss_gb', 0.0):.2f} GB" if isinstance(status.get("cpu_rss_gb"), (int, float)) else "-")
+
+                    val_cols = st.columns(3)
+                    val_cols[0].metric("Val PSNR", f"{status.get('val_psnr', 0.0):.3f}" if isinstance(status.get("val_psnr"), (int, float)) else "-")
+                    val_cols[1].metric("Val SSIM", f"{status.get('val_ssim', 0.0):.4f}" if isinstance(status.get("val_ssim"), (int, float)) else "-")
+                    val_cols[2].metric("Val LPIPS", f"{status.get('val_lpips', 0.0):.4f}" if isinstance(status.get("val_lpips"), (int, float)) else "-")
+
                 if csv_path and os.path.exists(csv_path):
                     try:
                         df = pd.read_csv(csv_path)
                         if not df.empty:
-                            # Loss Chart
                             fig_loss = px.line(df, x='step', y='loss', title='Training Loss', template="plotly_white")
                             fig_loss.update_traces(line_color='#FF4B4B')
                             st.plotly_chart(fig_loss, use_container_width=True)
-                            
-                            # LR Chart
+
                             fig_lr = px.line(df, x='step', y='lr', title='Learning Rate', template="plotly_white")
                             fig_lr.update_traces(line_color='#0068C9')
                             st.plotly_chart(fig_lr, use_container_width=True)
+
+                            if "samples_per_sec" in df.columns:
+                                fig_throughput = px.line(df, x='step', y='samples_per_sec', title='Throughput (samples/s)', template="plotly_white")
+                                fig_throughput.update_traces(line_color='#059669')
+                                st.plotly_chart(fig_throughput, use_container_width=True)
+
+                            if {"data_time", "compute_time"}.issubset(df.columns):
+                                time_df = df[["step", "data_time", "compute_time"]].melt(id_vars="step", var_name="component", value_name="seconds")
+                                fig_timing = px.line(time_df, x='step', y='seconds', color='component', title='Data vs Compute Time', template="plotly_white")
+                                st.plotly_chart(fig_timing, use_container_width=True)
                         else:
                             st.warning(t("Waiting for data points..."))
                     except Exception as e:
@@ -670,10 +674,13 @@ def evaluation_page():
                 for line in metrics:
                     if ":" in line:
                         key, val = line.split(":")
-                        val = float(val.strip())
-                        if "PSNR" in key: m_cols[0].metric("PSNR", f"{val:.2f} dB")
-                        elif "SSIM" in key: m_cols[1].metric("SSIM", f"{val:.4f}")
-                        elif "LPIPS" in key: m_cols[2].metric("LPIPS", f"{val:.4f}")
+                        try:
+                            numeric_val = float(val.strip())
+                        except ValueError:
+                            continue
+                        if "PSNR" in key: m_cols[0].metric("PSNR", f"{numeric_val:.2f} dB")
+                        elif "SSIM" in key: m_cols[1].metric("SSIM", f"{numeric_val:.4f}")
+                        elif "LPIPS" in key: m_cols[2].metric("LPIPS", f"{numeric_val:.4f}")
         else:
             st.error("Evaluation Failed")
             st.code(result.stderr)
@@ -705,7 +712,7 @@ def visualization_page():
 
     # Select Data
     data_path = folder_selector(t("dataset"), "vis_data", "../datasets/kitti_LOL")
-    test_low = os.path.join(data_path, "test", "low")
+    test_low = os.path.join(data_path, "eval15", "low")
     
     if os.path.exists(test_low):
         files = sorted([f for f in os.listdir(test_low) if f.endswith(('.png', '.jpg'))])
@@ -717,7 +724,7 @@ def visualization_page():
             
             # Paths
             low_p = os.path.join(test_low, sel_file)
-            high_p = os.path.join(data_path, "test", "high", sel_file)
+            high_p = os.path.join(data_path, "eval15", "high", sel_file)
             
             # Load & Process
             img_low = Image.open(low_p).convert("RGB")
@@ -820,7 +827,6 @@ with st.sidebar:
     nav_options = {
         t("home"): "Home",
         t("dataset"): "Dataset Preparation",
-        t("configuration"): "Configuration",
         t("training"): "Training",
         t("evaluation"): "Evaluation",
         t("visualization"): "Visualization"
@@ -830,7 +836,6 @@ with st.sidebar:
 
 if page == "Home": home_page()
 elif page == "Dataset Preparation": dataset_page()
-elif page == "Configuration": configuration_page()
 elif page == "Training": training_page()
 elif page == "Evaluation": evaluation_page()
 elif page == "Visualization": visualization_page()

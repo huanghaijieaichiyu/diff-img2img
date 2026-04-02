@@ -53,6 +53,7 @@ requests==2.32.3
 rich==14.0.0
 safetensors==0.5.3
 scikit-image==0.25.2
+scikit-video
 scipy==1.15.3
 setuptools==70.2.0
 six==1.17.0

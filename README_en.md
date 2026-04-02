@@ -14,7 +14,7 @@
     -   **数据合成**: 使用 `Darker` 引擎基于物理模型（Gamma、噪声、车灯）合成低光照数据。
     -   **训练监控**: 实时查看 Loss 曲线和学习率。
     -   **评估与可视化**: 计算 PSNR/SSIM/LPIPS 指标并对比增强效果。
--   **先进损失函数**: 融合 **Charbonnier Loss** (像素)、**SSIM Loss** (结构)、**Edge Loss** (边缘) 和 **Frequency Loss** (频域)。
+-   **先进损失函数**: 结合 **Min-SNR diffusion loss** 与低时间步 **Charbonnier / SSIM / LPIPS** 重建分支。
 -   **Retinex-Diffusion**: 利用 Retinex 分解引导扩散生成。
 
 ## 🖼️ 效果展示
@@ -53,7 +53,7 @@
 无需记忆复杂参数，一键启动 Studio：
 
 ```bash
-python main.py --mode ui
+python3 main.py --mode ui
 ```
 *(或者: `streamlit run ui/app.py`)*
 
@@ -72,14 +72,15 @@ accelerate launch main.py --mode train \
     --resolution 256 \
     --batch_size 4 \
     --epochs 50 \
-    --use_retinex
+    --use_retinex \
+    --train_profile auto
 ```
 
 ### 2. 预测 (Inference)
 
 **单图/文件夹:**
 ```bash
-python main.py --mode predict \
+python3 main.py --mode predict \
     --model_path runs/experiment_1 \
     --data_dir ../datasets/test_images \
     --output_dir predictions \
@@ -88,7 +89,7 @@ python main.py --mode predict \
 
 **视频:**
 ```bash
-python main.py --mode predict \
+python3 main.py --mode predict \
     --model_path runs/experiment_1 \
     --video_path input_video.mp4 \
     --output_dir video_results \
@@ -98,7 +99,7 @@ python main.py --mode predict \
 ### 3. 验证 (Validation)
 
 ```bash
-python main.py --mode validate \
+python3 main.py --mode validate \
     --model_path runs/experiment_1 \
     --data_dir ../datasets/kitti_LOL \
     --use_retinex
