@@ -1,0 +1,65 @@
+meta:
+  name: middle_accum
+  target_vram_gb: 16
+  description: 16GB accumulation-oriented preset that pushes toward a quality-heavy adapter and wider UNet.
+
+runtime:
+  train_profile: auto
+  mixed_precision: fp16
+  resolution: 320
+  log_interval: 10
+  num_workers: 6
+
+model:
+  architecture_scale: middle_accum
+  use_retinex: true
+  use_ema: true
+  ema_decay: 0.9999
+  prediction_type: v_prediction
+  conditioning_space: hvi_lite
+  inject_mode: film_pyramid
+  condition_variant: max
+  decom_variant: max
+  base_condition_channels: 32
+  decom_base_channels: 32
+  unet_layers_per_block: 2
+  unet_block_channels: [48, 96, 192, 384, 512]
+  unet_down_block_types: [DownBlock2D, DownBlock2D, AttnDownBlock2D, AttnDownBlock2D, AttnDownBlock2D]
+  unet_up_block_types: [AttnUpBlock2D, AttnUpBlock2D, AttnUpBlock2D, UpBlock2D, UpBlock2D]
+  enable_xformers_memory_efficient_attention: true
+
+optimization:
+  batch_size: 1
+  gradient_accumulation_steps: 12
+  lr: 1.0e-4
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 700
+  grad_clip_norm: 4.0
+
+loss:
+  offset_noise: true
+  offset_noise_scale: 0.1
+  snr_gamma: 5.0
+  retinex_loss_weight: 0.1
+  tv_loss_weight: 0.1
+  retinex_consistency_weight: 1.0
+  retinex_exposure_weight: 0.1
+  x0_loss_weight: 0.22
+  x0_loss_t_max: 224
+  x0_loss_warmup_steps: 2400
+  residual_scale: 0.5
+
+schedule:
+  checkpointing_steps: 1000
+  validation_steps: 500
+  max_train_steps:
+  freeze_decom_steps: 0
+  decom_warmup_steps: 3500
+  joint_retinex_ramp_steps: 1800
+
+evaluation:
+  num_inference_steps: 8
+  benchmark_inference_steps: [8, 20]
+  num_validation_images: 12
+  semantic_backbone: resnet18
+  nr_metric: niqe

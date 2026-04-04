@@ -29,9 +29,9 @@ from diffusers.training_utils import EMAModel
 from torcheval.metrics.functional import peak_signal_noise_ratio
 
 from datasets.data_set import LowLightDataset
-from models.conditioning import PyramidConditionAdapter
+from models.conditioning import build_condition_adapter
 from models.diffusion import CombinedModel
-from models.retinex import DecomNet
+from models.retinex import build_decom_net
 from utils.loss import CompositeLoss
 from utils.metrics import SemanticFeatureMetric, try_compute_niqe
 from utils.misc import charbonnier_loss_elementwise, compute_min_snr_loss_weights, ssim
@@ -132,9 +132,13 @@ class DiffusionEngine:
         self.decom_model = None
         if self.args.use_retinex:
             logger.info("Initializing Retinex decomposition network...")
-            self.decom_model = DecomNet().to(self.accelerator.device)
+            self.decom_model = build_decom_net(
+                variant=self.args.decom_variant,
+                base_channel=self.args.decom_base_channels,
+            ).to(self.accelerator.device)
 
-        self.condition_adapter = PyramidConditionAdapter(
+        self.condition_adapter = build_condition_adapter(
+            variant=self.args.condition_variant,
             block_channels=self.args.unet_block_channels,
             cond_out_channels=7,
             base_channels=self.args.base_condition_channels,
@@ -882,7 +886,7 @@ class DiffusionEngine:
 
     def validate(self, step=None):
         logger.info(f"Running validation at step {step}...")
-
+ 
         eval_dataset = LowLightDataset(
             image_dir=self.args.data_dir,
             img_size=self.args.resolution,
@@ -895,7 +899,6 @@ class DiffusionEngine:
             num_workers=self.args.num_workers,
         )
         eval_dataloader = self.accelerator.prepare(eval_dataloader)
-
         unwrapped = self.accelerator.unwrap_model(self.training_model)
         unet = unwrapped.unet
         decom = unwrapped.decom_model

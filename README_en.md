@@ -67,14 +67,32 @@ python3 main.py --mode ui
 
 ```bash
 accelerate launch main.py --mode train \
+    --config configs/train/middle.yaml \
     --data_dir ../datasets/kitti_LOL \
     --output_dir runs/experiment_1 \
-    --resolution 256 \
-    --batch_size 4 \
-    --epochs 50 \
     --use_retinex \
     --train_profile auto
 ```
+
+### 1.1 模型规模配置
+
+| Preset | 目标显存 | Retinex 分支 | 条件编码器 | 主干侧重 |
+|------|---------|-------------|-----------|---------|
+| `small` | ~8GB | `SmallDecomNet`：轻量 MBConv 风格 | `SmallConditionAdapter`：depthwise/MBConv + 轻量 FiLM | 优先参数量小、效率高、易训练 |
+| `small_accum` | ~8GB | `MiddleDecomNet` | `MiddleConditionAdapter` | 用更高梯度累积在 8GB 上运行更大的网络 |
+| `middle` | ~8GB / 16GB 更舒适 | `MiddleDecomNet`：3-scale + global context | `MiddleConditionAdapter`：均衡双分支条件编码 | 质量与速度均衡 |
+| `middle_accum` | ~16GB | `MaxDecomNet` | `MaxConditionAdapter` | 通过梯度累积运行更强的质量型结构 |
+| `max` | 64GB+ | `MaxDecomNet`：更深的质量优先 Retinex | `MaxConditionAdapter`：transformer/global refinement | 最大化恢复质量 |
+| `max_accum` | 64GB+ | `MaxDecomNet` | `MaxConditionAdapter` | 比 `max` 更大的扩散主干，偏上限实验 |
+
+内置配置文件：
+
+- `configs/train/small.yaml`
+- `configs/train/small_accum.yaml`
+- `configs/train/middle.yaml`
+- `configs/train/middle_accum.yaml`
+- `configs/train/max.yaml`
+- `configs/train/max_accum.yaml`
 
 ### 2. 预测 (Inference)
 

@@ -79,6 +79,7 @@ TRANSLATIONS = {
         "resume": "Resume From",
         "model": "🧠 Model",
         "use_retinex": "Use Retinex Decomposition",
+        "model_scale": "Model Scale",
         "resolution": "Image Resolution",
         "hyperparams": "⚡ Hyperparameters",
         "epochs": "Epochs",
@@ -168,6 +169,7 @@ TRANSLATIONS = {
         "resume": "恢复自",
         "model": "🧠 模型",
         "use_retinex": "使用 Retinex 分解",
+        "model_scale": "模型规模",
         "resolution": "图像分辨率",
         "hyperparams": "⚡ 超参数",
         "epochs": "轮数 (Epochs)",
@@ -499,7 +501,17 @@ def training_page():
                 
                 st.subheader(t("model"))
                 use_retinex = st.checkbox(t("use_retinex"), value=True, help="Highly recommended for low-light tasks.")
-                res = st.selectbox(t("resolution"), [256, 512], index=0)
+                model_scale_options = ["small", "middle", "max", "small_accum", "middle_accum", "max_accum"]
+                model_scale = st.selectbox(t("model_scale"), model_scale_options, index=0)
+                default_resolution = {
+                    "small": 256,
+                    "middle": 256,
+                    "max": 512,
+                    "small_accum": 256,
+                    "middle_accum": 320,
+                    "max_accum": 512,
+                }[model_scale]
+                res = st.selectbox(t("resolution"), [256, 320, 512], index=[256, 320, 512].index(default_resolution))
             
             with c2:
                 st.subheader(t("hyperparams"))
@@ -516,6 +528,7 @@ def training_page():
         # Use accelerate launch for mixed precision / distributed support
         cmd = [
             "accelerate", "launch", "main.py", "--mode", "train",
+            "--config", f"configs/train/{model_scale}.yaml",
             "--data_dir", data_dir,
             "--output_dir", output_dir,
             "--resolution", str(res),

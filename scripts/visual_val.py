@@ -12,9 +12,9 @@ from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultist
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from models.conditioning import PyramidConditionAdapter
+from models.conditioning import build_condition_adapter
 from models.diffusion import CombinedModel
-from models.retinex import DecomNet
+from models.retinex import build_decom_net
 
 
 def _read_metadata(model_path):
@@ -54,13 +54,17 @@ def load_models(model_path, use_retinex, device):
         ]
         for decom_path in decom_candidates:
             if os.path.exists(decom_path):
-                decom_model = DecomNet().to(device)
+                decom_model = build_decom_net(
+                    variant=args_dict.get("decom_variant", "middle"),
+                    base_channel=int(args_dict.get("decom_base_channels", 32)),
+                ).to(device)
                 decom_model.load_state_dict(torch.load(decom_path, map_location=device))
                 decom_model.eval()
                 break
     models["decom"] = decom_model
 
-    condition_adapter = PyramidConditionAdapter(
+    condition_adapter = build_condition_adapter(
+        variant=args_dict.get("condition_variant", "middle"),
         block_channels=args_dict.get("unet_block_channels", [32, 64, 128, 256, 512]),
         cond_out_channels=7,
         base_channels=int(args_dict.get("base_condition_channels", 32)),

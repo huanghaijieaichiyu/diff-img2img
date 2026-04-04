@@ -2,46 +2,79 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import C2f, Concat, Conv, ConvTranspose
+from .common import C2f, Concat, Conv, ConvGNAct, ConvTranspose, DWConvGNAct, GatedFusion, GlobalContextBlock, MBConvBlock, Transformer2DBlock
 
 
-class GlobalContextBlock(nn.Module):
-    def __init__(self, channels: int, num_heads: int = 4):
+def _resize_if_needed(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if source.shape[2:] != target.shape[2:]:
+        source = F.interpolate(source, size=target.shape[2:], mode="bilinear", align_corners=False)
+    return source
+
+
+class SmallDecomNet(nn.Module):
+    """
+    Efficiency-oriented Retinex decomposition.
+    Uses MBConv-style blocks and shallower depth for 8GB-class training.
+    """
+
+    def __init__(self, base_channel=24):
         super().__init__()
-        self.norm1 = nn.GroupNorm(num_groups=max(1, min(8, channels)), num_channels=channels)
-        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=max(1, min(num_heads, channels // 32 or 1)), batch_first=True)
-        self.norm2 = nn.GroupNorm(num_groups=max(1, min(8, channels)), num_channels=channels)
-        self.ffn = nn.Sequential(
-            nn.Conv2d(channels, channels * 2, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(channels * 2, channels, kernel_size=1),
+        c1, c2, c3 = base_channel, base_channel * 2, base_channel * 4
+
+        self.stem = DWConvGNAct(3, c1, k=3, s=1)
+        self.enc0 = MBConvBlock(c1, c1)
+        self.down1 = MBConvBlock(c1, c2, stride=2)
+        self.enc1 = MBConvBlock(c2, c2)
+        self.down2 = MBConvBlock(c2, c3, stride=2)
+        self.bottleneck = nn.Sequential(
+            MBConvBlock(c3, c3),
+            SqueezeExciteLite(c3),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, channels, height, width = x.shape
+        self.up1 = ConvTranspose(c3, c2, k=2, s=2)
+        self.fuse1 = GatedFusion(c2)
+        self.dec1 = MBConvBlock(c2, c2)
 
-        attn_input = self.norm1(x).flatten(2).transpose(1, 2)
-        attn_output, _ = self.attn(attn_input, attn_input, attn_input, need_weights=False)
-        x = x + attn_output.transpose(1, 2).reshape(batch_size, channels, height, width)
+        self.up0 = ConvTranspose(c2, c1, k=2, s=2)
+        self.fuse0 = GatedFusion(c1)
+        self.dec0 = MBConvBlock(c1, c1)
 
-        ffn_input = self.norm2(x)
-        x = x + self.ffn(ffn_input)
-        return x
+        self.r_head = nn.Sequential(ConvGNAct(c1, c1, k=3), nn.Conv2d(c1, 3, kernel_size=3, padding=1))
+        self.i_head = nn.Sequential(ConvGNAct(c1, c1, k=3), nn.Conv2d(c1, 1, kernel_size=3, padding=1))
+
+    def forward(self, x):
+        feat0 = self.enc0(self.stem(x))
+        feat1 = self.enc1(self.down1(feat0))
+        feat2 = self.bottleneck(self.down2(feat1))
+
+        dec1 = self.dec1(self.fuse1(_resize_if_needed(self.up1(feat2), feat1), feat1))
+        dec0 = self.dec0(self.fuse0(_resize_if_needed(self.up0(dec1), feat0), feat0))
+        return torch.sigmoid(self.r_head(dec0)), torch.sigmoid(self.i_head(dec0))
 
 
-class DecomNet(nn.Module):
+class SqueezeExciteLite(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        hidden = max(8, channels // 4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(channels, hidden, kernel_size=1)
+        self.fc2 = nn.Conv2d(hidden, channels, kernel_size=1)
+
+    def forward(self, x):
+        scale = self.pool(x)
+        scale = F.silu(self.fc1(scale))
+        scale = torch.sigmoid(self.fc2(scale))
+        return x * scale
+
+
+class MiddleDecomNet(nn.Module):
     """
-    Three-scale Retinex decomposition network with a global bottleneck block.
-
-    It remains lightweight, but compared with the previous 2-downsample design:
-      - sees a larger spatial context
-      - models illumination at 1/8 scale
-      - uses a global attention bottleneck to reduce local-only bias
+    Balanced Retinex decomposition.
+    Three-scale U-Net + one global context block.
     """
 
     def __init__(self, base_channel=32):
         super().__init__()
-
         self.cv0 = Conv(3, base_channel, k=3, s=1)
         self.c2f0 = C2f(base_channel, base_channel, n=1, shortcut=True)
 
@@ -67,44 +100,81 @@ class DecomNet(nn.Module):
         self.concat0 = Concat()
         self.c2f_up0 = C2f(base_channel * 2, base_channel, n=1, shortcut=True)
 
-        self.r_head = nn.Sequential(
-            Conv(base_channel, base_channel, k=3),
-            nn.Conv2d(base_channel, 3, kernel_size=3, padding=1),
-        )
-        self.i_head = nn.Sequential(
-            Conv(base_channel, base_channel, k=3),
-            nn.Conv2d(base_channel, 1, kernel_size=3, padding=1),
-        )
-
-    @staticmethod
-    def _resize_if_needed(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if source.shape[2:] != target.shape[2:]:
-            source = F.interpolate(source, size=target.shape[2:], mode="bilinear", align_corners=False)
-        return source
+        self.r_head = nn.Sequential(Conv(base_channel, base_channel, k=3), nn.Conv2d(base_channel, 3, kernel_size=3, padding=1))
+        self.i_head = nn.Sequential(Conv(base_channel, base_channel, k=3), nn.Conv2d(base_channel, 1, kernel_size=3, padding=1))
 
     def forward(self, x):
-        x0 = self.cv0(x)
-        feat0 = self.c2f0(x0)
+        feat0 = self.c2f0(self.cv0(x))
+        feat1 = self.c2f1(self.down1(feat0))
+        feat2 = self.c2f2(self.down2(feat1))
+        feat3 = self.global_bottleneck(self.c2f3(self.down3(feat2)))
 
-        x1 = self.down1(feat0)
-        feat1 = self.c2f1(x1)
+        dec2 = self.c2f_up2(self.concat2([_resize_if_needed(self.up2(feat3), feat2), feat2]))
+        dec1 = self.c2f_up1(self.concat1([_resize_if_needed(self.up1(dec2), feat1), feat1]))
+        dec0 = self.c2f_up0(self.concat0([_resize_if_needed(self.up0(dec1), feat0), feat0]))
+        return torch.sigmoid(self.r_head(dec0)), torch.sigmoid(self.i_head(dec0))
 
-        x2 = self.down2(feat1)
-        feat2 = self.c2f2(x2)
 
-        x3 = self.down3(feat2)
-        feat3 = self.c2f3(x3)
-        feat3 = self.global_bottleneck(feat3)
+class MaxDecomNet(nn.Module):
+    """
+    Quality-oriented Retinex decomposition.
+    Uses deeper scale depth, global context, transformer refinement and gated skip fusion.
+    """
 
-        up2 = self._resize_if_needed(self.up2(feat3), feat2)
-        dec2 = self.c2f_up2(self.concat2([up2, feat2]))
+    def __init__(self, base_channel=48):
+        super().__init__()
+        c1, c2, c3, c4 = base_channel, base_channel * 2, base_channel * 4, base_channel * 8
 
-        up1 = self._resize_if_needed(self.up1(dec2), feat1)
-        dec1 = self.c2f_up1(self.concat1([up1, feat1]))
+        self.stem = ConvGNAct(3, c1, k=3, s=1)
+        self.enc0 = nn.Sequential(C2f(c1, c1, n=2, shortcut=True), Transformer2DBlock(c1, num_heads=2))
 
-        up0 = self._resize_if_needed(self.up0(dec1), feat0)
-        dec0 = self.c2f_up0(self.concat0([up0, feat0]))
+        self.down1 = ConvGNAct(c1, c2, k=3, s=2)
+        self.enc1 = nn.Sequential(C2f(c2, c2, n=2, shortcut=True), Transformer2DBlock(c2, num_heads=4))
 
-        reflectance = torch.sigmoid(self.r_head(dec0))
-        illumination = torch.sigmoid(self.i_head(dec0))
-        return reflectance, illumination
+        self.down2 = ConvGNAct(c2, c3, k=3, s=2)
+        self.enc2 = nn.Sequential(C2f(c3, c3, n=2, shortcut=True), Transformer2DBlock(c3, num_heads=8))
+
+        self.down3 = ConvGNAct(c3, c4, k=3, s=2)
+        self.bottleneck = nn.Sequential(
+            C2f(c4, c4, n=2, shortcut=True),
+            GlobalContextBlock(c4, num_heads=8),
+            Transformer2DBlock(c4, num_heads=8),
+        )
+
+        self.up2 = ConvTranspose(c4, c3, k=2, s=2)
+        self.fuse2 = GatedFusion(c3)
+        self.dec2 = nn.Sequential(C2f(c3, c3, n=2, shortcut=True), Transformer2DBlock(c3, num_heads=8))
+
+        self.up1 = ConvTranspose(c3, c2, k=2, s=2)
+        self.fuse1 = GatedFusion(c2)
+        self.dec1 = nn.Sequential(C2f(c2, c2, n=2, shortcut=True), Transformer2DBlock(c2, num_heads=4))
+
+        self.up0 = ConvTranspose(c2, c1, k=2, s=2)
+        self.fuse0 = GatedFusion(c1)
+        self.dec0 = nn.Sequential(C2f(c1, c1, n=2, shortcut=True), Transformer2DBlock(c1, num_heads=2))
+
+        self.r_head = nn.Sequential(ConvGNAct(c1, c1, k=3), nn.Conv2d(c1, 3, kernel_size=3, padding=1))
+        self.i_head = nn.Sequential(ConvGNAct(c1, c1, k=3), nn.Conv2d(c1, 1, kernel_size=3, padding=1))
+
+    def forward(self, x):
+        feat0 = self.enc0(self.stem(x))
+        feat1 = self.enc1(self.down1(feat0))
+        feat2 = self.enc2(self.down2(feat1))
+        feat3 = self.bottleneck(self.down3(feat2))
+
+        dec2 = self.dec2(self.fuse2(_resize_if_needed(self.up2(feat3), feat2), feat2))
+        dec1 = self.dec1(self.fuse1(_resize_if_needed(self.up1(dec2), feat1), feat1))
+        dec0 = self.dec0(self.fuse0(_resize_if_needed(self.up0(dec1), feat0), feat0))
+        return torch.sigmoid(self.r_head(dec0)), torch.sigmoid(self.i_head(dec0))
+
+
+def build_decom_net(variant: str, base_channel: int):
+    variant = (variant or "middle").lower()
+    if variant in {"small", "mobile", "lite"}:
+        return SmallDecomNet(base_channel=base_channel)
+    if variant in {"max", "quality", "large"}:
+        return MaxDecomNet(base_channel=base_channel)
+    return MiddleDecomNet(base_channel=base_channel)
+
+
+DecomNet = MiddleDecomNet

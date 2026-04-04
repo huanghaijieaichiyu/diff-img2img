@@ -3,6 +3,9 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
+
+import yaml
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,9 @@ class TrainProfileConfig:
     conditioning_space: str
     inject_mode: str
     base_condition_channels: int
+    decom_base_channels: int
+    decom_variant: str
+    condition_variant: str
     enable_xformers_memory_efficient_attention: bool
     num_workers: int
     semantic_backbone: str
@@ -84,6 +90,9 @@ TRAIN_PROFILES = {
         conditioning_space="hvi_lite",
         inject_mode="film_pyramid",
         base_condition_channels=32,
+        decom_base_channels=32,
+        decom_variant="middle",
+        condition_variant="middle",
         enable_xformers_memory_efficient_attention=True,
         num_workers=_recommended_num_workers(),
         semantic_backbone="resnet18",
@@ -122,11 +131,23 @@ TRAIN_PROFILES = {
         conditioning_space="hvi_lite",
         inject_mode="film_pyramid",
         base_condition_channels=32,
+        decom_base_channels=32,
+        decom_variant="small",
+        condition_variant="small",
         enable_xformers_memory_efficient_attention=True,
         num_workers=max(2, min(4, _recommended_num_workers())),
         semantic_backbone="none",
         nr_metric="none",
     ),
+}
+
+MODEL_CONFIG_PRESETS = {
+    "small": "configs/train/small.yaml",
+    "middle": "configs/train/middle.yaml",
+    "max": "configs/train/max.yaml",
+    "small_accum": "configs/train/small_accum.yaml",
+    "middle_accum": "configs/train/middle_accum.yaml",
+    "max_accum": "configs/train/max_accum.yaml",
 }
 
 
@@ -135,6 +156,37 @@ def _add_hidden_argument(parser: argparse.ArgumentParser, *name_or_flags, **kwar
     if "default" not in kwargs:
         kwargs["default"] = None
     parser.add_argument(*name_or_flags, **kwargs)
+
+
+def _flatten_config_tree(config_node: dict) -> dict:
+    flat = {}
+    for key, value in (config_node or {}).items():
+        if isinstance(value, dict):
+            flat.update(_flatten_config_tree(value))
+        else:
+            flat[key] = value
+    return flat
+
+
+def _resolve_config_path(config_value: str | None) -> str:
+    if not config_value:
+        config_value = "small"
+    resolved = MODEL_CONFIG_PRESETS.get(config_value, config_value)
+    return str(Path(resolved))
+
+
+def _load_config_defaults(config_path: str) -> dict:
+    resolved_path = Path(_resolve_config_path(config_path))
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Config file not found: {resolved_path}")
+
+    with open(resolved_path, "r") as handle:
+        config_data = yaml.safe_load(handle) or {}
+
+    defaults = _flatten_config_tree(config_data)
+    defaults["config"] = str(resolved_path)
+    defaults["config_name"] = config_data.get("meta", {}).get("name", resolved_path.stem)
+    return defaults
 
 
 def _ensure_training_data_mode(args):
@@ -173,13 +225,28 @@ def apply_profile_defaults(args):
         args.use_ema = True
 
     _ensure_training_data_mode(args)
+    _validate_model_args(args)
     return args
 
 
+def _validate_model_args(args):
+    num_blocks = len(args.unet_block_channels)
+    if len(args.unet_down_block_types) != num_blocks:
+        raise ValueError("unet_down_block_types length must match unet_block_channels length")
+    if len(args.unet_up_block_types) != num_blocks:
+        raise ValueError("unet_up_block_types length must match unet_block_channels length")
+
+
 def get_args():
+    bootstrap_parser = argparse.ArgumentParser(add_help=False)
+    bootstrap_parser.add_argument("--config", type=str, default="small")
+    bootstrap_args, _ = bootstrap_parser.parse_known_args()
+    config_defaults = _load_config_defaults(bootstrap_args.config)
+
     parser = argparse.ArgumentParser(description="Diff-Img2Img Unified Engine")
 
     # User-facing parameters
+    parser.add_argument("--config", type=str, default=config_defaults["config"], help="YAML config path or preset name: small / middle / max / *_accum")
     parser.add_argument("--mode", type=str, default="train", choices=["train", "predict", "validate", "ui"], help="Execution mode")
     parser.add_argument("--data_dir", type=str, default="../datasets/kitti_LOL", help="Dataset root directory")
     parser.add_argument("--output_dir", type=str, default="runs/exp1", help="Output directory for logs and checkpoints")
@@ -235,6 +302,9 @@ def get_args():
     _add_hidden_argument(parser, "--conditioning_space", type=str, choices=["hvi_lite", "rgb"])
     _add_hidden_argument(parser, "--inject_mode", type=str, choices=["film_pyramid"])
     _add_hidden_argument(parser, "--base_condition_channels", type=int)
+    _add_hidden_argument(parser, "--decom_base_channels", type=int)
+    _add_hidden_argument(parser, "--decom_variant", type=str, choices=["small", "middle", "max"])
+    _add_hidden_argument(parser, "--condition_variant", type=str, choices=["small", "middle", "max"])
     _add_hidden_argument(parser, "--enable_xformers_memory_efficient_attention", action="store_true", default=None)
     _add_hidden_argument(parser, "--benchmark_inference_steps", nargs="+", type=int)
     _add_hidden_argument(parser, "--num_workers", type=int)
@@ -242,7 +312,10 @@ def get_args():
     _add_hidden_argument(parser, "--nr_metric", type=str, choices=["none", "niqe"])
     _add_hidden_argument(parser, "--port", type=int)
 
-    return apply_profile_defaults(parser.parse_args())
+    parser.set_defaults(**config_defaults)
+    args = parser.parse_args()
+    args.config = _resolve_config_path(args.config)
+    return apply_profile_defaults(args)
 
 
 if __name__ == "__main__":
