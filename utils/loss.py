@@ -102,27 +102,61 @@ class LPIPSLoss(nn.Module):
         return self.loss_fn(pred, target).mean()
 
 
+class UncertaintyWeightedLoss(nn.Module):
+    """
+    P0 Improvement: Uncertainty-based automatic loss weighting.
+    Learns optimal weights for multiple loss terms during training.
+    Reference: "Multi-Task Learning Using Uncertainty to Weigh Losses" (Kendall et al., 2018)
+    """
+    def __init__(self, num_losses=3):
+        super().__init__()
+        # Log variance parameters (learnable)
+        self.log_vars = nn.Parameter(torch.zeros(num_losses))
+
+    def forward(self, losses):
+        """
+        Args:
+            losses: List of loss tensors [l1, l2, l3, ...]
+        Returns:
+            Weighted sum of losses
+        """
+        weighted_losses = []
+        for i, loss in enumerate(losses):
+            precision = torch.exp(-self.log_vars[i])
+            weighted = precision * loss + self.log_vars[i]
+            weighted_losses.append(weighted)
+        return sum(weighted_losses), {f'weight_{i}': torch.exp(-self.log_vars[i]).item() for i in range(len(losses))}
+
+
 class CompositeLoss(nn.Module):
     """
     Composite Loss for Low-Light Image Enhancement.
     Combines:
     1. Pixel Loss (Charbonnier) - Robust reconstruction.
     2. SSIM Loss - Structural similarity.
-    3. LPIPS Loss - Perceptual quality (NEW).
+    3. LPIPS Loss - Perceptual quality.
+
+    P0 Improvement: Now supports uncertainty-based automatic weighting.
     """
-    def __init__(self, 
-                 w_char=1.0, 
+    def __init__(self,
+                 w_char=1.0,
                  w_ssim=0.1,
                  w_lpips=0.1,
-                 device='cuda'):
+                 device='cuda',
+                 use_uncertainty_weighting=True):
         super(CompositeLoss, self).__init__()
         self.w_char = w_char
         self.w_ssim = w_ssim
         self.w_lpips = w_lpips
-        
+        self.use_uncertainty_weighting = use_uncertainty_weighting
+
         self.char_loss = CharbonnierLoss()
         self.ssim_loss = SSIMLoss()
         self.lpips_loss = LPIPSLoss()
+
+        # P0: Add uncertainty weighting
+        if use_uncertainty_weighting:
+            self.uncertainty_weighter = UncertaintyWeightedLoss(num_losses=3)
 
     def forward(self, pred, target):
         """
@@ -134,24 +168,36 @@ class CompositeLoss(nn.Module):
             target = target.to(pred.device)
 
         l_char = self.char_loss(pred, target)
-        
+
         # Normalize to [0, 1] for SSIM calculation
         pred_01 = (pred.clamp(-1, 1) + 1) / 2
         target_01 = (target.clamp(-1, 1) + 1) / 2
         l_ssim = self.ssim_loss(pred_01, target_01)
-        
+
         # LPIPS expects [-1, 1] range directly
         l_lpips = self.lpips_loss(pred.clamp(-1, 1), target.clamp(-1, 1))
-        
-        total_loss = (self.w_char * l_char +
-                      self.w_ssim * l_ssim +
-                      self.w_lpips * l_lpips)
-        
-        logs = {
-            'l_pix': l_char.detach(),
-            'l_ssim': l_ssim.detach(),
-            'l_lpips': l_lpips.detach(),
-            'l_total': total_loss.detach()
-        }
-        
+
+        # P0: Use uncertainty weighting if enabled
+        if self.use_uncertainty_weighting:
+            total_loss, weights = self.uncertainty_weighter([l_char, l_ssim, l_lpips])
+            logs = {
+                'l_pix': l_char.detach(),
+                'l_ssim': l_ssim.detach(),
+                'l_lpips': l_lpips.detach(),
+                'l_total': total_loss.detach(),
+                'w_char': weights.get('weight_0', self.w_char),
+                'w_ssim': weights.get('weight_1', self.w_ssim),
+                'w_lpips': weights.get('weight_2', self.w_lpips),
+            }
+        else:
+            total_loss = (self.w_char * l_char +
+                          self.w_ssim * l_ssim +
+                          self.w_lpips * l_lpips)
+            logs = {
+                'l_pix': l_char.detach(),
+                'l_ssim': l_ssim.detach(),
+                'l_lpips': l_lpips.detach(),
+                'l_total': total_loss.detach()
+            }
+
         return total_loss, logs

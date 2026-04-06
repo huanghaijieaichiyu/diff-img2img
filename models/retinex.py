@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import C2f, Concat, Conv, ConvGNAct, ConvTranspose, DWConvGNAct, GatedFusion, GlobalContextBlock, MBConvBlock, Transformer2DBlock
+from .common import C2f, Concat, Conv, ConvGNAct, ConvTranspose, DWConvGNAct, GatedFusion, GlobalContextBlock, MBConvBlock, Transformer2DBlock, NAFBlock, LayerNorm2d
 
 
 def _resize_if_needed(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -168,12 +168,72 @@ class MaxDecomNet(nn.Module):
         return torch.sigmoid(self.r_head(dec0)), torch.sigmoid(self.i_head(dec0))
 
 
+class NAFDecomNet(nn.Module):
+    """
+    P1 Improvement: NAFNet-based Retinex decomposition.
+    Uses simple gating mechanism for efficient and effective decomposition.
+    Reference: "Simple Baselines for Image Restoration" (ECCV 2022)
+    """
+
+    def __init__(self, base_channel=32, num_blocks=4):
+        super().__init__()
+        self.stem = nn.Conv2d(3, base_channel, kernel_size=3, padding=1)
+
+        # Encoder with NAFBlocks
+        self.enc0 = nn.Sequential(*[NAFBlock(base_channel) for _ in range(num_blocks)])
+        self.down1 = nn.Conv2d(base_channel, base_channel * 2, kernel_size=3, stride=2, padding=1)
+        self.enc1 = nn.Sequential(*[NAFBlock(base_channel * 2) for _ in range(num_blocks)])
+        self.down2 = nn.Conv2d(base_channel * 2, base_channel * 4, kernel_size=3, stride=2, padding=1)
+        self.enc2 = nn.Sequential(*[NAFBlock(base_channel * 4) for _ in range(num_blocks)])
+
+        # Bottleneck
+        self.bottleneck = nn.Sequential(*[NAFBlock(base_channel * 4) for _ in range(num_blocks)])
+
+        # Decoder
+        self.up1 = nn.ConvTranspose2d(base_channel * 4, base_channel * 2, kernel_size=2, stride=2)
+        self.fuse1 = nn.Conv2d(base_channel * 4, base_channel * 2, kernel_size=1)  # Reduce channels after concat
+        self.dec1 = nn.Sequential(*[NAFBlock(base_channel * 2) for _ in range(num_blocks)])
+        self.up0 = nn.ConvTranspose2d(base_channel * 2, base_channel, kernel_size=2, stride=2)
+        self.fuse0 = nn.Conv2d(base_channel * 2, base_channel, kernel_size=1)  # Reduce channels after concat
+        self.dec0 = nn.Sequential(*[NAFBlock(base_channel) for _ in range(num_blocks)])
+
+        # Output heads
+        self.r_head = nn.Sequential(
+            nn.Conv2d(base_channel, base_channel, kernel_size=3, padding=1),
+            LayerNorm2d(base_channel),
+            nn.SiLU(),
+            nn.Conv2d(base_channel, 3, kernel_size=3, padding=1)
+        )
+        self.i_head = nn.Sequential(
+            nn.Conv2d(base_channel, base_channel, kernel_size=3, padding=1),
+            LayerNorm2d(base_channel),
+            nn.SiLU(),
+            nn.Conv2d(base_channel, 1, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        # Encoder
+        feat0 = self.enc0(self.stem(x))
+        feat1 = self.enc1(self.down1(feat0))
+        feat2 = self.bottleneck(self.enc2(self.down2(feat1)))
+
+        # Decoder with skip connections
+        up1 = _resize_if_needed(self.up1(feat2), feat1)
+        dec1 = self.dec1(self.fuse1(torch.cat([up1, feat1], dim=1)))
+        up0 = _resize_if_needed(self.up0(dec1), feat0)
+        dec0 = self.dec0(self.fuse0(torch.cat([up0, feat0], dim=1)))
+
+        return torch.sigmoid(self.r_head(dec0)), torch.sigmoid(self.i_head(dec0))
+
+
 def build_decom_net(variant: str, base_channel: int):
     variant = (variant or "middle").lower()
     if variant in {"small", "mobile", "lite"}:
         return SmallDecomNet(base_channel=base_channel)
     if variant in {"max", "quality", "large"}:
         return MaxDecomNet(base_channel=base_channel)
+    if variant in {"naf", "nafnet"}:
+        return NAFDecomNet(base_channel=base_channel, num_blocks=4)
     return MiddleDecomNet(base_channel=base_channel)
 
 

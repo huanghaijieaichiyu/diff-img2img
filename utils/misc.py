@@ -144,6 +144,7 @@ def compute_snr(noise_scheduler, timesteps):
 
 
 def compute_min_snr_loss_weights(noise_scheduler, timesteps, snr_gamma=5.0):
+    """Legacy Min-SNR weighting (2023)"""
     snr = compute_snr(noise_scheduler, timesteps)
     prediction_type = getattr(noise_scheduler.config, "prediction_type", "epsilon")
 
@@ -156,6 +157,85 @@ def compute_min_snr_loss_weights(noise_scheduler, timesteps, snr_gamma=5.0):
     else:
         raise ValueError(f"Unsupported prediction type: {prediction_type}")
     return weights.detach()
+
+
+# ============================================================================
+#  P0 Improvement: Advanced Loss Weighting Strategies
+# ============================================================================
+
+def compute_p2_loss_weights(noise_scheduler, timesteps, p2_gamma=1.0, p2_k=1.0):
+    """
+    P2 weighting from "Perception Prioritized Training of Diffusion Models" (2022)
+    Focuses training on perceptually important timesteps.
+
+    Args:
+        noise_scheduler: The noise scheduler
+        timesteps: Current timesteps
+        p2_gamma: Weighting exponent (default: 1.0)
+        p2_k: Offset constant (default: 1.0)
+
+    Returns:
+        Loss weights for each timestep
+    """
+    snr = compute_snr(noise_scheduler, timesteps)
+    snr_clamped = torch.clamp(snr, min=1e-8)
+    weights = 1.0 / (p2_k + snr_clamped) ** p2_gamma
+    return weights.detach()
+
+
+def compute_edm_loss_weights(noise_scheduler, timesteps, sigma_data=0.5):
+    """
+    EDM-style weighting from "Elucidating the Design Space of Diffusion-Based Generative Models"
+    (Karras et al., 2022)
+
+    Provides more balanced training across noise levels.
+
+    Args:
+        noise_scheduler: The noise scheduler
+        timesteps: Current timesteps
+        sigma_data: Data standard deviation (default: 0.5)
+
+    Returns:
+        Loss weights for each timestep
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    if alphas_cumprod.device != timesteps.device:
+        alphas_cumprod = alphas_cumprod.to(timesteps.device)
+
+    # Convert to sigma parameterization
+    alpha_t = alphas_cumprod[timesteps]
+    sigma_t = torch.sqrt((1 - alpha_t) / alpha_t)
+
+    # EDM weighting: (sigma^2 + sigma_data^2) / (sigma * sigma_data)^2
+    weights = (sigma_t ** 2 + sigma_data ** 2) / ((sigma_t * sigma_data) ** 2 + 1e-8)
+    return weights.detach()
+
+
+def compute_adaptive_loss_weights(noise_scheduler, timesteps, weighting_scheme="edm", **kwargs):
+    """
+    P0 Improvement: Unified interface for different weighting schemes.
+
+    Args:
+        noise_scheduler: The noise scheduler
+        timesteps: Current timesteps
+        weighting_scheme: One of ["min_snr", "p2", "edm"]
+        **kwargs: Additional arguments for specific schemes
+
+    Returns:
+        Loss weights for each timestep
+    """
+    if weighting_scheme == "min_snr":
+        snr_gamma = kwargs.get("snr_gamma", 5.0)
+        return compute_min_snr_loss_weights(noise_scheduler, timesteps, snr_gamma)
+    elif weighting_scheme == "p2":
+        p2_gamma = kwargs.get("p2_gamma", 1.0)
+        p2_k = kwargs.get("p2_k", 1.0)
+        return compute_p2_loss_weights(noise_scheduler, timesteps, p2_gamma, p2_k)
+    elif weighting_scheme == "edm":
+        sigma_data = kwargs.get("sigma_data", 0.5)
+        return compute_edm_loss_weights(noise_scheduler, timesteps, sigma_data)
+    else:
+        raise ValueError(f"Unknown weighting scheme: {weighting_scheme}")
 
 
 def charbonnier_loss_elementwise(pred, target, eps=1e-3):

@@ -34,7 +34,7 @@ from models.diffusion import CombinedModel
 from models.retinex import build_decom_net
 from utils.loss import CompositeLoss
 from utils.metrics import SemanticFeatureMetric, try_compute_niqe
-from utils.misc import charbonnier_loss_elementwise, compute_min_snr_loss_weights, ssim
+from utils.misc import compute_min_snr_loss_weights, compute_adaptive_loss_weights, ssim
 from utils.train_display import create_training_display
 from utils.video_writer import video_writer
 
@@ -102,6 +102,7 @@ class DiffusionEngine:
             os.makedirs(args.output_dir, exist_ok=True)
 
         self.metrics_csv_path = os.path.join(args.output_dir, "training_metrics.csv")
+        self._joint_decom_trainable = None
         self._setup_models()
 
         self.noise_scheduler = DDPMScheduler(
@@ -109,7 +110,11 @@ class DiffusionEngine:
             beta_schedule="squaredcos_cap_v2",
             prediction_type=args.prediction_type,
         )
-        self.criterion = CompositeLoss(device=self.accelerator.device).to(self.accelerator.device)
+        use_uncertainty = getattr(args, "use_uncertainty_weighting", False)
+        self.criterion = CompositeLoss(
+            device=self.accelerator.device,
+            use_uncertainty_weighting=use_uncertainty,
+        ).to(self.accelerator.device)
 
     def _setup_models(self):
         input_channels = 10
@@ -160,16 +165,27 @@ class DiffusionEngine:
             conditioning_space=self.args.conditioning_space,
         )
 
-        self.ema_model = None
+        self.ema_models = {}
         if self.args.use_ema:
-            logger.info("Initializing EMA model...")
-            self.ema_model = EMAModel(
+            logger.info("Initializing EMA models...")
+            self.ema_models["unet"] = EMAModel(
                 self.unet.parameters(),
                 decay=self.args.ema_decay,
                 model_cls=UNet2DModel,
                 model_config=self.unet.config,
             )
-            self.ema_model.to(self.accelerator.device)
+            if self.decom_model is not None:
+                self.ema_models["decom_model"] = EMAModel(
+                    self.decom_model.parameters(),
+                    decay=self.args.ema_decay,
+                )
+            if self.condition_adapter is not None:
+                self.ema_models["condition_adapter"] = EMAModel(
+                    self.condition_adapter.parameters(),
+                    decay=self.args.ema_decay,
+                )
+            for ema_model in self.ema_models.values():
+                ema_model.to(self.accelerator.device)
 
     @staticmethod
     def _set_trainable(module, trainable: bool):
@@ -177,6 +193,174 @@ class DiffusionEngine:
             return
         for parameter in module.parameters():
             parameter.requires_grad = trainable
+
+    def _named_core_modules(self, unwrapped_model=None):
+        if unwrapped_model is None:
+            unwrapped_model = self.accelerator.unwrap_model(self.training_model)
+        return {
+            "unet": unwrapped_model.unet,
+            "decom_model": unwrapped_model.decom_model,
+            "condition_adapter": unwrapped_model.condition_adapter,
+        }
+
+    @staticmethod
+    def _use_weight_decay(parameter_name: str, parameter: torch.nn.Parameter) -> bool:
+        normalized_name = parameter_name.lower()
+        if parameter.ndim <= 1:
+            return False
+        if normalized_name.endswith("bias"):
+            return False
+        if any(token in normalized_name for token in ("norm", "bn", "log_vars")):
+            return False
+        return True
+
+    def _build_optimizer_param_groups(self):
+        decay_params = []
+        no_decay_params = []
+        seen = set()
+
+        def add_named_params(named_params, include_frozen: bool):
+            for name, parameter in named_params:
+                if not include_frozen and not parameter.requires_grad:
+                    continue
+                param_id = id(parameter)
+                if param_id in seen:
+                    continue
+                seen.add(param_id)
+                if self._use_weight_decay(name, parameter):
+                    decay_params.append(parameter)
+                else:
+                    no_decay_params.append(parameter)
+
+        add_named_params(self.training_model.named_parameters(), include_frozen=True)
+        add_named_params(self.criterion.named_parameters(), include_frozen=False)
+
+        param_groups = []
+        if decay_params:
+            param_groups.append({"params": decay_params, "weight_decay": 0.01})
+        if no_decay_params:
+            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+        return param_groups
+
+    def _params_for_gradient_clipping(self):
+        params = list(self.training_model.parameters())
+        params.extend(list(self.criterion.parameters()))
+        return params
+
+    def _set_joint_phase_trainability(self, joint_step: int):
+        unwrapped_model = self.accelerator.unwrap_model(self.training_model)
+        self._set_trainable(unwrapped_model.unet, True)
+        self._set_trainable(unwrapped_model.condition_adapter, True)
+
+        if unwrapped_model.decom_model is None:
+            self._joint_decom_trainable = None
+            return
+
+        decom_trainable = joint_step >= self.args.freeze_decom_steps
+        if self._joint_decom_trainable == decom_trainable:
+            return
+
+        self._set_trainable(unwrapped_model.decom_model, decom_trainable)
+        self._joint_decom_trainable = decom_trainable
+        state = "trainable" if decom_trainable else "frozen"
+        logger.info(f"Setting decomposition network to {state} at joint_step={joint_step}")
+
+    def _ema_file_map(self, save_path: str):
+        return {
+            "unet": [
+                os.path.join(save_path, "ema_unet.pth"),
+                os.path.join(save_path, "ema_model.pth"),
+            ],
+            "decom_model": [os.path.join(save_path, "ema_decom_model.pth")],
+            "condition_adapter": [os.path.join(save_path, "ema_condition_adapter.pth")],
+        }
+
+    def _load_ema_state(self, save_path: str):
+        if not self.args.use_ema or not self.ema_models:
+            return
+
+        for module_name, candidate_paths in self._ema_file_map(save_path).items():
+            ema_model = self.ema_models.get(module_name)
+            if ema_model is None:
+                continue
+            for candidate_path in candidate_paths:
+                if not os.path.exists(candidate_path):
+                    continue
+                ema_model.load_state_dict(torch.load(candidate_path, map_location=self.accelerator.device))
+                logger.info(f"Loaded EMA state for {module_name} from {candidate_path}")
+                break
+
+    def _save_ema_state(self, save_path: str):
+        if not self.args.use_ema or not self.ema_models:
+            return
+
+        file_map = self._ema_file_map(save_path)
+        for module_name, ema_model in self.ema_models.items():
+            target_path = file_map[module_name][0]
+            torch.save(ema_model.state_dict(), target_path)
+            if module_name == "unet":
+                torch.save(ema_model.state_dict(), os.path.join(save_path, "ema_model.pth"))
+
+    def _ema_store(self):
+        if not self.args.use_ema or not self.ema_models:
+            return
+
+        modules = self._named_core_modules()
+        for module_name, ema_model in self.ema_models.items():
+            module = modules.get(module_name)
+            if module is not None:
+                ema_model.store(module.parameters())
+
+    def _ema_copy_to_modules(self):
+        if not self.args.use_ema or not self.ema_models:
+            return
+
+        modules = self._named_core_modules()
+        for module_name, ema_model in self.ema_models.items():
+            module = modules.get(module_name)
+            if module is not None:
+                ema_model.copy_to(module.parameters())
+
+    def _ema_restore(self):
+        if not self.args.use_ema or not self.ema_models:
+            return
+
+        modules = self._named_core_modules()
+        for module_name, ema_model in self.ema_models.items():
+            module = modules.get(module_name)
+            if module is not None:
+                ema_model.restore(module.parameters())
+
+    def _ema_step(self):
+        """
+        P1 Fix: Adaptive EMA decay with warmup for better early training stability.
+        Starts with lower decay (0.95) and gradually increases to target (0.9999).
+        """
+        if not self.args.use_ema or not self.ema_models:
+            return
+
+        # Calculate adaptive decay based on training progress
+        warmup_steps = getattr(self.args, 'ema_warmup_steps', 5000)
+        # Track global step through accelerator
+        current_step = getattr(self, '_global_step', 0)
+
+        if current_step < warmup_steps:
+            # Cosine warmup from 0.95 to target decay
+            progress = current_step / warmup_steps
+            decay_start = 0.95
+            decay_end = self.args.ema_decay
+            # Smooth cosine interpolation
+            decay = decay_start + (decay_end - decay_start) * (0.5 * (1 - math.cos(math.pi * progress)))
+        else:
+            decay = self.args.ema_decay
+
+        # Update all EMA models with adaptive decay
+        modules = self._named_core_modules()
+        for module_name, ema_model in self.ema_models.items():
+            module = modules.get(module_name)
+            if module is not None:
+                ema_model.decay = decay
+                ema_model.step(module.parameters())
 
     def _candidate_paths(self, path: str, filename: str):
         return [
@@ -312,13 +496,19 @@ class DiffusionEngine:
         return step % interval == 0
 
     def _x0_branch_weight(self, global_step: int) -> float:
+        """
+        P1 Fix: Use cosine warmup instead of linear for smoother x0 loss introduction.
+        Cosine warmup starts slow and accelerates, reducing early training instability.
+        """
         if global_step < self.args.decom_warmup_steps:
             return 0.0
         if self.args.x0_loss_warmup_steps <= 0:
             return self.args.x0_loss_weight
-        progress = (global_step - self.args.decom_warmup_steps + 1) / float(self.args.x0_loss_warmup_steps)
+        progress = (global_step - self.args.decom_warmup_steps) / float(self.args.x0_loss_warmup_steps)
         progress = max(0.0, min(1.0, progress))
-        return self.args.x0_loss_weight * progress
+        # Cosine warmup: slow start, fast finish
+        cosine_progress = 0.5 * (1 - math.cos(math.pi * progress))
+        return self.args.x0_loss_weight * cosine_progress
 
     def _residual_target(self, clean_images: torch.Tensor, low_light_images: torch.Tensor) -> torch.Tensor:
         return (clean_images - low_light_images) * self.args.residual_scale
@@ -405,10 +595,10 @@ class DiffusionEngine:
 
     def train(self):
         optimizer = torch.optim.AdamW(
-            self.training_model.parameters(),
+            self._build_optimizer_param_groups(),
             lr=self.args.lr,
-            weight_decay=1e-2,
-            eps=1e-08,
+            betas=(0.9, 0.999),
+            eps=1e-8,
         )
 
         train_dataset = LowLightDataset(
@@ -437,19 +627,38 @@ class DiffusionEngine:
         warmup_steps = self.args.decom_warmup_steps if self.args.use_retinex and self.decom_model is not None else 0
         total_training_steps = self.args.max_train_steps + warmup_steps
 
-        lr_scheduler = get_scheduler(
-            self.args.lr_scheduler,
-            optimizer=optimizer,
-            num_warmup_steps=self.args.lr_warmup_steps * self.args.gradient_accumulation_steps,
-            num_training_steps=total_training_steps * self.args.gradient_accumulation_steps,
-        )
+        # P0 Improvement: Use cosine annealing with warmup for better convergence
+        if self.args.lr_scheduler == "cosine_with_warmup":
+            from diffusers.optimization import get_cosine_schedule_with_warmup
+            lr_scheduler = get_cosine_schedule_with_warmup(
+                optimizer=optimizer,
+                num_warmup_steps=self.args.lr_warmup_steps * self.args.gradient_accumulation_steps,
+                num_training_steps=total_training_steps * self.args.gradient_accumulation_steps,
+                num_cycles=0.5,
+            )
+        else:
+            lr_scheduler = get_scheduler(
+                self.args.lr_scheduler,
+                optimizer=optimizer,
+                num_warmup_steps=self.args.lr_warmup_steps * self.args.gradient_accumulation_steps,
+                num_training_steps=total_training_steps * self.args.gradient_accumulation_steps,
+            )
 
-        self.training_model, optimizer, train_dataloader, lr_scheduler = self.accelerator.prepare(
-            self.training_model,
-            optimizer,
-            train_dataloader,
-            lr_scheduler,
-        )
+        if self.args.use_uncertainty_weighting:
+            self.training_model, self.criterion, optimizer, train_dataloader, lr_scheduler = self.accelerator.prepare(
+                self.training_model,
+                self.criterion,
+                optimizer,
+                train_dataloader,
+                lr_scheduler,
+            )
+        else:
+            self.training_model, optimizer, train_dataloader, lr_scheduler = self.accelerator.prepare(
+                self.training_model,
+                optimizer,
+                train_dataloader,
+                lr_scheduler,
+            )
 
         if self.accelerator.is_main_process:
             tracker_config = dict(vars(self.args))
@@ -465,6 +674,7 @@ class DiffusionEngine:
 
         global_step = 0
         first_epoch = 0
+        completed_joint_steps = 0
         if self.args.resume:
             if self.args.resume == "latest":
                 checkpoints = [d for d in os.listdir(self.args.output_dir) if d.startswith("checkpoint-")]
@@ -480,17 +690,18 @@ class DiffusionEngine:
                 global_step = int(os.path.basename(self.args.resume).split("-")[1])
                 completed_joint_steps = max(0, global_step - warmup_steps)
                 first_epoch = completed_joint_steps // max(1, num_update_steps_per_epoch)
-
-                if self.args.use_ema and self.ema_model is not None:
-                    ema_path = os.path.join(self.args.resume, "ema_model.pth")
-                    if os.path.exists(ema_path):
-                        self.ema_model.load_state_dict(torch.load(ema_path, map_location=self.accelerator.device))
+                self._load_ema_state(self.args.resume)
 
         if global_step >= warmup_steps:
-            self._set_trainable(self.accelerator.unwrap_model(self.training_model).unet, True)
-            self._set_trainable(self.accelerator.unwrap_model(self.training_model).condition_adapter, True)
+            self._set_joint_phase_trainability(completed_joint_steps)
 
         logger.info("***** Running training *****")
+        logger.info(
+            "Effective batch size: %s (batch_size=%s x grad_accum=%s)",
+            getattr(self.args, "effective_batch_size", self.args.batch_size * self.args.gradient_accumulation_steps),
+            self.args.batch_size,
+            self.args.gradient_accumulation_steps,
+        )
         rich_enabled = self.accelerator.is_local_main_process and sys.stdout.isatty()
         use_tqdm = False
         progress_bar = tqdm(
@@ -502,6 +713,8 @@ class DiffusionEngine:
         live_display = create_training_display(total_steps=total_training_steps, enabled=rich_enabled)
         live_display.start()
 
+        # Track global step for EMA warmup
+        self._global_step = global_step
         self.training_model.train()
         train_iterator = iter(train_dataloader)
         last_iter_end = time.perf_counter()
@@ -541,6 +754,7 @@ class DiffusionEngine:
                 logs.update(self.latest_validation_metrics)
                 progress_bar.update(1)
                 global_step += 1
+                self._global_step = global_step  # Update for EMA warmup
                 logs["epoch"] = 0
                 logs["step"] = global_step
                 logs["phase"] = "decom_warmup"
@@ -563,12 +777,11 @@ class DiffusionEngine:
                 accum_samples = 0
 
         if warmup_steps > 0:
-            logger.info("Retinex warmup finished. Unfreezing diffusion backbone and condition adapter.")
-            unwrapped = self.accelerator.unwrap_model(self.training_model)
-            self._set_trainable(unwrapped.unet, True)
-            self._set_trainable(unwrapped.condition_adapter, True)
+            logger.info("Retinex warmup finished. Transitioning into joint training.")
 
         completed_joint_steps = max(0, global_step - warmup_steps)
+        if global_step >= warmup_steps:
+            self._set_joint_phase_trainability(completed_joint_steps)
         accum_data_time = 0.0
         accum_compute_time = 0.0
         accum_samples = 0
@@ -578,6 +791,7 @@ class DiffusionEngine:
                 if completed_joint_steps >= self.args.max_train_steps:
                     break
 
+                self._set_joint_phase_trainability(completed_joint_steps)
                 data_time = time.perf_counter() - last_iter_end
                 compute_start = time.perf_counter()
                 _, logs = self._train_step(
@@ -605,6 +819,7 @@ class DiffusionEngine:
                     progress_bar.update(1)
                     global_step += 1
                     completed_joint_steps += 1
+                    self._global_step = global_step  # Update for EMA warmup
 
                     logs["epoch"] = epoch + 1
                     logs["step"] = global_step
@@ -656,7 +871,7 @@ class DiffusionEngine:
 
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(self.training_model.parameters(), self.args.grad_clip_norm)
+                    self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
@@ -707,7 +922,18 @@ class DiffusionEngine:
             else:
                 target = self.noise_scheduler.get_velocity(residual_target, noise, timesteps)
 
-            snr_weights = compute_min_snr_loss_weights(self.noise_scheduler, timesteps, self.args.snr_gamma)
+            weighting_scheme = getattr(self.args, "loss_weighting_scheme", "min_snr")
+            if weighting_scheme == "min_snr":
+                snr_weights = compute_min_snr_loss_weights(self.noise_scheduler, timesteps, self.args.snr_gamma)
+            else:
+                snr_weights = compute_adaptive_loss_weights(
+                    self.noise_scheduler,
+                    timesteps,
+                    weighting_scheme=weighting_scheme,
+                    snr_gamma=self.args.snr_gamma,
+                )
+            # P1 Fix: Use Charbonnier loss instead of MSE for robustness
+            from utils.misc import charbonnier_loss_elementwise
             loss_diff_elem = charbonnier_loss_elementwise(model_pred, target)
             loss_diffusion = (loss_diff_elem.mean(dim=[1, 2, 3]) * snr_weights).mean()
 
@@ -724,19 +950,21 @@ class DiffusionEngine:
 
             retinex_losses = self._compute_retinex_losses(aux)
             if self.args.use_retinex:
+                # P0 Fix: Use smooth cosine ramp instead of sudden jump
                 if joint_step < self.args.joint_retinex_ramp_steps:
-                    weak_consistency = 0.25 * retinex_losses["l_consistency"]
-                    loss = loss + self.args.retinex_loss_weight * weak_consistency
+                    ramp_progress = joint_step / max(1, self.args.joint_retinex_ramp_steps)
+                    ramp_weight = 0.5 * (1 - math.cos(math.pi * ramp_progress))
+                    loss = loss + self.args.retinex_loss_weight * ramp_weight * retinex_losses["retinex_total"]
                 else:
                     loss = loss + self.args.retinex_loss_weight * retinex_losses["retinex_total"]
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self.training_model.parameters(), self.args.grad_clip_norm)
+                self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
+                # P0 Fix: Update EMA before optimizer.step() to use pre-update parameters
+                self._ema_step()
                 optimizer.step()
                 lr_scheduler.step()
-                if self.args.use_ema and self.ema_model is not None:
-                    self.ema_model.step(self.accelerator.unwrap_model(self.training_model).unet.parameters())
                 optimizer.zero_grad()
 
             logs = {
@@ -904,9 +1132,8 @@ class DiffusionEngine:
         decom = unwrapped.decom_model
         condition_adapter = unwrapped.condition_adapter
 
-        if self.args.use_ema and self.ema_model is not None:
-            self.ema_model.store(unet.parameters())
-            self.ema_model.copy_to(unet.parameters())
+        self._ema_store()
+        self._ema_copy_to_modules()
 
         unet.eval()
         if decom is not None:
@@ -1005,8 +1232,7 @@ class DiffusionEngine:
                     metrics=primary_metrics,
                 )
 
-        if self.args.use_ema and self.ema_model is not None:
-            self.ema_model.restore(unet.parameters())
+        self._ema_restore()
 
         self.training_model.train()
         self.accelerator.wait_for_everyone()
@@ -1117,6 +1343,7 @@ class DiffusionEngine:
             "ema_enabled": self.args.use_ema,
             "best_psnr": self.best_psnr,
             "metrics": metrics or {},
+            "effective_batch_size": getattr(self.args, "effective_batch_size", None),
             "args": serializable_args,
         }
 
@@ -1151,8 +1378,7 @@ class DiffusionEngine:
         save_path = os.path.join(self.args.output_dir, f"checkpoint-{step}")
         self.accelerator.save_state(save_path)
 
-        if self.args.use_ema and self.ema_model is not None:
-            torch.save(self.ema_model.state_dict(), os.path.join(save_path, "ema_model.pth"))
+        self._save_ema_state(save_path)
 
         unwrapped = self.accelerator.unwrap_model(self.training_model)
         if unwrapped.decom_model is not None:
@@ -1179,15 +1405,17 @@ class DiffusionEngine:
         if not self.accelerator.is_main_process:
             return
 
+        self._ema_store()
+        self._ema_copy_to_modules()
         unwrapped = self.accelerator.unwrap_model(self.training_model)
-        if self.args.use_ema and self.ema_model is not None:
-            self.ema_model.copy_to(unwrapped.unet.parameters())
-
-        self._save_model_bundle(
-            self.args.output_dir,
-            unwrapped.unet,
-            unwrapped.decom_model,
-            unwrapped.condition_adapter,
-            prefix="final",
-            step=global_step,
-        )
+        try:
+            self._save_model_bundle(
+                self.args.output_dir,
+                unwrapped.unet,
+                unwrapped.decom_model,
+                unwrapped.condition_adapter,
+                prefix="final",
+                step=global_step,
+            )
+        finally:
+            self._ema_restore()

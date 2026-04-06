@@ -1,25 +1,26 @@
 meta:
-  name: middle
-  target_vram_gb: 8
-  description: Borderline 8GB / comfortable 16GB preset. Uses stronger modules than small, but lowers resolution and batch size to fit.
+  name: small_sota
+  target_vram_gb: 6
+  description: Low-risk quality preset for 6GB VRAM - Min-SNR weighting, cosine annealing, effective batch 16
 
 runtime:
   train_profile: auto
   mixed_precision: fp16
   resolution: 256
   log_interval: 10
-  num_workers: 4
+  num_workers: 2
+  online_synthesis: true  # Enable online synthesis since we only have low images
 
 model:
-  architecture_scale: middle
+  architecture_scale: small
   use_retinex: true
   use_ema: true
   ema_decay: 0.9999
   prediction_type: v_prediction
   conditioning_space: hvi_lite
   inject_mode: film_pyramid
-  condition_variant: middle
-  decom_variant: middle
+  condition_variant: small  # Keep small for memory efficiency
+  decom_variant: small  # Keep small for memory efficiency
   base_condition_channels: 24
   decom_base_channels: 24
   unet_layers_per_block: 2
@@ -32,7 +33,7 @@ optimization:
   batch_size: 1
   gradient_accumulation_steps: 16
   lr: 1.0e-4
-  lr_scheduler: cosine_with_warmup  # P0: Improved learning rate schedule
+  lr_scheduler: cosine_with_warmup  # P0: Cosine annealing
   lr_warmup_steps: 500
   grad_clip_norm: 4.0
 
@@ -46,22 +47,22 @@ loss:
   tv_loss_weight: 0.1
   retinex_consistency_weight: 1.0
   retinex_exposure_weight: 0.1
-  x0_loss_weight: 0.18
-  x0_loss_t_max: 192
-  x0_loss_warmup_steps: 1800
+  x0_loss_weight: 0.15
+  x0_loss_t_max: 180
+  x0_loss_warmup_steps: 1500
   residual_scale: 0.5
 
 schedule:
   checkpointing_steps: 1000
   validation_steps: 500
-  max_train_steps:
+  max_train_steps: 100  # Smoke test: only 100 steps
   freeze_decom_steps: 0
-  decom_warmup_steps: 2500
-  joint_retinex_ramp_steps: 1500
+  decom_warmup_steps: 50  # Smoke test: reduced warmup
+  joint_retinex_ramp_steps: 30
 
 evaluation:
   num_inference_steps: 8
-  benchmark_inference_steps: [8, 20]
-  num_validation_images: 12
-  semantic_backbone: resnet18
-  nr_metric: niqe
+  benchmark_inference_steps: [8]
+  num_validation_images: 4  # Smoke test: fewer images
+  semantic_backbone: none  # Smoke test: disable for speed
+  nr_metric: none  # Smoke test: disable for speed

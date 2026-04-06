@@ -8,6 +8,9 @@ from pathlib import Path
 import yaml
 
 
+MIN_EFFECTIVE_BATCH_SIZE = 16
+
+
 @dataclass(frozen=True)
 class TrainProfileConfig:
     report_to: str
@@ -49,6 +52,9 @@ class TrainProfileConfig:
     num_workers: int
     semantic_backbone: str
     nr_metric: str
+    # P0/P1 Improvements
+    loss_weighting_scheme: str = "min_snr"  # "min_snr", "p2", "edm"
+    use_uncertainty_weighting: bool = False
 
 
 def _recommended_num_workers() -> int:
@@ -63,10 +69,12 @@ TRAIN_PROFILES = {
         checkpointing_steps=1000,
         validation_steps=500,
         max_train_steps=None,
-        lr_scheduler="constant_with_warmup",
+        lr_scheduler="cosine_with_warmup",  # P0: Use cosine annealing
         lr_warmup_steps=500,
         offset_noise=True,
         snr_gamma=5.0,
+        loss_weighting_scheme="min_snr",
+        use_uncertainty_weighting=False,
         retinex_loss_weight=0.1,
         tv_loss_weight=0.1,
         retinex_consistency_weight=1.0,
@@ -104,10 +112,12 @@ TRAIN_PROFILES = {
         checkpointing_steps=500,
         validation_steps=250,
         max_train_steps=None,
-        lr_scheduler="constant_with_warmup",
+        lr_scheduler="cosine_with_warmup",  # P0: Use cosine annealing
         lr_warmup_steps=200,
         offset_noise=True,
         snr_gamma=5.0,
+        loss_weighting_scheme="min_snr",
+        use_uncertainty_weighting=False,
         retinex_loss_weight=0.1,
         tv_loss_weight=0.1,
         retinex_consistency_weight=1.0,
@@ -143,7 +153,9 @@ TRAIN_PROFILES = {
 
 MODEL_CONFIG_PRESETS = {
     "small": "configs/train/small.yaml",
+    "small_sota": "configs/train/small_sota.yaml",  # P0/P1 improvements (smoke test)
     "middle": "configs/train/middle.yaml",
+    "middle_sota": "configs/train/middle_sota.yaml",  # P0/P1 improvements
     "max": "configs/train/max.yaml",
     "small_accum": "configs/train/small_accum.yaml",
     "middle_accum": "configs/train/middle_accum.yaml",
@@ -226,6 +238,7 @@ def apply_profile_defaults(args):
 
     _ensure_training_data_mode(args)
     _validate_model_args(args)
+    _attach_effective_batch_metadata(args)
     return args
 
 
@@ -235,6 +248,37 @@ def _validate_model_args(args):
         raise ValueError("unet_down_block_types length must match unet_block_channels length")
     if len(args.unet_up_block_types) != num_blocks:
         raise ValueError("unet_up_block_types length must match unet_block_channels length")
+
+
+def _attach_effective_batch_metadata(args):
+    if args.mode != "train":
+        return
+
+    args.effective_batch_size = max(1, int(args.batch_size)) * max(1, int(args.gradient_accumulation_steps))
+    args.min_effective_batch_size = MIN_EFFECTIVE_BATCH_SIZE
+
+
+def _report_effective_batch(args):
+    if args.mode != "train":
+        return
+
+    effective_batch_size = getattr(
+        args,
+        "effective_batch_size",
+        max(1, int(args.batch_size)) * max(1, int(args.gradient_accumulation_steps)),
+    )
+    print(
+        "[train-config] "
+        f"batch_size={args.batch_size}, "
+        f"gradient_accumulation_steps={args.gradient_accumulation_steps}, "
+        f"effective_batch={effective_batch_size}"
+    )
+    if effective_batch_size < MIN_EFFECTIVE_BATCH_SIZE:
+        print(
+            "[train-config][warning] "
+            f"effective_batch={effective_batch_size} is below the recommended minimum of "
+            f"{MIN_EFFECTIVE_BATCH_SIZE}. Consider increasing gradient_accumulation_steps."
+        )
 
 
 def get_args():
@@ -259,7 +303,7 @@ def get_args():
     parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate")
     parser.add_argument("--resolution", type=int, default=256, help="Training and validation resolution")
     parser.add_argument("--use_retinex", action="store_true", help="Enable Retinex decomposition")
-    parser.add_argument("--ema", dest="use_ema", action=argparse.BooleanOptionalAction, default=True, help="Enable EMA for the diffusion backbone.")
+    parser.add_argument("--ema", dest="use_ema", action=argparse.BooleanOptionalAction, default=True, help="Enable EMA for the trainable model modules.")
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"], help="Mixed precision policy")
     parser.add_argument("--train_profile", type=str, default="auto", choices=sorted(TRAIN_PROFILES.keys()), help="High-level training preset")
     parser.add_argument("--log_interval", type=int, default=10, help="How often to refresh training summaries")
@@ -303,14 +347,17 @@ def get_args():
     _add_hidden_argument(parser, "--inject_mode", type=str, choices=["film_pyramid"])
     _add_hidden_argument(parser, "--base_condition_channels", type=int)
     _add_hidden_argument(parser, "--decom_base_channels", type=int)
-    _add_hidden_argument(parser, "--decom_variant", type=str, choices=["small", "middle", "max"])
-    _add_hidden_argument(parser, "--condition_variant", type=str, choices=["small", "middle", "max"])
+    _add_hidden_argument(parser, "--decom_variant", type=str, choices=["small", "middle", "max", "naf"])
+    _add_hidden_argument(parser, "--condition_variant", type=str, choices=["small", "middle", "max", "max_v2", "cross_attn"])
     _add_hidden_argument(parser, "--enable_xformers_memory_efficient_attention", action="store_true", default=None)
     _add_hidden_argument(parser, "--benchmark_inference_steps", nargs="+", type=int)
     _add_hidden_argument(parser, "--num_workers", type=int)
     _add_hidden_argument(parser, "--semantic_backbone", type=str, choices=["none", "resnet18"])
     _add_hidden_argument(parser, "--nr_metric", type=str, choices=["none", "niqe"])
     _add_hidden_argument(parser, "--port", type=int)
+    # P0/P1 Improvement parameters
+    _add_hidden_argument(parser, "--loss_weighting_scheme", type=str, choices=["min_snr", "p2", "edm"])
+    _add_hidden_argument(parser, "--use_uncertainty_weighting", action="store_true", default=None)
 
     parser.set_defaults(**config_defaults)
     args = parser.parse_args()
@@ -320,6 +367,7 @@ def get_args():
 
 if __name__ == "__main__":
     args = get_args()
+    _report_effective_batch(args)
 
     if args.mode == "ui":
         print("🚀 Launching Diff-Img2Img Studio...")
