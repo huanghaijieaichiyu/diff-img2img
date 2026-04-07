@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from datasets.prepare_data import load_manifest_entries
 from scripts.darker import Darker
 
 
@@ -31,6 +32,8 @@ class LowLightDataset(Dataset):
         phase="train",
         online_synthesis: bool = False,
         darker_ranges: Optional[dict] = None,
+        manifest_path: Optional[str] = None,
+        paired_samples: Optional[list[dict]] = None,
     ):
         self.image_dir = image_dir
         self.img_size = img_size
@@ -49,6 +52,17 @@ class LowLightDataset(Dataset):
             self.data.sort()
             if not self.data:
                 print(f"警告: 在 {image_dir} 中未找到图片。")
+            return
+
+        if phase == "train" and (manifest_path or paired_samples):
+            manifest_entries = paired_samples if paired_samples is not None else load_manifest_entries(manifest_path)
+            self.data = [
+                (entry["low_path"], entry["high_path"])
+                for entry in manifest_entries
+                if entry.get("low_path") and entry.get("high_path")
+            ]
+            if not self.data:
+                raise RuntimeError(f"Prepared training manifest is empty: {manifest_path}")
             return
 
         if phase == "train":

@@ -3,14 +3,37 @@ import os
 import numpy as np
 from tqdm import tqdm
 import random
+import time
 from typing import Optional, Union, Dict, Any
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 
 # ============================================================================
 #  Noise Models
 # ============================================================================
+
+
+def configure_cpu_image_backend(num_threads: int = 1) -> None:
+    """
+    Keep OpenCV/BLAS thread fan-out under control inside worker processes.
+
+    The degradation pipeline already parallelizes across processes, so allowing
+    OpenCV to spawn many internal threads per worker usually hurts throughput on
+    CPU-bound prepare jobs.
+    """
+    thread_value = str(max(1, int(num_threads)))
+    for env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[env_name] = thread_value
+    try:
+        cv2.setNumThreads(int(thread_value))
+    except Exception:
+        pass
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+
 
 def add_gaussian_noise(image: np.ndarray, mean: float = 0, sigma: float = 10) -> np.ndarray:
     """Simple additive Gaussian noise (legacy, kept for compatibility)."""
@@ -38,21 +61,20 @@ def add_poisson_gaussian_noise(image: np.ndarray,
     """
     if image is None:
         return None
-    img_float = image.astype(np.float64)
+    img_float = image.astype(np.float32)
 
     # Shot noise (signal-dependent Poisson)
     # Scale down, apply poisson, scale back
     safe_img = np.maximum(img_float, 0)
     if k > 0:
-        poisson_noise = np.random.poisson(safe_img * k) / k - img_float
+        poisson_noise = np.random.poisson(safe_img * k).astype(np.float32) / k - img_float
     else:
-        poisson_noise = 0
+        poisson_noise = np.zeros_like(img_float)
 
-    # Read noise (additive Gaussian, independent per channel)
-    read_noise = np.zeros_like(img_float)
-    for ch in range(img_float.shape[2]):
-        ch_sigma = sigma_read * random.uniform(0.8, 1.2)  # per-channel variation
-        read_noise[:, :, ch] = np.random.normal(0, ch_sigma, img_float.shape[:2])
+    # Read noise (additive Gaussian, independent per channel).
+    # Vectorize the sampling to avoid a small Python loop per image.
+    channel_sigma = sigma_read * np.random.uniform(0.8, 1.2, size=(1, 1, img_float.shape[2])).astype(np.float32)
+    read_noise = np.random.normal(0.0, 1.0, size=img_float.shape).astype(np.float32) * channel_sigma
 
     noisy = img_float + poisson_noise + read_noise
     return np.clip(noisy, 0, 255).astype(np.uint8)
@@ -233,6 +255,46 @@ def apply_motion_blur(image: np.ndarray,
 # ============================================================================
 #  Main Darker Class
 # ============================================================================
+
+_BATCH_DARKER = None
+
+
+def _batch_worker_initializer(data_dir: str,
+                              gamma: float,
+                              linear_attenuation: float,
+                              phase: str,
+                              randomize: bool,
+                              param_ranges: Optional[Dict[str, Any]]) -> None:
+    global _BATCH_DARKER
+    configure_cpu_image_backend(num_threads=1)
+    _BATCH_DARKER = Darker(
+        data_dir=data_dir,
+        gamma=gamma,
+        linear_attenuation=linear_attenuation,
+        phase=phase,
+        randomize=randomize,
+        param_ranges=param_ranges,
+    )
+
+
+def _batch_process_single_image(filename: str) -> tuple[str, bool, str]:
+    global _BATCH_DARKER
+    try:
+        if _BATCH_DARKER is None:
+            return filename, False, "Batch worker is not initialized."
+        input_path = _BATCH_DARKER.high_dir / filename
+        img = cv2.imread(str(input_path))
+        if img is None:
+            return filename, False, f"Failed to read image: {input_path}"
+
+        dark = _BATCH_DARKER.degrade_single(img)
+        output_path = _BATCH_DARKER.low_dir / filename
+        if not cv2.imwrite(str(output_path), dark):
+            return filename, False, f"Failed to write image: {output_path}"
+        return filename, True, ""
+    except Exception as exc:  # pragma: no cover - defensive path
+        return filename, False, str(exc)
+
 
 class Darker:
     """
@@ -476,17 +538,41 @@ class Darker:
         print(f"Processing {len(files)} images with {num_workers} workers...")
         print(f"Randomization: {'ON' if self.randomize else 'OFF'}")
         print(f"Default gamma={self.gamma}, attenuation={self.linear_attenuation}")
+        chunksize = max(1, len(files) // max(1, num_workers * 8))
+        print(f"OpenCV threads per worker: 1 | chunksize: {chunksize}")
+        started_at = time.perf_counter()
+        processed = 0
+        failed = 0
 
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [
-                executor.submit(self._process_single_image, f)
-                for f in files
-            ]
+        with ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=_batch_worker_initializer,
+            initargs=(
+                str(self.data_dir),
+                float(self.gamma),
+                float(self.linear_attenuation),
+                str(self.phase),
+                bool(self.randomize),
+                self.ranges,
+            ),
+        ) as executor:
+            for filename, ok, error in tqdm(
+                executor.map(_batch_process_single_image, files, chunksize=chunksize),
+                total=len(files),
+                desc="Progress",
+            ):
+                processed += 1
+                if not ok:
+                    failed += 1
+                    print(f"Error processing {filename}: {error}")
 
-            for _ in tqdm(as_completed(futures), total=len(files), desc="Progress"):
-                pass
-
-        print(f"Done! Output saved to {self.low_dir}")
+        elapsed = max(time.perf_counter() - started_at, 1e-8)
+        succeeded = processed - failed
+        print(
+            f"Done! Output saved to {self.low_dir} | "
+            f"succeeded={succeeded} failed={failed} elapsed={elapsed:.2f}s "
+            f"throughput={processed / elapsed:.2f} img/s"
+        )
 
 
 if __name__ == '__main__':

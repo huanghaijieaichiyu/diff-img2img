@@ -64,3 +64,5 @@ data/
 # Package managers
 uv.lock
 package-lock.json
+*.spec
+.claude

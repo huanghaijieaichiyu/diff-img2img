@@ -605,7 +605,7 @@ class DiffusionEngine:
             image_dir=self.args.data_dir,
             img_size=self.args.resolution,
             phase="train",
-            online_synthesis=self.args.online_synthesis,
+            manifest_path=getattr(self.args, "train_manifest_path", None),
         )
         train_loader_kwargs = {
             "batch_size": self.args.batch_size,

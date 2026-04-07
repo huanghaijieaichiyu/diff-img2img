@@ -1,7 +1,7 @@
 meta:
   name: small
-  target_vram_gb: 8
-  description: 8GB-safe preset prioritizing fit and stability.
+  target_vram_gb: 6
+  description: Compact official preset scaled down from middle for 6-8GB GPUs.
 
 runtime:
   train_profile: auto
@@ -9,6 +9,13 @@ runtime:
   resolution: 256
   log_interval: 10
   num_workers: 4
+  prepare_on_train: true
+  prepared_cache_dir:
+  offline_variant_count: 3
+  prepare_workers:
+  prepare_force: false
+  synthesis_seed: 42
+  darker_ranges:
 
 model:
   architecture_scale: small
@@ -18,35 +25,37 @@ model:
   prediction_type: v_prediction
   conditioning_space: hvi_lite
   inject_mode: film_pyramid
-  condition_variant: small
-  decom_variant: small
-  base_condition_channels: 16
-  decom_base_channels: 16
-  unet_layers_per_block: 1
+  condition_variant: max_v2
+  decom_variant: naf
+  base_condition_channels: 24
+  decom_base_channels: 24
+  unet_layers_per_block: 2
   unet_block_channels: [32, 64, 128, 192]
-  unet_down_block_types: [DownBlock2D, DownBlock2D, DownBlock2D, AttnDownBlock2D]
-  unet_up_block_types: [AttnUpBlock2D, UpBlock2D, UpBlock2D, UpBlock2D]
+  unet_down_block_types: [DownBlock2D, DownBlock2D, AttnDownBlock2D, AttnDownBlock2D]
+  unet_up_block_types: [AttnUpBlock2D, AttnUpBlock2D, UpBlock2D, UpBlock2D]
   enable_xformers_memory_efficient_attention: true
 
 optimization:
   batch_size: 2
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   lr: 1.0e-4
-  lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 300
-  grad_clip_norm: 3.0
+  lr_scheduler: cosine_with_warmup
+  lr_warmup_steps: 400
+  grad_clip_norm: 4.0
 
 loss:
   offset_noise: true
   offset_noise_scale: 0.1
   snr_gamma: 5.0
+  loss_weighting_scheme: min_snr
+  use_uncertainty_weighting: false
   retinex_loss_weight: 0.1
   tv_loss_weight: 0.1
   retinex_consistency_weight: 1.0
   retinex_exposure_weight: 0.1
-  x0_loss_weight: 0.15
-  x0_loss_t_max: 160
-  x0_loss_warmup_steps: 1500
+  x0_loss_weight: 0.16
+  x0_loss_t_max: 180
+  x0_loss_warmup_steps: 1600
   residual_scale: 0.5
 
 schedule:
@@ -55,7 +64,7 @@ schedule:
   max_train_steps:
   freeze_decom_steps: 0
   decom_warmup_steps: 2000
-  joint_retinex_ramp_steps: 1000
+  joint_retinex_ramp_steps: 1200
 
 evaluation:
   num_inference_steps: 8

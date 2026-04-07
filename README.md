@@ -10,7 +10,7 @@ A **Conditional Diffusion Model** framework for low-light image enhancement, int
 - ✅ P0 fixes: Smooth Retinex loss ramp + corrected EMA timing
 - ✅ P1 enhancements: Charbonnier diffusion loss + cosine warmup + adaptive EMA
 - ✅ Architecture: NAFNet decomposition + Cross-Attention conditioning
-- ✅ Training: EDM/P2 weighting + uncertainty-based loss balancing
+- ✅ Training engine: Min-SNR / P2 / EDM weighting support + optional uncertainty-based loss balancing
 
 **Expected improvements:** +30% stability, +15% convergence speed, +0.5-1.0 dB PSNR
 
@@ -21,9 +21,9 @@ A **Conditional Diffusion Model** framework for low-light image enhancement, int
 | Feature | Description |
 |---------|-------------|
 | **Retinex-Diffusion Architecture** | DecomNet decomposes images into Reflectance/Illumination, conditioning the diffusion UNet |
-| **SOTA Training** | Cosine annealing, EDM weighting, adaptive EMA, smooth loss ramps |
+| **SOTA Training** | Preset-driven training with cosine warmup, adaptive EMA, smooth Retinex ramps |
 | **Physics-Based Synthesis** | Poisson-Gaussian noise, headlights, vignetting, motion blur, JPEG artifacts |
-| **Online Synthesis** | On-the-fly degradation — each epoch sees different low-light variants |
+| **Prepared Multi-Variant Cache** | Training auto-builds a 3-variant offline low-light cache from `our485/high` when prepared data is missing |
 | **Advanced Losses** | Charbonnier + SSIM + LPIPS with uncertainty weighting |
 | **Web UI Studio** | Streamlit dashboard for training, evaluation, and visualization |
 
@@ -37,7 +37,8 @@ A **Conditional Diffusion Model** framework for low-light image enhancement, int
 
 - Python 3.10+
 - PyTorch 2.0+ with CUDA
-- ~6-8GB VRAM (small/middle configs)
+- 8GB VRAM recommended for full training (`middle`)
+- 6GB VRAM is enough for the compact official preset (`small`)
 
 ## 🚀 Quick Start
 
@@ -47,15 +48,18 @@ git clone https://github.com/yourusername/diff-img2img.git
 cd diff-img2img
 conda create -n diff-img2img python=3.10 && conda activate diff-img2img
 pip install -r requirements.txt
+accelerate config default
 
-# 2. Train with SOTA improvements
-python main.py --config middle_sota --mode train \
-    --data_dir /path/to/dataset \
-    --output_dir runs/sota_exp
+# 2. Train with the recommended 8GB preset
+MODEL_SIZE=middle \
+DATA_DIR=/path/to/dataset \
+OUTPUT_DIR=runs/middle_exp \
+TRAIN_PROFILE=auto \
+bash start_train.sh
 
 # 3. Predict
 python main.py --mode predict \
-    --model_path runs/sota_exp \
+    --model_path runs/middle_exp \
     --data_dir test_images/ \
     --output_dir predictions
 ```
@@ -64,33 +68,45 @@ python main.py --mode predict \
 
 | Config | VRAM | Features | Use Case |
 |--------|------|----------|----------|
-| `small` | 6-8GB | MBConv decomposition, lightweight adapter | Fast iteration, baseline |
-| `small_sota` | 6-8GB | + SOTA improvements | **Recommended for 8GB** |
-| `middle` | 8-16GB | Balanced U-Net, dual-branch adapter | Quality/cost balance |
-| `middle_sota` | 8-16GB | + NAFNet + Cross-Attention | **Recommended for 16GB** |
+| `small` | ~6GB | Compact NAF + deep-only cross-attention preset | Best fit for 6-8GB GPUs |
+| `middle` | ~8GB | NAF decomposition + stronger conditioner + effective batch 8 | **Recommended full-training preset** |
 | `max` | 64GB+ | Transformer refinement, global context | Maximum quality |
 
 ## 💻 Training
 
 ```bash
-# Basic training
-python main.py --config middle_sota --mode train \
-    --data_dir /path/to/dataset \
-    --output_dir runs/exp
+# Recommended wrapper (uses accelerate launch internally)
+MODEL_SIZE=middle \
+DATA_DIR=/path/to/dataset \
+OUTPUT_DIR=runs/exp \
+TRAIN_PROFILE=auto \
+bash start_train.sh
 
-# Advanced options
-python main.py --config middle_sota --mode train \
+# Equivalent raw command
+accelerate launch main.py --mode train \
+    --config configs/train/middle.yaml \
     --data_dir /path/to/dataset \
     --output_dir runs/exp \
-    --epochs 50 \
-    --batch_size 2 \
-    --lr 1e-4 \
-    --mixed_precision fp16
+    --train_profile auto
+
+# Build or rebuild the prepared multi-variant cache explicitly
+python main.py --mode prepare \
+    --config configs/train/middle.yaml \
+    --data_dir /path/to/dataset \
+    --offline_variant_count 3
 ```
 
 **Key flags:**
-- `--config`: Model preset (small/middle/max + optional _sota suffix)
-- `--use_retinex`: Enable Retinex decomposition (default: on)
+- `--config`: Model preset or YAML path. Recommended full run: `configs/train/middle.yaml`
+- `--train_profile`: `auto` for normal training
+- `start_train.sh`: convenience entrypoint that reads `MODEL_SIZE`, `DATA_DIR`, `OUTPUT_DIR`, and `TRAIN_PROFILE`
+- training now only consumes prepared multi-variant low-light data; single-variant `our485/low` is not treated as ready-to-train
+- if `.prepared/train_manifest.jsonl` or `.prepared/prepare_meta.json` is missing/stale, training first regenerates a 3-variant offline cache from `our485/high`
+- the prepare step now prints scan/build progress, supports interruption, and resumes from missing variants on the next run when metadata still matches
+- `--mode prepare`: run the same offline cache builder without starting training
+- `--offline_variant_count`: target number of prepared low-light variants per training image (default: `3`)
+- `--prepare_force`: force rebuilding the prepared cache
+- `--use_retinex`: enabled by the training presets already; keep it on unless you are doing ablations
 - `--ema` / `--no-ema`: EMA model (default: on with adaptive decay)
 - `--mixed_precision`: fp16/bf16/no (default: fp16)
 
@@ -129,6 +145,7 @@ python main.py --mode ui
 - [SOTA_IMPROVEMENTS_REPORT.md](SOTA_IMPROVEMENTS_REPORT.md) - Complete SOTA report
 - [TRAINING_LOGIC_REVIEW.md](TRAINING_LOGIC_REVIEW.md) - Training logic analysis
 - [CHANGELOG.md](CHANGELOG.md) - Version history
+- [notebooks/train_test_notebook.ipynb](notebooks/train_test_notebook.ipynb) - End-to-end notebook walkthrough for dataset prep, training, inference, and evaluation
 
 ## 🏗️ Architecture
 

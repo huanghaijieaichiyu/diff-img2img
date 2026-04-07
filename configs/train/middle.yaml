@@ -1,7 +1,7 @@
 meta:
   name: middle
   target_vram_gb: 8
-  description: Borderline 8GB / comfortable 16GB preset. Uses stronger modules than small, but lowers resolution and batch size to fit.
+  description: Official recommended 8GB preset with NAF decomposition and deep-only cross-attention conditioning.
 
 runtime:
   train_profile: auto
@@ -9,6 +9,13 @@ runtime:
   resolution: 256
   log_interval: 10
   num_workers: 4
+  prepare_on_train: true
+  prepared_cache_dir:
+  offline_variant_count: 3
+  prepare_workers:
+  prepare_force: false
+  synthesis_seed: 42
+  darker_ranges:
 
 model:
   architecture_scale: middle
@@ -18,10 +25,10 @@ model:
   prediction_type: v_prediction
   conditioning_space: hvi_lite
   inject_mode: film_pyramid
-  condition_variant: middle
-  decom_variant: middle
-  base_condition_channels: 24
-  decom_base_channels: 24
+  condition_variant: max_v2
+  decom_variant: naf
+  base_condition_channels: 32
+  decom_base_channels: 32
   unet_layers_per_block: 2
   unet_block_channels: [32, 64, 128, 256]
   unet_down_block_types: [DownBlock2D, DownBlock2D, AttnDownBlock2D, AttnDownBlock2D]
@@ -29,10 +36,10 @@ model:
   enable_xformers_memory_efficient_attention: true
 
 optimization:
-  batch_size: 1
-  gradient_accumulation_steps: 16
+  batch_size: 2
+  gradient_accumulation_steps: 4
   lr: 1.0e-4
-  lr_scheduler: cosine_with_warmup  # P0: Improved learning rate schedule
+  lr_scheduler: cosine_with_warmup
   lr_warmup_steps: 500
   grad_clip_norm: 4.0
 

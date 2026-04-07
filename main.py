@@ -1,5 +1,6 @@
 import argparse
 import os
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -153,13 +154,16 @@ TRAIN_PROFILES = {
 
 MODEL_CONFIG_PRESETS = {
     "small": "configs/train/small.yaml",
-    "small_sota": "configs/train/small_sota.yaml",  # P0/P1 improvements (smoke test)
     "middle": "configs/train/middle.yaml",
-    "middle_sota": "configs/train/middle_sota.yaml",  # P0/P1 improvements
     "max": "configs/train/max.yaml",
-    "small_accum": "configs/train/small_accum.yaml",
-    "middle_accum": "configs/train/middle_accum.yaml",
-    "max_accum": "configs/train/max_accum.yaml",
+}
+
+LEGACY_MODEL_CONFIG_ALIASES = {
+    "small_sota": "small",
+    "small_accum": "small",
+    "middle_sota": "middle",
+    "middle_accum": "middle",
+    "max_accum": "max",
 }
 
 
@@ -171,9 +175,10 @@ def _add_hidden_argument(parser: argparse.ArgumentParser, *name_or_flags, **kwar
 
 
 def _flatten_config_tree(config_node: dict) -> dict:
+    preserved_dict_keys = {"darker_ranges"}
     flat = {}
     for key, value in (config_node or {}).items():
-        if isinstance(value, dict):
+        if isinstance(value, dict) and key not in preserved_dict_keys:
             flat.update(_flatten_config_tree(value))
         else:
             flat[key] = value
@@ -183,6 +188,11 @@ def _flatten_config_tree(config_node: dict) -> dict:
 def _resolve_config_path(config_value: str | None) -> str:
     if not config_value:
         config_value = "small"
+    if config_value in LEGACY_MODEL_CONFIG_ALIASES:
+        replacement = LEGACY_MODEL_CONFIG_ALIASES[config_value]
+        raise ValueError(
+            f"Legacy config '{config_value}' has been removed. Please use '{replacement}' instead."
+        )
     resolved = MODEL_CONFIG_PRESETS.get(config_value, config_value)
     return str(Path(resolved))
 
@@ -201,22 +211,17 @@ def _load_config_defaults(config_path: str) -> dict:
     return defaults
 
 
-def _ensure_training_data_mode(args):
-    if args.mode != "train":
-        return
-
-    if args.online_synthesis:
-        return
-
-    low_dir = os.path.join(args.data_dir, "our485", "low")
-    if not os.path.isdir(low_dir):
-        args.online_synthesis = True
-        return
-
-    supported_exts = (".png", ".jpg", ".jpeg", ".bmp")
-    has_low_images = any(file_name.lower().endswith(supported_exts) for file_name in os.listdir(low_dir))
-    if not has_low_images:
-        args.online_synthesis = True
+def _normalize_darker_ranges_arg(darker_ranges):
+    if darker_ranges in (None, "", {}):
+        return None
+    if isinstance(darker_ranges, dict):
+        return darker_ranges
+    if isinstance(darker_ranges, str):
+        parsed = yaml.safe_load(darker_ranges)
+        if not isinstance(parsed, dict):
+            raise ValueError("darker_ranges must decode to a dict.")
+        return parsed
+    raise TypeError(f"Unsupported darker_ranges type: {type(darker_ranges)!r}")
 
 
 def apply_profile_defaults(args):
@@ -231,13 +236,26 @@ def apply_profile_defaults(args):
         args.port = 8501
     if args.benchmark_inference_steps is None:
         args.benchmark_inference_steps = [8, 20]
+    if getattr(args, "prepare_on_train", None) is None:
+        args.prepare_on_train = True
+    if getattr(args, "prepared_cache_dir", None) in ("", None):
+        args.prepared_cache_dir = os.path.join(args.data_dir, ".prepared")
+    if getattr(args, "offline_variant_count", None) is None:
+        args.offline_variant_count = 3
+    if getattr(args, "prepare_workers", None) is None:
+        args.prepare_workers = _recommended_num_workers()
+    if getattr(args, "prepare_force", None) is None:
+        args.prepare_force = False
+    if getattr(args, "synthesis_seed", None) is None:
+        args.synthesis_seed = args.seed if args.seed is not None else 42
+    args.darker_ranges = _normalize_darker_ranges_arg(getattr(args, "darker_ranges", None))
 
     # Legacy compatibility
     if getattr(args, "use_ema", None) is None:
         args.use_ema = True
 
-    _ensure_training_data_mode(args)
     _validate_model_args(args)
+    _validate_prepare_args(args)
     _attach_effective_batch_metadata(args)
     return args
 
@@ -256,6 +274,41 @@ def _attach_effective_batch_metadata(args):
 
     args.effective_batch_size = max(1, int(args.batch_size)) * max(1, int(args.gradient_accumulation_steps))
     args.min_effective_batch_size = MIN_EFFECTIVE_BATCH_SIZE
+
+
+def _validate_prepare_args(args):
+    if getattr(args, "offline_variant_count", 1) < 1:
+        raise ValueError("offline_variant_count must be >= 1")
+    if getattr(args, "prepare_workers", 1) < 1:
+        raise ValueError("prepare_workers must be >= 1")
+    darker_ranges = getattr(args, "darker_ranges", None)
+    if darker_ranges is not None and not isinstance(darker_ranges, dict):
+        raise ValueError("darker_ranges must be a dict or a JSON string that decodes to a dict")
+
+
+def _ensure_prepared_training_manifest(args):
+    from datasets.prepare_data import ensure_prepared_training_data
+
+    print(
+        "[prepare] "
+        f"cache_dir={args.prepared_cache_dir} "
+        f"variants={args.offline_variant_count} "
+        f"workers={args.prepare_workers} "
+        f"seed={args.synthesis_seed}",
+        flush=True,
+    )
+    manifest_path, prepared = ensure_prepared_training_data(
+        args.data_dir,
+        args.prepared_cache_dir,
+        variant_count=args.offline_variant_count,
+        synthesis_seed=args.synthesis_seed,
+        darker_ranges=args.darker_ranges,
+        prepare_workers=args.prepare_workers,
+        force=args.prepare_force,
+        prepare_on_train=args.prepare_on_train,
+    )
+    args.train_manifest_path = manifest_path
+    return manifest_path, prepared
 
 
 def _report_effective_batch(args):
@@ -281,6 +334,10 @@ def _report_effective_batch(args):
         )
 
 
+def _handle_termination_signal(_signum, _frame):
+    raise KeyboardInterrupt
+
+
 def get_args():
     bootstrap_parser = argparse.ArgumentParser(add_help=False)
     bootstrap_parser.add_argument("--config", type=str, default="small")
@@ -290,8 +347,8 @@ def get_args():
     parser = argparse.ArgumentParser(description="Diff-Img2Img Unified Engine")
 
     # User-facing parameters
-    parser.add_argument("--config", type=str, default=config_defaults["config"], help="YAML config path or preset name: small / middle / max / *_accum")
-    parser.add_argument("--mode", type=str, default="train", choices=["train", "predict", "validate", "ui"], help="Execution mode")
+    parser.add_argument("--config", type=str, default=config_defaults["config"], help="YAML config path or preset name: small / middle / max")
+    parser.add_argument("--mode", type=str, default="train", choices=["train", "prepare", "predict", "validate", "ui"], help="Execution mode")
     parser.add_argument("--data_dir", type=str, default="../datasets/kitti_LOL", help="Dataset root directory")
     parser.add_argument("--output_dir", type=str, default="runs/exp1", help="Output directory for logs and checkpoints")
     parser.add_argument("--model_path", type=str, default=None, help="Path to pretrained model for predict/validate")
@@ -309,6 +366,13 @@ def get_args():
     parser.add_argument("--log_interval", type=int, default=10, help="How often to refresh training summaries")
     parser.add_argument("--num_inference_steps", type=int, default=8, help="Inference steps for prediction/validation")
     parser.add_argument("--num_validation_images", type=int, default=16, help="How many validation images to evaluate")
+    parser.add_argument("--prepare_on_train", "--prepare-on-train", dest="prepare_on_train", action=argparse.BooleanOptionalAction, default=None, help="Automatically build the multi-variant prepared training cache before training.")
+    parser.add_argument("--prepared_cache_dir", "--prepared-cache-dir", type=str, default=None, help="Directory that stores prepared multi-variant low-light training data.")
+    parser.add_argument("--offline_variant_count", "--offline-variant-count", type=int, default=None, help="How many low-light variants to prepare for each training high-light image.")
+    parser.add_argument("--prepare_workers", "--prepare-workers", type=int, default=None, help="Worker count for offline data preparation.")
+    parser.add_argument("--prepare_force", "--prepare-force", dest="prepare_force", action=argparse.BooleanOptionalAction, default=None, help="Force rebuilding the prepared training cache.")
+    parser.add_argument("--synthesis_seed", "--synthesis-seed", type=int, default=None, help="Base seed used for offline low-light synthesis.")
+    parser.add_argument("--darker_ranges", "--darker-ranges", type=str, default=None, help="JSON/YAML dict overriding Darker parameter ranges during offline preparation.")
 
     # Hidden advanced compatibility parameters
     _add_hidden_argument(parser, "--device", type=str)
@@ -366,29 +430,47 @@ def get_args():
 
 
 if __name__ == "__main__":
-    args = get_args()
-    _report_effective_batch(args)
+    signal.signal(signal.SIGTERM, _handle_termination_signal)
+    try:
+        args = get_args()
+        _report_effective_batch(args)
 
-    if args.mode == "ui":
-        print("🚀 Launching Diff-Img2Img Studio...")
-        ui_path = os.path.join("ui", "app.py")
-        if not os.path.exists(ui_path):
-            print(f"Error: UI file not found at {ui_path}")
-            sys.exit(1)
+        if args.mode == "prepare":
+            manifest_path, prepared = _ensure_prepared_training_manifest(args)
+            action = "Prepared" if prepared else "Validated"
+            print(f"{action} multi-variant training cache: {manifest_path}")
+        elif args.mode == "ui":
+            print("🚀 Launching Diff-Img2Img Studio...")
+            ui_path = os.path.join("ui", "app.py")
+            if not os.path.exists(ui_path):
+                print(f"Error: UI file not found at {ui_path}")
+                sys.exit(1)
 
-        cmd = [sys.executable, "-m", "streamlit", "run", ui_path]
-        try:
-            subprocess.run(cmd)
-        except KeyboardInterrupt:
-            print("\nUI Stopped.")
-    else:
-        from core.engine import DiffusionEngine
+            cmd = [sys.executable, "-m", "streamlit", "run", ui_path]
+            try:
+                subprocess.run(cmd)
+            except KeyboardInterrupt:
+                print("\nUI Stopped.")
+        else:
+            if args.mode == "train":
+                manifest_path, prepared = _ensure_prepared_training_manifest(args)
+                if prepared:
+                    print(f"[prepare] built multi-variant training cache at {manifest_path}")
+                else:
+                    print(f"[prepare] using existing multi-variant training cache at {manifest_path}")
+            from core.engine import DiffusionEngine
 
-        engine = DiffusionEngine(args)
+            engine = DiffusionEngine(args)
 
-        if args.mode == "train":
-            engine.train()
-        elif args.mode == "validate":
-            engine.validate()
-        elif args.mode == "predict":
-            engine.predict()
+            if args.mode == "train":
+                engine.train()
+            elif args.mode == "validate":
+                engine.validate()
+            elif args.mode == "predict":
+                engine.predict()
+    except ValueError as exc:
+        print(f"Error: {exc}", flush=True)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print("\n[interrupt] Received keyboard interrupt. Exiting gracefully.", flush=True)
+        sys.exit(130)

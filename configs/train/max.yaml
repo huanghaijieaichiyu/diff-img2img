@@ -1,7 +1,7 @@
 meta:
   name: max
   target_vram_gb: 64
-  description: Large-capacity preset for 64GB+ compute, favoring upper-bound quality.
+  description: Official high-capacity preset for maximum restoration quality.
 
 runtime:
   train_profile: auto
@@ -9,6 +9,13 @@ runtime:
   resolution: 512
   log_interval: 10
   num_workers: 8
+  prepare_on_train: true
+  prepared_cache_dir:
+  offline_variant_count: 3
+  prepare_workers:
+  prepare_force: false
+  synthesis_seed: 42
+  darker_ranges:
 
 model:
   architecture_scale: max
