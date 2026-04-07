@@ -20,6 +20,16 @@ from concurrent.futures import ProcessPoolExecutor
 # Import project modules
 sys.path.append(os.getcwd())
 
+from utils.workflow_utils import (
+    build_prepare_command as shared_build_prepare_command,
+    build_preview_summary,
+    build_train_command as shared_build_train_command,
+    load_preset_card,
+    quote_command,
+    recommended_prepare_workers as shared_recommended_prepare_workers,
+    summarize_prepared_cache as shared_summarize_prepared_cache,
+)
+
 # --- Localization ---
 LANGUAGES = {
     "English": "en",
@@ -628,8 +638,7 @@ def clear_training_state():
 
 
 def recommended_prepare_workers():
-    cpu_count = os.cpu_count() or 4
-    return max(1, min(8, cpu_count // 2))
+    return shared_recommended_prepare_workers()
 
 
 def count_image_files(path):
@@ -643,53 +652,31 @@ def count_image_files(path):
     return count
 
 
+def parse_darker_ranges_text(darker_ranges_text):
+    text = (darker_ranges_text or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = yaml.safe_load(text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def resolve_cache_dir(data_dir, prepared_cache_dir):
     if prepared_cache_dir:
         return os.path.abspath(prepared_cache_dir)
     return os.path.abspath(os.path.join(data_dir, ".prepared"))
 
 
-def summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed):
-    cache_dir = resolve_cache_dir(data_dir, prepared_cache_dir)
-    high_dir = os.path.join(data_dir, "our485", "high")
-    manifest_path = os.path.join(cache_dir, "train_manifest.jsonl")
-    meta_path = os.path.join(cache_dir, "prepare_meta.json")
-
-    high_images = count_image_files(high_dir)
-    expected_entries = high_images * int(variant_count)
-    manifest_entries = 0
-    if os.path.exists(manifest_path):
-        with open(manifest_path, "r", encoding="utf-8") as handle:
-            manifest_entries = sum(1 for line in handle if line.strip())
-
-    meta = read_status_file(meta_path)
-    status = "missing"
-    if meta:
-        status = str(meta.get("status", "invalid")).lower()
-        if status not in {"ready", "preparing", "interrupted"}:
-            status = "invalid"
-    if os.path.exists(manifest_path) and not meta:
-        status = "stale"
-    if meta and status == "ready":
-        if int(meta.get("variant_count", -1)) != int(variant_count):
-            status = "stale"
-        elif int(meta.get("synthesis_seed", -1)) != int(synthesis_seed):
-            status = "stale"
-        elif expected_entries > 0 and manifest_entries != expected_entries:
-            status = "stale"
-    elif meta and status == "invalid":
-        status = "stale"
-
-    return {
-        "cache_dir": cache_dir,
-        "manifest_path": manifest_path,
-        "meta_path": meta_path,
-        "high_images": high_images,
-        "expected_entries": expected_entries,
-        "manifest_entries": manifest_entries,
-        "meta": meta,
-        "status": status,
-    }
+def summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed, darker_ranges=None):
+    return shared_summarize_prepared_cache(
+        data_dir,
+        prepared_cache_dir,
+        variant_count=variant_count,
+        synthesis_seed=synthesis_seed,
+        darker_ranges=darker_ranges,
+    )
 
 
 def render_prepared_cache_summary(summary):
@@ -721,44 +708,14 @@ def render_prepared_cache_summary(summary):
             f"{t('completed_entries')}: {summary['meta'].get('completed_entries', '-')}"
         )
     st.caption(f"{t('cache_dir_label')}: `{summary['cache_dir']}`")
+    if summary.get("status_reasons"):
+        st.caption("Reasons: " + ", ".join(summary["status_reasons"]))
+    if summary.get("source_error"):
+        st.caption(f"Source: {summary['source_error']}")
 
 
 def load_preset_summary(preset_name):
-    config_path = Path("configs/train") / f"{preset_name}.yaml"
-    summary = {
-        "name": preset_name,
-        "config_path": str(config_path),
-        "description": "",
-        "target_vram_gb": "-",
-        "resolution": "-",
-        "batch_size": "-",
-        "gradient_accumulation_steps": 1,
-        "effective_batch": "-",
-    }
-    if not config_path.exists():
-        return summary
-
-    try:
-        with open(config_path, "r", encoding="utf-8") as handle:
-            data = yaml.safe_load(handle) or {}
-    except Exception:
-        return summary
-
-    meta = data.get("meta", {})
-    runtime = data.get("runtime", {})
-    optimization = data.get("optimization", {})
-    batch_size = int(optimization.get("batch_size", 1))
-    grad_acc = int(optimization.get("gradient_accumulation_steps", 1))
-    summary.update({
-        "name": meta.get("name", preset_name),
-        "description": meta.get("description", ""),
-        "target_vram_gb": meta.get("target_vram_gb", "-"),
-        "resolution": runtime.get("resolution", "-"),
-        "batch_size": batch_size,
-        "gradient_accumulation_steps": grad_acc,
-        "effective_batch": batch_size * grad_acc,
-    })
-    return summary
+    return load_preset_card(preset_name)
 
 
 def render_intro_card(title, subtitle, badges=None, kicker=None):
@@ -798,50 +755,37 @@ def build_train_command(
     prepare_force,
     darker_ranges_text,
 ):
-    cmd = [
-        sys.executable, "-m", "accelerate.commands.launch", "main.py", "--mode", "train",
-        "--config", f"configs/train/{model_scale}.yaml",
-        "--data_dir", data_dir,
-        "--output_dir", output_dir,
-        "--resolution", str(resolution),
-        "--batch_size", str(batch_size),
-        "--epochs", str(epochs),
-        "--lr", str(lr),
-        "--train_profile", train_profile,
-        "--offline_variant_count", str(variant_count),
-        "--prepare_workers", str(prepare_workers),
-        "--synthesis_seed", str(synthesis_seed),
-    ]
-
-    if use_retinex:
-        cmd.append("--use_retinex")
-    if resume:
-        cmd.extend(["--resume", resume])
-    if prepared_cache_dir:
-        cmd.extend(["--prepared_cache_dir", prepared_cache_dir])
-    if prepare_force:
-        cmd.append("--prepare_force")
-    if darker_ranges_text.strip():
-        cmd.extend(["--darker_ranges", darker_ranges_text])
-    return cmd
+    return shared_build_train_command(
+        model_scale=model_scale,
+        data_dir=data_dir,
+        output_dir=output_dir,
+        resolution=resolution,
+        batch_size=batch_size,
+        epochs=epochs,
+        lr=lr,
+        train_profile=train_profile,
+        variant_count=variant_count,
+        prepare_workers=prepare_workers,
+        synthesis_seed=synthesis_seed,
+        use_retinex=use_retinex,
+        resume=resume,
+        prepared_cache_dir=prepared_cache_dir,
+        prepare_force=prepare_force,
+        darker_ranges_text=darker_ranges_text,
+    )
 
 
 def build_prepare_command(config_path, data_dir, prepared_cache_dir, variant_count, prepare_workers, synthesis_seed, prepare_force, darker_ranges_text):
-    cmd = [
-        sys.executable, "main.py", "--mode", "prepare",
-        "--config", config_path,
-        "--data_dir", data_dir,
-        "--offline_variant_count", str(variant_count),
-        "--prepare_workers", str(prepare_workers),
-        "--synthesis_seed", str(synthesis_seed),
-    ]
-    if prepared_cache_dir:
-        cmd.extend(["--prepared_cache_dir", prepared_cache_dir])
-    if prepare_force:
-        cmd.append("--prepare_force")
-    if darker_ranges_text.strip():
-        cmd.extend(["--darker_ranges", darker_ranges_text])
-    return cmd
+    return shared_build_prepare_command(
+        config_path=config_path,
+        data_dir=data_dir,
+        prepared_cache_dir=prepared_cache_dir,
+        variant_count=variant_count,
+        prepare_workers=prepare_workers,
+        synthesis_seed=synthesis_seed,
+        prepare_force=prepare_force,
+        darker_ranges_text=darker_ranges_text,
+    )
 
 # --- Pages ---
 
@@ -972,7 +916,13 @@ def dataset_page():
         st.info(t("manual_prepare_tip"))
         prepare_btn = st.form_submit_button(t("prepare_dataset"), type="primary")
 
-    cache_summary = summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed)
+    cache_summary = summarize_prepared_cache(
+        data_dir,
+        prepared_cache_dir,
+        variant_count,
+        synthesis_seed,
+        parse_darker_ranges_text(darker_ranges_text),
+    )
     render_prepared_cache_summary(cache_summary)
     preview_cmd = build_prepare_command(
         config_path=f"configs/train/{model_scale}.yaml",
@@ -985,7 +935,7 @@ def dataset_page():
         darker_ranges_text=darker_ranges_text,
     )
     with st.expander(t("command_preview"), expanded=False):
-        st.code(shlex.join(preview_cmd), language="bash")
+        st.code(quote_command(preview_cmd), language="bash")
 
     if prepare_btn:
         if not os.path.exists(data_dir):
@@ -1008,7 +958,15 @@ def dataset_page():
 
         if result.returncode == 0:
             st.success(t("prepare_complete"))
-            render_prepared_cache_summary(summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed))
+            render_prepared_cache_summary(
+                summarize_prepared_cache(
+                    data_dir,
+                    prepared_cache_dir,
+                    variant_count,
+                    synthesis_seed,
+                    parse_darker_ranges_text(darker_ranges_text),
+                )
+            )
         else:
             st.error(t("prepare_failed"))
         with st.expander(t("prepare_stdout"), expanded=result.returncode != 0):
@@ -1087,7 +1045,13 @@ def training_page():
             train_btn = button_cols[1].form_submit_button(t("launch_train"), type="primary")
 
         preset_summary = load_preset_summary(model_scale)
-        cache_summary = summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed)
+        cache_summary = summarize_prepared_cache(
+            data_dir,
+            prepared_cache_dir,
+            variant_count,
+            synthesis_seed,
+            parse_darker_ranges_text(darker_ranges_text),
+        )
         effective_batch = int(batch_size) * int(preset_summary.get("gradient_accumulation_steps", 1))
         summary_cols = st.columns(4)
         summary_cols[0].metric(t("target_vram"), f"{preset_summary['target_vram_gb']} GB")
@@ -1120,8 +1084,28 @@ def training_page():
             prepare_force=prepare_force,
             darker_ranges_text=darker_ranges_text,
         )
+        preview_summary = build_preview_summary(
+            model_scale,
+            mode="train",
+            data_dir=data_dir,
+            output_dir=output_dir,
+            resolution=res,
+            batch_size=batch_size,
+            epochs=epochs,
+            lr=lr,
+            train_profile=train_profile,
+            variant_count=variant_count,
+            prepare_workers=prepare_workers,
+            synthesis_seed=synthesis_seed,
+            use_retinex=use_retinex,
+            resume=resume,
+            prepared_cache_dir=prepared_cache_dir,
+            prepare_force=prepare_force,
+        )
         with st.expander(t("command_preview"), expanded=False):
-            st.code(shlex.join(train_cmd_preview), language="bash")
+            st.code(quote_command(train_cmd_preview), language="bash")
+        with st.expander("Resolved Config Summary", expanded=False):
+            st.json(preview_summary)
 
         if prepare_btn:
             if not os.path.exists(data_dir):
@@ -1141,7 +1125,15 @@ def training_page():
                     result = subprocess.run(prepare_cmd, capture_output=True, text=True)
                 if result.returncode == 0:
                     st.success(t("prepare_complete"))
-                    render_prepared_cache_summary(summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed))
+                    render_prepared_cache_summary(
+                        summarize_prepared_cache(
+                            data_dir,
+                            prepared_cache_dir,
+                            variant_count,
+                            synthesis_seed,
+                            parse_darker_ranges_text(darker_ranges_text),
+                        )
+                    )
                 else:
                     st.error(t("prepare_failed"))
                 with st.expander(t("prepare_stdout"), expanded=result.returncode != 0):
@@ -1239,6 +1231,9 @@ def training_page():
                     val_cols[0].metric("Val PSNR", f"{status.get('val_psnr', 0.0):.3f}" if isinstance(status.get("val_psnr"), (int, float)) else "-")
                     val_cols[1].metric("Val SSIM", f"{status.get('val_ssim', 0.0):.4f}" if isinstance(status.get("val_ssim"), (int, float)) else "-")
                     val_cols[2].metric("Val LPIPS", f"{status.get('val_lpips', 0.0):.4f}" if isinstance(status.get("val_lpips"), (int, float)) else "-")
+                    if status.get("config_summary"):
+                        with st.expander("Resolved Config Summary", expanded=False):
+                            st.json(status["config_summary"])
 
                 if csv_path and os.path.exists(csv_path):
                     try:
@@ -1307,7 +1302,10 @@ def evaluation_page():
             "--data_dir", data_dir,
             "--output_dir", out_dir
         ]
-        if use_retinex: cmd.append("--use_retinex")
+        if use_retinex:
+            cmd.append("--use_retinex")
+        else:
+            cmd.append("--no-use_retinex")
         
         with st.spinner(t("calc_metrics")):
             result = subprocess.run(cmd, capture_output=True, text=True)

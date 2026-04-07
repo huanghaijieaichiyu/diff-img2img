@@ -35,6 +35,7 @@ from models.retinex import build_decom_net
 from utils.loss import CompositeLoss
 from utils.metrics import SemanticFeatureMetric, try_compute_niqe
 from utils.misc import charbonnier_loss_elementwise, compute_min_snr_loss_weights, compute_adaptive_loss_weights, ssim
+from utils.project_config import build_runtime_summary, serialize_args
 from utils.train_display import create_training_display
 from utils.video_writer import video_writer
 
@@ -76,6 +77,8 @@ class DiffusionEngine:
         self.process.cpu_percent(None)
         self.latest_validation_metrics = {}
         self.status_json_path = os.path.join(args.output_dir, "training_status.json")
+        self.resolved_config_path = os.path.join(args.output_dir, "resolved_config.json")
+        self.runtime_summary = build_runtime_summary(args)
 
         logging_dir = os.path.join(args.output_dir, "logs")
         accelerator_project_config = ProjectConfiguration(
@@ -106,6 +109,7 @@ class DiffusionEngine:
 
         if self.accelerator.is_main_process:
             os.makedirs(args.output_dir, exist_ok=True)
+            self._write_resolved_config()
 
         self.metrics_csv_path = os.path.join(args.output_dir, "training_metrics.csv")
         self._joint_decom_trainable = None
@@ -475,11 +479,20 @@ class DiffusionEngine:
             "train_profile": self.args.train_profile,
             "mixed_precision": self.args.mixed_precision,
             "use_retinex": self.args.use_retinex,
+            "config_summary": self.runtime_summary,
         })
         payload.update(self.latest_validation_metrics)
 
         with open(self.status_json_path, "w") as status_file:
             json.dump(payload, status_file, indent=2)
+
+    def _write_resolved_config(self):
+        payload = {
+            "args": serialize_args(self.args),
+            "summary": self.runtime_summary,
+        }
+        with open(self.resolved_config_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
 
     def _append_training_metrics(self, step: int, phase: str, logs: dict):
         if not self.accelerator.is_main_process:

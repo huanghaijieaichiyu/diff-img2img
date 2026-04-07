@@ -4,10 +4,14 @@ import signal
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 
 import yaml
 
+from utils.project_config import (
+    load_config_defaults,
+    print_runtime_summary,
+    resolve_config_path,
+)
 
 MIN_EFFECTIVE_BATCH_SIZE = 16
 
@@ -152,63 +156,11 @@ TRAIN_PROFILES = {
     ),
 }
 
-MODEL_CONFIG_PRESETS = {
-    "small": "configs/train/small.yaml",
-    "middle": "configs/train/middle.yaml",
-    "max": "configs/train/max.yaml",
-}
-
-LEGACY_MODEL_CONFIG_ALIASES = {
-    "small_sota": "small",
-    "small_accum": "small",
-    "middle_sota": "middle",
-    "middle_accum": "middle",
-    "max_accum": "max",
-}
-
-
 def _add_hidden_argument(parser: argparse.ArgumentParser, *name_or_flags, **kwargs):
     kwargs.setdefault("help", argparse.SUPPRESS)
     if "default" not in kwargs:
         kwargs["default"] = None
     parser.add_argument(*name_or_flags, **kwargs)
-
-
-def _flatten_config_tree(config_node: dict) -> dict:
-    preserved_dict_keys = {"darker_ranges"}
-    flat = {}
-    for key, value in (config_node or {}).items():
-        if isinstance(value, dict) and key not in preserved_dict_keys:
-            flat.update(_flatten_config_tree(value))
-        else:
-            flat[key] = value
-    return flat
-
-
-def _resolve_config_path(config_value: str | None) -> str:
-    if not config_value:
-        config_value = "small"
-    if config_value in LEGACY_MODEL_CONFIG_ALIASES:
-        replacement = LEGACY_MODEL_CONFIG_ALIASES[config_value]
-        raise ValueError(
-            f"Legacy config '{config_value}' has been removed. Please use '{replacement}' instead."
-        )
-    resolved = MODEL_CONFIG_PRESETS.get(config_value, config_value)
-    return str(Path(resolved))
-
-
-def _load_config_defaults(config_path: str) -> dict:
-    resolved_path = Path(_resolve_config_path(config_path))
-    if not resolved_path.exists():
-        raise FileNotFoundError(f"Config file not found: {resolved_path}")
-
-    with open(resolved_path, "r") as handle:
-        config_data = yaml.safe_load(handle) or {}
-
-    defaults = _flatten_config_tree(config_data)
-    defaults["config"] = str(resolved_path)
-    defaults["config_name"] = config_data.get("meta", {}).get("name", resolved_path.stem)
-    return defaults
 
 
 def _normalize_darker_ranges_arg(darker_ranges):
@@ -358,7 +310,7 @@ def get_args():
     bootstrap_parser = argparse.ArgumentParser(add_help=False)
     bootstrap_parser.add_argument("--config", type=str, default="small")
     bootstrap_args, _ = bootstrap_parser.parse_known_args()
-    config_defaults = _load_config_defaults(bootstrap_args.config)
+    config_defaults = load_config_defaults(bootstrap_args.config)
 
     parser = argparse.ArgumentParser(description="Diff-Img2Img Unified Engine")
 
@@ -375,7 +327,12 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=4, help="Per-device training batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Base learning rate")
     parser.add_argument("--resolution", type=int, default=256, help="Training and validation resolution")
-    parser.add_argument("--use_retinex", action="store_true", help="Enable Retinex decomposition")
+    parser.add_argument(
+        "--use_retinex",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable Retinex decomposition",
+    )
     parser.add_argument("--ema", dest="use_ema", action=argparse.BooleanOptionalAction, default=True, help="Enable EMA for the trainable model modules.")
     parser.add_argument("--mixed_precision", type=str, default="fp16", choices=["no", "fp16", "bf16"], help="Mixed precision policy")
     parser.add_argument("--train_profile", type=str, default="auto", choices=sorted(TRAIN_PROFILES.keys()), help="High-level training preset")
@@ -449,7 +406,7 @@ def get_args():
 
     parser.set_defaults(**config_defaults)
     args = parser.parse_args()
-    args.config = _resolve_config_path(args.config)
+    args.config = resolve_config_path(args.config)
     return apply_profile_defaults(args)
 
 
@@ -458,6 +415,8 @@ if __name__ == "__main__":
     try:
         args = get_args()
         _report_effective_batch(args)
+        if args.mode != "ui":
+            print_runtime_summary(args)
 
         if args.mode == "prepare":
             manifest_path, prepared = _ensure_prepared_training_manifest(args)

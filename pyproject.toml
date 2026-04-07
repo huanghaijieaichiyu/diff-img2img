@@ -1,36 +1,42 @@
 [project]
-name = "inr2rgb"
+name = "diff-img2img"
 version = "0.1.0"
-description = "A diffusion model for inr2rgb, based on the paper 'INR2RGB: Learning Realistic Image Synthesis via Implicit Neural Representations'"
+description = "Retinex-guided conditional diffusion pipeline for low-light image enhancement."
 readme = "README.md"
 requires-python = "==3.10.11"
 dependencies = [
-    # Core PyTorch (CUDA version handled by install command)---windows 最好去官网下载才能调用GPU
-    "torch==2.6.0",
-    "torchvision==0.21.0",
-    "torchaudio==2.6.0",
+    # Core training stack
+    "torch==2.7.0+cu118",
+    "torchvision==0.22.0+cu118",
+    "torchaudio==2.7.0+cu118",
     "torcheval",
-    # Hugging Face ecosystem
-    "diffusers>=0.20.0",
-    "accelerate>=0.25.0",
-    "transformers>=4.30.0",
-    # xformers (version resolved via extra-index-url)
-    "xformers == 0.0.29.post3",
-    # Utilities
-    "tqdm",
-    "Pillow",
-    "numpy",
-    "opencv-python",
-    "scikit-image",
-    "imageio",
-    "matplotlib",
-    "tensorboard",
-    "rich",
-    "ptflops",
-    "timm>=0.9.12" 
+    "accelerate==1.7.0",
+    "diffusers==0.33.1",
+    "xformers==0.0.30",
+    # Runtime + UI
+    "numpy==2.1.2",
+    "opencv-python==4.11.0.86",
+    "pillow==11.0.0",
+    "pyyaml==6.0.2",
+    "psutil==7.0.0",
+    "imageio==2.37.0",
+    "matplotlib==3.10.3",
+    "plotly==6.5.0",
+    "pandas==2.3.3",
+    "rich==14.0.0",
+    "streamlit==1.51.0",
+    "tensorboard==2.19.0",
+    "lpips==0.1.4",
+    "scikit-image==0.25.2",
+    "scikit-video",
+    "tqdm==4.67.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
 ]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
-

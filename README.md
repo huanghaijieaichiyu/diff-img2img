@@ -103,11 +103,17 @@ Environment variables understood by `start_train.sh`:
 - `OUTPUT_DIR`: run directory
 - `TRAIN_PROFILE`: `auto` or `debug_online`
 - `CONFIG_PATH`: optional explicit YAML path override
+- `RUN_MODE`: `train` or `validate`
+- `MODEL_PATH`: checkpoint directory used when `RUN_MODE=validate`
 - `PREPARED_CACHE_DIR`: optional cache override, defaults to `<DATA_DIR>/.prepared`
 - `PREPARE_WORKERS`: worker count for offline cache generation
 - `OFFLINE_VARIANT_COUNT`: number of synthetic low-light variants per training image
 - `SYNTHESIS_SEED`: base seed for offline synthesis
 - `PREPARE_FORCE`: set to `1` to rebuild the cache from scratch
+- `RUN_FULL_EVAL_AFTER_TRAIN`: set to `1` to launch the standardized offline validation right after a successful train run
+- Explicit runtime overrides such as `NUM_WORKERS`, `PREFETCH_FACTOR`, `BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS`, `VALIDATION_STEPS`, `BENCHMARK_INFERENCE_STEPS`, `SEMANTIC_BACKBONE`, and `NR_METRIC`
+
+`start_train.sh` now only forwards the environment variables you explicitly set; the resolved defaults still come from `configs/train/*.yaml` and `main.py`.
 
 Equivalent raw command:
 
@@ -127,6 +133,14 @@ python3 main.py --mode validate \
   --model_path runs/exp \
   --data_dir /path/to/dataset \
   --output_dir runs/exp_eval
+
+# Equivalent wrapper-based validation
+RUN_MODE=validate \
+MODEL_SIZE=middle \
+DATA_DIR=/path/to/dataset \
+OUTPUT_DIR=runs/exp \
+MODEL_PATH=runs/exp/best_model \
+bash start_train.sh
 
 # Image prediction
 python3 main.py --mode predict \
@@ -159,6 +173,15 @@ python3 run_app.py
 ```
 
 Default URL: `http://localhost:8501`
+
+## Run Summaries
+
+Use the built-in artifact utilities to summarize and compare experiments:
+
+```bash
+python3 scripts/summarize_run.py --run-dir runs/exp
+python3 scripts/compare_runs.py --run-dir runs/exp_a --run-dir runs/exp_b --sort-by psnr
+```
 
 ## Repo Layout
 

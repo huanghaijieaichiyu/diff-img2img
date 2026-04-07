@@ -39,8 +39,9 @@ nvidia-nccl-cu11==2.21.5
 nvidia-nvtx-cu11==11.8.86
 opencv-python==4.11.0.86
 packaging==25.0
+pandas==2.3.3
 pillow==11.0.0
-plotly
+plotly==6.5.0
 protobuf==6.31.0
 psutil==7.0.0
 pygments==2.19.1
@@ -57,7 +58,7 @@ scikit-video
 scipy==1.15.3
 setuptools==70.2.0
 six==1.17.0
-streamlit
+streamlit==1.51.0
 sympy==1.13.3
 tensorboard==2.19.0
 tensorboard-data-server==0.7.2
