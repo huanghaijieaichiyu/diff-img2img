@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import C2f, Concat, Conv, ConvGNAct, ConvTranspose, DWConvGNAct, GatedFusion, GlobalContextBlock, MBConvBlock, Transformer2DBlock, NAFBlock, LayerNorm2d
+from .common import C2f, Concat, Conv, ConvGNAct, ConvTranspose, DWConvGNAct, GatedFusion, GlobalContextBlock, MBConvBlock, Transformer2DBlock, NAFBlock, LayerNorm2d, PooledGlobalContextBlock
 
 
 def _resize_if_needed(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -226,12 +226,70 @@ class NAFDecomNet(nn.Module):
         return torch.sigmoid(self.r_head(dec0)), torch.sigmoid(self.i_head(dec0))
 
 
+class NAFLiteDecomNet(nn.Module):
+    """
+    Lightweight NAF-style decomposition with pooled global context.
+    Uses fewer NAF blocks and a pooled attention bottleneck to preserve the
+    long-range illumination cues without the full attention cost.
+    """
+
+    def __init__(self, base_channel=24, num_blocks=2, pooled_size=8):
+        super().__init__()
+        c1, c2, c3 = base_channel, base_channel * 2, base_channel * 4
+
+        self.stem = nn.Conv2d(3, c1, kernel_size=3, padding=1)
+
+        self.enc0 = nn.Sequential(*[NAFBlock(c1) for _ in range(num_blocks)])
+        self.down1 = nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1)
+        self.enc1 = nn.Sequential(*[NAFBlock(c2) for _ in range(num_blocks)])
+        self.down2 = nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1)
+        self.enc2 = nn.Sequential(*[NAFBlock(c3) for _ in range(num_blocks)])
+
+        self.bottleneck = nn.Sequential(
+            NAFBlock(c3),
+            PooledGlobalContextBlock(c3, num_heads=4, pooled_size=pooled_size),
+            NAFBlock(c3),
+        )
+
+        self.up1 = ConvTranspose(c3, c2, k=2, s=2)
+        self.fuse1 = GatedFusion(c2)
+        self.dec1 = nn.Sequential(*[NAFBlock(c2) for _ in range(num_blocks)])
+
+        self.up0 = ConvTranspose(c2, c1, k=2, s=2)
+        self.fuse0 = GatedFusion(c1)
+        self.dec0 = nn.Sequential(*[NAFBlock(c1) for _ in range(num_blocks)])
+
+        self.r_head = nn.Sequential(
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1),
+            LayerNorm2d(c1),
+            nn.SiLU(),
+            nn.Conv2d(c1, 3, kernel_size=3, padding=1),
+        )
+        self.i_head = nn.Sequential(
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1),
+            LayerNorm2d(c1),
+            nn.SiLU(),
+            nn.Conv2d(c1, 1, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x):
+        feat0 = self.enc0(self.stem(x))
+        feat1 = self.enc1(self.down1(feat0))
+        feat2 = self.bottleneck(self.enc2(self.down2(feat1)))
+
+        dec1 = self.dec1(self.fuse1(_resize_if_needed(self.up1(feat2), feat1), feat1))
+        dec0 = self.dec0(self.fuse0(_resize_if_needed(self.up0(dec1), feat0), feat0))
+        return torch.sigmoid(self.r_head(dec0)), torch.sigmoid(self.i_head(dec0))
+
+
 def build_decom_net(variant: str, base_channel: int):
     variant = (variant or "middle").lower()
     if variant in {"small", "mobile", "lite"}:
         return SmallDecomNet(base_channel=base_channel)
     if variant in {"max", "quality", "large"}:
         return MaxDecomNet(base_channel=base_channel)
+    if variant in {"naf_lite", "naflite", "efficient"}:
+        return NAFLiteDecomNet(base_channel=base_channel, num_blocks=2)
     if variant in {"naf", "nafnet"}:
         return NAFDecomNet(base_channel=base_channel, num_blocks=4)
     return MiddleDecomNet(base_channel=base_channel)

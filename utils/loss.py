@@ -3,6 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _resize_if_needed(image: torch.Tensor, target_size: int | None) -> torch.Tensor:
+    if target_size is None:
+        return image
+    if image.shape[-1] <= target_size and image.shape[-2] <= target_size:
+        return image
+    return F.interpolate(image, size=(target_size, target_size), mode="bilinear", align_corners=False)
+
+
 class CharbonnierLoss(nn.Module):
     """
     Charbonnier Loss (L1 approximation) for robust regression.
@@ -76,8 +84,13 @@ class LPIPSLoss(nn.Module):
     This provides much better visual quality than pixel-only losses,
     as it captures high-level texture and structural features.
     """
-    def __init__(self, net='vgg'):
+    def __init__(self, net='vgg', enabled=True, resize_to=None):
         super(LPIPSLoss, self).__init__()
+        self.resize_to = resize_to
+        if not enabled:
+            self.available = False
+            self.loss_fn = None
+            return
         try:
             import lpips
             self.loss_fn = lpips.LPIPS(net=net, verbose=False)
@@ -99,7 +112,38 @@ class LPIPSLoss(nn.Module):
         """
         if not self.available:
             return torch.tensor(0.0, device=pred.device)
+        pred = _resize_if_needed(pred, self.resize_to)
+        target = _resize_if_needed(target, self.resize_to)
         return self.loss_fn(pred, target).mean()
+
+
+class HaarWaveletLoss(nn.Module):
+    """
+    Cheap detail-preserving loss using fixed Haar wavelet filters.
+    Only the high-frequency bands are supervised.
+    """
+
+    def __init__(self):
+        super().__init__()
+        kernel = torch.tensor(
+            [
+                [[1.0, 1.0], [1.0, 1.0]],
+                [[1.0, 1.0], [-1.0, -1.0]],
+                [[1.0, -1.0], [1.0, -1.0]],
+                [[1.0, -1.0], [-1.0, 1.0]],
+            ],
+            dtype=torch.float32,
+        ) / 2.0
+        self.register_buffer("kernel", kernel.unsqueeze(1))
+
+    def forward(self, pred, target):
+        channels = pred.shape[1]
+        weight = self.kernel.repeat(channels, 1, 1, 1)
+        pred_coeffs = F.conv2d(pred, weight, stride=2, padding=0, groups=channels)
+        target_coeffs = F.conv2d(target, weight, stride=2, padding=0, groups=channels)
+        pred_coeffs = pred_coeffs.view(pred.shape[0], channels, 4, pred_coeffs.shape[-2], pred_coeffs.shape[-1])
+        target_coeffs = target_coeffs.view(target.shape[0], channels, 4, target_coeffs.shape[-2], target_coeffs.shape[-1])
+        return F.l1_loss(pred_coeffs[:, :, 1:], target_coeffs[:, :, 1:])
 
 
 class UncertaintyWeightedLoss(nn.Module):
@@ -142,21 +186,32 @@ class CompositeLoss(nn.Module):
                  w_char=1.0,
                  w_ssim=0.1,
                  w_lpips=0.1,
+                 w_wavelet=0.0,
                  device='cuda',
-                 use_uncertainty_weighting=True):
+                 use_uncertainty_weighting=True,
+                 use_lpips=True,
+                 lpips_resize=None):
         super(CompositeLoss, self).__init__()
         self.w_char = w_char
         self.w_ssim = w_ssim
         self.w_lpips = w_lpips
+        self.w_wavelet = w_wavelet
         self.use_uncertainty_weighting = use_uncertainty_weighting
+        self.use_lpips = use_lpips
 
         self.char_loss = CharbonnierLoss()
         self.ssim_loss = SSIMLoss()
-        self.lpips_loss = LPIPSLoss()
+        self.lpips_loss = LPIPSLoss(enabled=use_lpips, resize_to=lpips_resize)
+        self.wavelet_loss = HaarWaveletLoss() if w_wavelet > 0 else None
 
-        # P0: Add uncertainty weighting
+        self.active_term_names = ["char", "ssim"]
+        if use_lpips:
+            self.active_term_names.append("lpips")
+        if self.wavelet_loss is not None:
+            self.active_term_names.append("wavelet")
+
         if use_uncertainty_weighting:
-            self.uncertainty_weighter = UncertaintyWeightedLoss(num_losses=3)
+            self.uncertainty_weighter = UncertaintyWeightedLoss(num_losses=len(self.active_term_names))
 
     def forward(self, pred, target):
         """
@@ -174,30 +229,44 @@ class CompositeLoss(nn.Module):
         target_01 = (target.clamp(-1, 1) + 1) / 2
         l_ssim = self.ssim_loss(pred_01, target_01)
 
-        # LPIPS expects [-1, 1] range directly
-        l_lpips = self.lpips_loss(pred.clamp(-1, 1), target.clamp(-1, 1))
+        l_lpips = self.lpips_loss(pred.clamp(-1, 1), target.clamp(-1, 1)) if self.use_lpips else torch.tensor(0.0, device=pred.device)
+        l_wavelet = self.wavelet_loss(pred_01, target_01) if self.wavelet_loss is not None else torch.tensor(0.0, device=pred.device)
 
-        # P0: Use uncertainty weighting if enabled
         if self.use_uncertainty_weighting:
-            total_loss, weights = self.uncertainty_weighter([l_char, l_ssim, l_lpips])
+            active_losses = [l_char, l_ssim]
+            if self.use_lpips:
+                active_losses.append(l_lpips)
+            if self.wavelet_loss is not None:
+                active_losses.append(l_wavelet)
+            total_loss, weights = self.uncertainty_weighter(active_losses)
+            named_weights = {
+                f"w_{name}": weights.get(f"weight_{index}")
+                for index, name in enumerate(self.active_term_names)
+            }
             logs = {
                 'l_pix': l_char.detach(),
                 'l_ssim': l_ssim.detach(),
                 'l_lpips': l_lpips.detach(),
+                'l_wavelet': l_wavelet.detach(),
                 'l_total': total_loss.detach(),
-                'w_char': weights.get('weight_0', self.w_char),
-                'w_ssim': weights.get('weight_1', self.w_ssim),
-                'w_lpips': weights.get('weight_2', self.w_lpips),
+                'w_char': named_weights.get('w_char', self.w_char),
+                'w_ssim': named_weights.get('w_ssim', self.w_ssim),
+                'w_lpips': named_weights.get('w_lpips', self.w_lpips),
+                'w_wavelet': named_weights.get('w_wavelet', self.w_wavelet),
             }
         else:
-            total_loss = (self.w_char * l_char +
-                          self.w_ssim * l_ssim +
-                          self.w_lpips * l_lpips)
+            total_loss = self.w_char * l_char + self.w_ssim * l_ssim
+            if self.use_lpips:
+                total_loss = total_loss + self.w_lpips * l_lpips
+            if self.wavelet_loss is not None:
+                total_loss = total_loss + self.w_wavelet * l_wavelet
             logs = {
                 'l_pix': l_char.detach(),
                 'l_ssim': l_ssim.detach(),
                 'l_lpips': l_lpips.detach(),
-                'l_total': total_loss.detach()
+                'l_wavelet': l_wavelet.detach(),
+                'l_total': total_loss.detach(),
+                'w_wavelet': self.w_wavelet,
             }
 
         return total_loss, logs

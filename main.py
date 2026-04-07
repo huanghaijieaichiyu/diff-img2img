@@ -249,6 +249,22 @@ def apply_profile_defaults(args):
     if getattr(args, "synthesis_seed", None) is None:
         args.synthesis_seed = args.seed if args.seed is not None else 42
     args.darker_ranges = _normalize_darker_ranges_arg(getattr(args, "darker_ranges", None))
+    if getattr(args, "prefetch_factor", None) is None:
+        args.prefetch_factor = 4
+    if getattr(args, "persistent_workers", None) is None:
+        args.persistent_workers = args.num_workers > 0
+    if getattr(args, "pin_memory", None) is None:
+        args.pin_memory = True
+    if getattr(args, "decode_cache_size", None) is None:
+        args.decode_cache_size = 0
+    if getattr(args, "opencv_threads_per_worker", None) is None:
+        args.opencv_threads_per_worker = 1
+    if getattr(args, "use_lpips", None) is None:
+        args.use_lpips = True
+    if getattr(args, "lpips_resize", None) in ("", None):
+        args.lpips_resize = None
+    if getattr(args, "wavelet_loss_weight", None) is None:
+        args.wavelet_loss_weight = 0.0
 
     # Legacy compatibility
     if getattr(args, "use_ema", None) is None:
@@ -411,17 +427,25 @@ def get_args():
     _add_hidden_argument(parser, "--inject_mode", type=str, choices=["film_pyramid"])
     _add_hidden_argument(parser, "--base_condition_channels", type=int)
     _add_hidden_argument(parser, "--decom_base_channels", type=int)
-    _add_hidden_argument(parser, "--decom_variant", type=str, choices=["small", "middle", "max", "naf"])
-    _add_hidden_argument(parser, "--condition_variant", type=str, choices=["small", "middle", "max", "max_v2", "cross_attn"])
+    _add_hidden_argument(parser, "--decom_variant", type=str, choices=["small", "middle", "max", "naf", "naf_lite"])
+    _add_hidden_argument(parser, "--condition_variant", type=str, choices=["small", "small_v2", "middle", "max", "max_v2", "cross_attn"])
     _add_hidden_argument(parser, "--enable_xformers_memory_efficient_attention", action="store_true", default=None)
     _add_hidden_argument(parser, "--benchmark_inference_steps", nargs="+", type=int)
     _add_hidden_argument(parser, "--num_workers", type=int)
+    _add_hidden_argument(parser, "--prefetch_factor", type=int)
+    _add_hidden_argument(parser, "--persistent_workers", action=argparse.BooleanOptionalAction, default=None)
+    _add_hidden_argument(parser, "--pin_memory", action=argparse.BooleanOptionalAction, default=None)
+    _add_hidden_argument(parser, "--decode_cache_size", type=int)
+    _add_hidden_argument(parser, "--opencv_threads_per_worker", type=int)
     _add_hidden_argument(parser, "--semantic_backbone", type=str, choices=["none", "resnet18"])
     _add_hidden_argument(parser, "--nr_metric", type=str, choices=["none", "niqe"])
     _add_hidden_argument(parser, "--port", type=int)
     # P0/P1 Improvement parameters
     _add_hidden_argument(parser, "--loss_weighting_scheme", type=str, choices=["min_snr", "p2", "edm"])
     _add_hidden_argument(parser, "--use_uncertainty_weighting", action="store_true", default=None)
+    _add_hidden_argument(parser, "--use_lpips", action=argparse.BooleanOptionalAction, default=None)
+    _add_hidden_argument(parser, "--lpips_resize", type=int)
+    _add_hidden_argument(parser, "--wavelet_loss_weight", type=float)
 
     parser.set_defaults(**config_defaults)
     args = parser.parse_args()

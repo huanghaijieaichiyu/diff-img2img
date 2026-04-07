@@ -15,6 +15,13 @@ def autopad(k, p=None, d=1):
     return p
 
 
+def _group_count(channels: int, max_groups: int = 8) -> int:
+    for groups in range(min(max_groups, channels), 0, -1):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
 class Conv(nn.Module):
     default_act = nn.SiLU()
 
@@ -45,7 +52,7 @@ class ConvGNAct(nn.Module):
     def __init__(self, c1, c2, k=3, s=1, g=1, act=True):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, stride=s, padding=autopad(k), groups=g, bias=False)
-        self.norm = nn.GroupNorm(num_groups=max(1, min(8, c2)), num_channels=c2)
+        self.norm = nn.GroupNorm(num_groups=_group_count(c2), num_channels=c2)
         self.act = nn.SiLU() if act else nn.Identity()
 
     def forward(self, x):
@@ -119,7 +126,7 @@ class MBConvBlock(nn.Module):
             ConvGNAct(hidden, hidden, k=3, s=stride, g=hidden),
             SqueezeExcite(hidden),
             nn.Conv2d(hidden, c2, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups=max(1, min(8, c2)), num_channels=c2),
+            nn.GroupNorm(num_groups=_group_count(c2), num_channels=c2),
         ])
         self.block = nn.Sequential(*layers)
 
@@ -148,10 +155,10 @@ class GatedFusion(nn.Module):
 class GlobalContextBlock(nn.Module):
     def __init__(self, channels: int, num_heads: int = 4):
         super().__init__()
-        self.norm1 = nn.GroupNorm(num_groups=max(1, min(8, channels)), num_channels=channels)
+        self.norm1 = nn.GroupNorm(num_groups=_group_count(channels), num_channels=channels)
         heads = max(1, min(num_heads, max(1, channels // 32)))
         self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, batch_first=True)
-        self.norm2 = nn.GroupNorm(num_groups=max(1, min(8, channels)), num_channels=channels)
+        self.norm2 = nn.GroupNorm(num_groups=_group_count(channels), num_channels=channels)
         self.ffn = nn.Sequential(
             nn.Conv2d(channels, channels * 2, kernel_size=1),
             nn.SiLU(),
@@ -163,6 +170,43 @@ class GlobalContextBlock(nn.Module):
         attn_input = self.norm1(x).flatten(2).transpose(1, 2)
         attn_output, _ = self.attn(attn_input, attn_input, attn_input, need_weights=False)
         x = x + attn_output.transpose(1, 2).reshape(batch_size, channels, height, width)
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class PooledGlobalContextBlock(nn.Module):
+    """
+    Efficiency-oriented global context block.
+    Pools features to a small token grid before attention, then broadcasts the
+    refined context back to the original resolution.
+    """
+
+    def __init__(self, channels: int, num_heads: int = 4, pooled_size: int = 8):
+        super().__init__()
+        self.pooled_size = max(2, int(pooled_size))
+        self.norm1 = nn.GroupNorm(num_groups=_group_count(channels), num_channels=channels)
+        heads = max(1, min(num_heads, max(1, channels // 32)))
+        self.attn = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, batch_first=True)
+        self.norm2 = nn.GroupNorm(num_groups=_group_count(channels), num_channels=channels)
+        self.ffn = nn.Sequential(
+            nn.Conv2d(channels, channels * 2, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(channels * 2, channels, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, height, width = x.shape
+        pooled_h = min(self.pooled_size, height)
+        pooled_w = min(self.pooled_size, width)
+
+        pooled = F.adaptive_avg_pool2d(self.norm1(x), output_size=(pooled_h, pooled_w))
+        attn_input = pooled.flatten(2).transpose(1, 2)
+        attn_output, _ = self.attn(attn_input, attn_input, attn_input, need_weights=False)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, channels, pooled_h, pooled_w)
+        if (pooled_h, pooled_w) != (height, width):
+            attn_output = F.interpolate(attn_output, size=(height, width), mode="bilinear", align_corners=False)
+
+        x = x + attn_output
         x = x + self.ffn(self.norm2(x))
         return x
 

@@ -34,7 +34,7 @@ from models.diffusion import CombinedModel
 from models.retinex import build_decom_net
 from utils.loss import CompositeLoss
 from utils.metrics import SemanticFeatureMetric, try_compute_niqe
-from utils.misc import compute_min_snr_loss_weights, compute_adaptive_loss_weights, ssim
+from utils.misc import charbonnier_loss_elementwise, compute_min_snr_loss_weights, compute_adaptive_loss_weights, ssim
 from utils.train_display import create_training_display
 from utils.video_writer import video_writer
 
@@ -53,6 +53,7 @@ class DiffusionEngine:
             "lr",
             "l_diff",
             "l_x0",
+            "l_wavelet",
             "x0_w",
             "l_ret",
             "l_recon_low",
@@ -114,6 +115,9 @@ class DiffusionEngine:
         self.criterion = CompositeLoss(
             device=self.accelerator.device,
             use_uncertainty_weighting=use_uncertainty,
+            use_lpips=getattr(args, "use_lpips", True),
+            lpips_resize=getattr(args, "lpips_resize", None),
+            w_wavelet=getattr(args, "wavelet_loss_weight", 0.0),
         ).to(self.accelerator.device)
 
     def _setup_models(self):
@@ -428,6 +432,7 @@ class DiffusionEngine:
         worker_seed = worker_info.seed if worker_info is not None else (self.args.seed or 42) + worker_id
         random.seed(worker_seed)
         np.random.seed(worker_seed % (2 ** 32 - 1))
+        cv2.setNumThreads(max(0, int(getattr(self.args, "opencv_threads_per_worker", 1))))
 
     def _collect_runtime_metrics(self, data_time: float, compute_time: float, batch_size: int) -> dict:
         iter_time = max(data_time + compute_time, 1e-8)
@@ -606,18 +611,19 @@ class DiffusionEngine:
             img_size=self.args.resolution,
             phase="train",
             manifest_path=getattr(self.args, "train_manifest_path", None),
+            decode_cache_size=getattr(self.args, "decode_cache_size", 0),
         )
         train_loader_kwargs = {
             "batch_size": self.args.batch_size,
             "shuffle": True,
             "num_workers": self.args.num_workers,
-            "pin_memory": True,
+            "pin_memory": bool(getattr(self.args, "pin_memory", True)),
             "drop_last": True,
             "worker_init_fn": self._worker_init_fn,
         }
         if self.args.num_workers > 0:
-            train_loader_kwargs["persistent_workers"] = True
-            train_loader_kwargs["prefetch_factor"] = 4
+            train_loader_kwargs["persistent_workers"] = bool(getattr(self.args, "persistent_workers", True))
+            train_loader_kwargs["prefetch_factor"] = max(2, int(getattr(self.args, "prefetch_factor", 4)))
         train_dataloader = DataLoader(train_dataset, **train_loader_kwargs)
 
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / self.args.gradient_accumulation_steps)
@@ -932,8 +938,6 @@ class DiffusionEngine:
                     weighting_scheme=weighting_scheme,
                     snr_gamma=self.args.snr_gamma,
                 )
-            # P1 Fix: Use Charbonnier loss instead of MSE for robustness
-            from utils.misc import charbonnier_loss_elementwise
             loss_diff_elem = charbonnier_loss_elementwise(model_pred, target)
             loss_diffusion = (loss_diff_elem.mean(dim=[1, 2, 3]) * snr_weights).mean()
 
@@ -943,8 +947,9 @@ class DiffusionEngine:
             x0_weight = self._x0_branch_weight(global_step)
             timestep_mask = timesteps <= self.args.x0_loss_t_max
             x0_loss = torch.tensor(0.0, device=clean_images.device)
+            x0_logs = {}
             if x0_weight > 0.0 and torch.any(timestep_mask):
-                x0_loss, _ = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
+                x0_loss, x0_logs = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
 
             loss = loss_diffusion + x0_weight * x0_loss
 
@@ -972,6 +977,7 @@ class DiffusionEngine:
                 "lr": lr_scheduler.get_last_lr()[0],
                 "l_diff": loss_diffusion.item(),
                 "l_x0": x0_loss.item(),
+                "l_wavelet": float(x0_logs.get("l_wavelet", torch.tensor(0.0, device=clean_images.device)).item()) if x0_logs else 0.0,
                 "x0_w": x0_weight,
                 "l_ret": retinex_losses["retinex_total"].item(),
                 "l_recon_low": retinex_losses["l_recon_low"].item(),
@@ -1119,12 +1125,14 @@ class DiffusionEngine:
             image_dir=self.args.data_dir,
             img_size=self.args.resolution,
             phase="test",
+            decode_cache_size=getattr(self.args, "decode_cache_size", 0),
         )
         eval_dataloader = DataLoader(
             eval_dataset,
             batch_size=self.args.batch_size,
             shuffle=False,
             num_workers=self.args.num_workers,
+            pin_memory=bool(getattr(self.args, "pin_memory", True)),
         )
         eval_dataloader = self.accelerator.prepare(eval_dataloader)
         unwrapped = self.accelerator.unwrap_model(self.training_model)

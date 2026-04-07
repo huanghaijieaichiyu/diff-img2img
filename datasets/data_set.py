@@ -1,5 +1,6 @@
 import os
 import random
+from collections import OrderedDict
 from typing import Optional
 
 import cv2
@@ -34,6 +35,7 @@ class LowLightDataset(Dataset):
         darker_ranges: Optional[dict] = None,
         manifest_path: Optional[str] = None,
         paired_samples: Optional[list[dict]] = None,
+        decode_cache_size: int = 0,
     ):
         self.image_dir = image_dir
         self.img_size = img_size
@@ -42,6 +44,8 @@ class LowLightDataset(Dataset):
         self.darker_ranges = darker_ranges
         self.darker = None
         self.data = []
+        self.decode_cache_size = max(0, int(decode_cache_size or 0))
+        self.decode_cache = OrderedDict()
 
         if phase == "predict":
             if os.path.exists(image_dir):
@@ -102,12 +106,20 @@ class LowLightDataset(Dataset):
             self.darker = Darker(randomize=True, param_ranges=self.darker_ranges)
         return self.darker
 
-    @staticmethod
-    def _read_rgb(path: str) -> np.ndarray:
+    def _read_rgb(self, path: str) -> np.ndarray:
+        if self.decode_cache_size > 0 and path in self.decode_cache:
+            self.decode_cache.move_to_end(path)
+            return self.decode_cache[path]
+
         image_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
         if image_bgr is None:
             raise FileNotFoundError(f"Failed to read image: {path}")
-        return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        if self.decode_cache_size > 0:
+            self.decode_cache[path] = image_rgb
+            if len(self.decode_cache) > self.decode_cache_size:
+                self.decode_cache.popitem(last=False)
+        return image_rgb
 
     def _random_crop_coords(self, height: int, width: int):
         crop_h = min(self.img_size, height)

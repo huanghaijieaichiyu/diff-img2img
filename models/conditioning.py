@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .common import ConvGNAct, DWConvGNAct, GatedFusion, GlobalContextBlock, MBConvBlock, Transformer2DBlock, CrossAttentionBlock
+from .common import ConvGNAct, DWConvGNAct, GatedFusion, GlobalContextBlock, MBConvBlock, Transformer2DBlock, CrossAttentionBlock, NAFBlock, PooledGlobalContextBlock
 
 
 def rgb_to_hvi_lite(x_01: torch.Tensor) -> torch.Tensor:
@@ -184,6 +184,111 @@ class SmallConditionAdapter(ConditionAdapterBase):
             self.up_stage_map,
         )
         packed["noisy_delta"] = 0.08 * packed["noisy_delta"]
+        return packed
+
+
+class SmallConditionAdapterV2(ConditionAdapterBase):
+    """
+    HVI dual-path lightweight adapter with NAF local modeling and pooled global
+    context at the deepest stage.
+    """
+
+    def __init__(self, block_channels, cond_out_channels=7, base_channels=24, use_retinex=True, conditioning_space="hvi_lite"):
+        super().__init__(block_channels, cond_out_channels, base_channels, use_retinex, conditioning_space)
+        illum_in = 2 if use_retinex else 1
+        detail_in = 5
+
+        self.illum_stem = DWConvGNAct(illum_in, base_channels, k=3, s=1)
+        self.illum_refine0 = NAFBlock(base_channels)
+        self.illum_down1 = MBConvBlock(base_channels, base_channels * 2, stride=2)
+        self.illum_refine1 = NAFBlock(base_channels * 2)
+        self.illum_down2 = MBConvBlock(base_channels * 2, base_channels * 4, stride=2)
+        self.illum_refine2 = nn.Sequential(
+            NAFBlock(base_channels * 4),
+            PooledGlobalContextBlock(base_channels * 4, num_heads=4, pooled_size=8),
+        )
+
+        self.detail_stem = DWConvGNAct(detail_in, base_channels, k=3, s=1)
+        self.detail_refine0 = NAFBlock(base_channels)
+        self.detail_down1 = MBConvBlock(base_channels, base_channels * 2, stride=2)
+        self.detail_refine1 = NAFBlock(base_channels * 2)
+        self.detail_down2 = MBConvBlock(base_channels * 2, base_channels * 4, stride=2)
+        self.detail_refine2 = nn.Sequential(
+            NAFBlock(base_channels * 4),
+            PooledGlobalContextBlock(base_channels * 4, num_heads=4, pooled_size=8),
+        )
+
+        self.fuse0 = GatedFusion(base_channels)
+        self.fuse1 = GatedFusion(base_channels * 2)
+        self.fuse2 = GatedFusion(base_channels * 4)
+
+        self.noisy_proj0 = DWConvGNAct(3, base_channels, k=3, s=1)
+        self.noisy_proj1 = MBConvBlock(base_channels, base_channels * 2, stride=2)
+        self.noisy_proj2 = MBConvBlock(base_channels * 2, base_channels * 4, stride=2)
+
+        self.local_film0 = nn.Conv2d(base_channels, base_channels * 2, kernel_size=1)
+        self.local_film1 = nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=1)
+        self.local_film2 = nn.Conv2d(base_channels * 4, base_channels * 8, kernel_size=1)
+
+        fused_channels = [base_channels, base_channels * 2, base_channels * 4]
+        self.down_stage_map, self.up_stage_map = self._make_stage_maps(fused_channels)
+        up_block_channels = list(reversed(self.block_channels))
+        self.down_film_layers = nn.ModuleList([
+            nn.Conv2d(fused_channels[self.down_stage_map[index]], self.block_channels[index] * 2, kernel_size=1)
+            for index in range(len(self.block_channels))
+        ])
+        self.mid_film = nn.Conv2d(fused_channels[-1], self.block_channels[-1] * 2, kernel_size=1)
+        self.up_film_layers = nn.ModuleList([
+            nn.Conv2d(fused_channels[self.up_stage_map[index]], up_block_channels[index] * 2, kernel_size=1)
+            for index in range(len(up_block_channels))
+        ])
+
+        merged_channels = sum(fused_channels)
+        self.cond_merge = nn.Sequential(
+            ConvGNAct(merged_channels, base_channels, k=1, s=1),
+            nn.Conv2d(base_channels, cond_out_channels, kernel_size=1),
+        )
+        self.noisy_merge = nn.Sequential(
+            ConvGNAct(merged_channels, base_channels, k=1, s=1),
+            nn.Conv2d(base_channels, 3, kernel_size=3, padding=1),
+            nn.Tanh(),
+        )
+
+    def forward(self, noisy_images: torch.Tensor, illumination_input: torch.Tensor, detail_input: torch.Tensor):
+        illum0 = self.illum_refine0(self.illum_stem(illumination_input))
+        illum1 = self.illum_refine1(self.illum_down1(illum0))
+        illum2 = self.illum_refine2(self.illum_down2(illum1))
+
+        detail0 = self.detail_refine0(self.detail_stem(detail_input))
+        detail1 = self.detail_refine1(self.detail_down1(detail0))
+        detail2 = self.detail_refine2(self.detail_down2(detail1))
+
+        fused0 = self.fuse0(illum0, detail0)
+        fused1 = self.fuse1(illum1, detail1)
+        fused2 = self.fuse2(illum2, detail2)
+        fused_feats = [fused0, fused1, fused2]
+
+        noisy0 = self.noisy_proj0(noisy_images)
+        noisy1 = self.noisy_proj1(noisy0)
+        noisy2 = self.noisy_proj2(noisy1)
+
+        mod0 = self._film_modulation(noisy0, fused0, self.local_film0)
+        mod1 = self._film_modulation(noisy1, fused1, self.local_film1)
+        mod2 = self._film_modulation(noisy2, fused2, self.local_film2)
+
+        packed = self._pack_outputs(
+            noisy_images,
+            fused_feats,
+            [mod0, mod1, mod2],
+            self.cond_merge,
+            self.noisy_merge,
+            self.down_film_layers,
+            self.mid_film,
+            self.up_film_layers,
+            self.down_stage_map,
+            self.up_stage_map,
+        )
+        packed["noisy_delta"] = 0.07 * packed["noisy_delta"]
         return packed
 
 
@@ -516,6 +621,14 @@ def build_condition_adapter(variant: str, block_channels, cond_out_channels=7, b
     variant = (variant or "middle").lower()
     if variant in {"small", "mobile", "lite"}:
         return SmallConditionAdapter(
+            block_channels=block_channels,
+            cond_out_channels=cond_out_channels,
+            base_channels=base_channels,
+            use_retinex=use_retinex,
+            conditioning_space=conditioning_space,
+        )
+    if variant in {"small_v2", "efficient", "lite_v2"}:
+        return SmallConditionAdapterV2(
             block_channels=block_channels,
             cond_out_channels=cond_out_channels,
             base_channels=base_channels,
