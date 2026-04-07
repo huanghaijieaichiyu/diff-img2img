@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import signal
+import shlex
 import time
 from pathlib import Path
 import shutil
@@ -13,6 +14,7 @@ import pandas as pd
 import plotly.express as px
 import torch
 import yaml
+from html import escape
 from concurrent.futures import ProcessPoolExecutor
 
 # Import project modules
@@ -34,16 +36,47 @@ TRANSLATIONS = {
         "visualization": "Visualization",
         "configuration": "Configuration",
         "app_title": "🌌 Diff-Img2Img Studio",
+        "home_kicker": "Prepared-cache workflow for low-light restoration",
         "home_subtitle": "🚀 Next-Gen Low-Light Enhancement",
-        "home_desc": "**Diff-Img2Img** is a comprehensive framework leveraging **Diffusion Models** and **Retinex Theory** to restore extreme low-light images with realistic noise handling.",
+        "home_desc": "Diff-Img2Img combines Retinex decomposition, diffusion restoration, and an offline prepared-cache pipeline to make low-light enhancement runs easier to reproduce and monitor.",
         "key_features": "🌟 Key Features",
         "feature_1": "**Physics-based Data Synthesis**: Uses `Darker` engine to simulate realistic low-light degradation (Gamma, Noise, Headlights).",
         "feature_2": "**Retinex-Diffusion Architecture**: Decomposes images into Reflectance/Illumination for stable diffusion training.",
-        "feature_3": "**Full-Stack Workflow**: From data generation to visual evaluation in one integrated dashboard.",
+        "feature_3": "**Full-Stack Workflow**: Prepare cache, launch training, monitor logs, evaluate runs, and inspect outputs in one place.",
         "example_results": "🖼️ Example Results",
         "synthesized_input": "Synthesized Low-Light (Input)",
         "ground_truth": "Ground Truth (Reference)",
         "home_tip": "💡 **Tip:** Navigate using the sidebar to start your workflow.",
+        "workflow_header": "Workflow",
+        "workflow_prepare_title": "Prepare The Offline Cache",
+        "workflow_prepare_desc": "Generate multi-variant low-light samples from `our485/high`, inspect cache health, and rebuild only when settings change.",
+        "workflow_train_title": "Launch Preset Training",
+        "workflow_train_desc": "Use the official `small`, `middle`, or `max` configs, preview the final command, and launch with prepared-cache settings attached.",
+        "workflow_eval_title": "Validate And Visualize",
+        "workflow_eval_desc": "Read metrics, compare outputs on `eval15`, and keep qualitative checks close to the training loop.",
+        "quick_start": "Quick Start",
+        "train_command": "Training Command",
+        "ui_command": "UI Command",
+        "preset_overview": "Preset Overview",
+        "preset_summary": "Preset Summary",
+        "preset_description": "Preset Description",
+        "target_vram": "Target VRAM",
+        "preset_resolution": "Preset Resolution",
+        "effective_batch": "Effective Batch",
+        "recommended_effective_batch": "Recommended minimum effective batch",
+        "command_preview": "Command Preview",
+        "start_training_hint": "Launch training from the Configuration tab to start logging metrics here.",
+        "monitoring_note": "The monitor reads `training_metrics.csv` and `training_status.json` from the active output directory.",
+        "waiting_for_logs": "Waiting for logs...",
+        "auto_refresh": "🔄 Auto Refresh (5s)",
+        "auto_refresh_help": "Automatically refresh metrics and logs every 5 seconds.",
+        "waiting_for_data_points": "Waiting for data points...",
+        "initializing_metrics_log": "Initializing metrics log...",
+        "evaluation_failed": "Evaluation failed.",
+        "dependencies_missing": "Dependencies missing (`scripts/visual_val.py`).",
+        "load_failed": "Model load failed",
+        "displaying": "Displaying",
+        "dataset_path_invalid": "Dataset path is invalid or missing `eval15/low`.",
         "dataset_header": "🌑 Dataset Preparation",
         "dataset_sub": "Build and manage the prepared multi-variant low-light cache used by training.",
         "how_it_works": "ℹ️ How it works",
@@ -86,6 +119,7 @@ TRANSLATIONS = {
         "batch_size": "Batch Size",
         "lr": "Learning Rate",
         "train_profile": "Training Profile",
+        "train_desc": "Launch preset training, inspect the resolved command, and monitor logs plus metrics from the current output directory.",
         "train_tip": "💡 **Tip:** Training now auto-prepares a 3-variant offline low-light cache when prepared data is missing. Ensure your GPU has enough VRAM for Batch Size > 1 at 512px.",
         "launch_train": "🚀 Launch Training",
         "train_launched": "Training launched! Switch to 'Monitoring' tab.",
@@ -131,6 +165,7 @@ TRANSLATIONS = {
         "eval_complete": "Evaluation Complete!",
         "results": "Results",
         "vis_header": "🎨 Visualization",
+        "vis_desc": "Inspect checkpoints on `eval15` and compare low-light, enhanced, and reference images.",
         "vis_config": "Config",
         "reload_models": "Reload Models",
         "select_image": "Select Test Image",
@@ -145,6 +180,7 @@ TRANSLATIONS = {
         "setup_header": "🛠️ Setup & Installation",
         "setup_desc": "Ensure you have the required environment:",
         "install_dependencies": "Install Dependencies",
+        "config_tip": "This file is written to `accelerate_config.yaml` and will be picked up by the training launcher.",
     },
     "zh": {
         "nav_title": "导航",
@@ -155,16 +191,47 @@ TRANSLATIONS = {
         "visualization": "可视化",
         "configuration": "配置",
         "app_title": "🌌 Diff-Img2Img 工作室",
+        "home_kicker": "面向低光增强的 prepared-cache 训练工作流",
         "home_subtitle": "🚀 下一代低光照增强",
-        "home_desc": "**Diff-Img2Img** 是一个利用 **扩散模型** 和 **Retinex 理论** 来恢复极低光照图像并处理真实噪声的综合框架。",
+        "home_desc": "Diff-Img2Img 将 Retinex 分解、扩散恢复和离线 prepared-cache 数据流程组合在一起，让低光增强训练更稳定、更容易复现。",
         "key_features": "🌟 主要特性",
         "feature_1": "**基于物理的数据合成**：使用 `Darker` 引擎模拟真实的低光照退化（Gamma，噪声，车灯）。",
         "feature_2": "**Retinex-扩散架构**：将图像分解为反射率/光照，以进行稳定的扩散训练。",
-        "feature_3": "**全栈工作流**：从数据生成到可视化评估的一个集成仪表板。",
+        "feature_3": "**全栈工作流**：在一个界面里完成缓存准备、训练启动、日志监控、评估与可视化。",
         "example_results": "🖼️ 示例结果",
         "synthesized_input": "合成低光照 (输入)",
         "ground_truth": "地面实况 (参考)",
         "home_tip": "💡 **提示：** 使用侧边栏导航开始您的工作流。",
+        "workflow_header": "工作流",
+        "workflow_prepare_title": "准备离线缓存",
+        "workflow_prepare_desc": "从 `our485/high` 生成多变体低光样本，检查缓存健康状态，并在参数变化时按需重建。",
+        "workflow_train_title": "启动官方预设训练",
+        "workflow_train_desc": "使用 `small`、`middle` 或 `max` 官方配置，先预览最终命令，再携带 prepared-cache 参数启动训练。",
+        "workflow_eval_title": "评估与可视化",
+        "workflow_eval_desc": "读取指标、查看 `eval15` 可视化结果，把定量和定性检查都放在训练闭环里。",
+        "quick_start": "快速开始",
+        "train_command": "训练命令",
+        "ui_command": "界面命令",
+        "preset_overview": "预设概览",
+        "preset_summary": "预设摘要",
+        "preset_description": "预设说明",
+        "target_vram": "目标显存",
+        "preset_resolution": "预设分辨率",
+        "effective_batch": "有效批次",
+        "recommended_effective_batch": "建议的最小有效批次",
+        "command_preview": "命令预览",
+        "start_training_hint": "请先在“配置”标签页启动训练，这里才会开始显示日志和指标。",
+        "monitoring_note": "监控页会读取当前输出目录下的 `training_metrics.csv` 与 `training_status.json`。",
+        "waiting_for_logs": "正在等待日志输出...",
+        "auto_refresh": "🔄 自动刷新 (5 秒)",
+        "auto_refresh_help": "每 5 秒自动刷新日志和图表。",
+        "waiting_for_data_points": "正在等待训练数据点...",
+        "initializing_metrics_log": "正在初始化指标日志...",
+        "evaluation_failed": "评估失败。",
+        "dependencies_missing": "缺少依赖（`scripts/visual_val.py`）。",
+        "load_failed": "模型加载失败",
+        "displaying": "当前显示",
+        "dataset_path_invalid": "数据集路径无效，或缺少 `eval15/low`。",
         "dataset_header": "🌑 数据集准备",
         "dataset_sub": "构建并管理训练实际使用的 prepared 多变体低光缓存。",
         "how_it_works": "ℹ️ 工作原理",
@@ -207,6 +274,7 @@ TRANSLATIONS = {
         "batch_size": "批次大小",
         "lr": "学习率",
         "train_profile": "训练配置",
+        "train_desc": "用官方预设启动训练，先检查最终命令，再在当前输出目录上持续查看日志和指标。",
         "train_tip": "💡 **提示：** 如果缺少 prepared 数据，训练会先自动生成 3 变体离线低光缓存。也请确保您的 GPU 显存足以在 512px 下支持批次大小 > 1。",
         "launch_train": "🚀 启动训练",
         "train_launched": "训练已启动！切换到 '监控' 标签。",
@@ -252,6 +320,7 @@ TRANSLATIONS = {
         "eval_complete": "评估完成！",
         "results": "结果",
         "vis_header": "🎨 可视化",
+        "vis_desc": "在 `eval15` 上检查 checkpoint，并对比低光输入、增强结果和参考图像。",
         "vis_config": "配置",
         "reload_models": "重新加载模型",
         "select_image": "选择测试图像",
@@ -266,6 +335,7 @@ TRANSLATIONS = {
         "setup_header": "🛠️ 安装与设置",
         "setup_desc": "确保您已准备好运行环境：",
         "install_dependencies": "安装依赖",
+        "config_tip": "该配置会写入 `accelerate_config.yaml`，训练启动时会自动读取。",
     }
 }
 
@@ -282,78 +352,206 @@ st.set_page_config(
 # --- Custom CSS for Modern UI ---
 st.markdown("""
 <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Source+Serif+4:wght@600;700&display=swap');
+
+    :root {
+        --bg: #f5f1e8;
+        --surface: rgba(255, 252, 246, 0.92);
+        --surface-strong: rgba(255, 250, 242, 0.98);
+        --line: rgba(102, 79, 43, 0.16);
+        --text: #1e2b2b;
+        --muted: #5c6868;
+        --accent: #0f766e;
+        --accent-soft: rgba(15, 118, 110, 0.10);
+        --highlight: #c38b2f;
+        --shadow: 0 18px 40px rgba(48, 44, 31, 0.10);
+    }
+
+    .stApp {
+        background:
+            radial-gradient(circle at top right, rgba(195, 139, 47, 0.16), transparent 28%),
+            radial-gradient(circle at top left, rgba(15, 118, 110, 0.10), transparent 24%),
+            linear-gradient(180deg, #f8f4ec 0%, #f2ede2 100%);
+    }
+
     /* Global Fonts */
     html, body, [class*="css"] {
-        font-family: 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        font-family: 'Space Grotesk', 'Avenir Next', 'Helvetica Neue', sans-serif;
+        color: var(--text);
     }
     
     /* Headings */
     h1, h2, h3 {
+        font-family: 'Source Serif 4', Georgia, serif;
         font-weight: 700;
-        color: #1f2937;
+        color: var(--text);
     }
     
     /* Buttons */
     .stButton button {
         width: 100%;
-        border-radius: 8px;
+        border-radius: 12px;
         font-weight: 600;
         border: none;
         transition: all 0.2s ease-in-out;
         padding: 0.6rem 1rem;
+        background: linear-gradient(135deg, #146d67 0%, #0f766e 100%);
+        color: #fff;
+        box-shadow: 0 10px 24px rgba(15, 118, 110, 0.18);
     }
     .stButton button:hover {
         transform: translateY(-1px);
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        box-shadow: 0 14px 28px rgba(15, 118, 110, 0.24);
     }
     
     /* Inputs & Selects */
     .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div {
-        border-radius: 8px;
-        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.75);
     }
     .stTextInput input:focus, .stNumberInput input:focus {
-        border-color: #4f46e5;
-        box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
+        border-color: rgba(15, 118, 110, 0.6);
+        box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.18);
     }
     
     /* Expanders & Cards */
     div[data-testid="stExpander"] {
-        border-radius: 12px;
-        border: 1px solid #e5e7eb;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-        background-color: #ffffff;
+        border-radius: 18px;
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow);
+        background-color: var(--surface);
         margin-bottom: 1rem;
     }
     
     /* Metric Cards */
     div[data-testid="metric-container"] {
-        background-color: #f9fafb;
+        background: linear-gradient(180deg, rgba(255,255,255,0.95) 0%, rgba(250,246,238,0.92) 100%);
         padding: 1rem;
-        border-radius: 8px;
-        border: 1px solid #f3f4f6;
+        border-radius: 16px;
+        border: 1px solid var(--line);
         text-align: center;
         transition: transform 0.2s;
+        box-shadow: 0 10px 24px rgba(48, 44, 31, 0.06);
     }
     div[data-testid="metric-container"]:hover {
         transform: scale(1.02);
-        border-color: #d1d5db;
+        border-color: rgba(15, 118, 110, 0.20);
     }
     
     /* Sidebar */
     section[data-testid="stSidebar"] {
-        background-color: #f8fafc;
-        border-right: 1px solid #e2e8f0;
+        background: linear-gradient(180deg, rgba(250, 246, 237, 0.96) 0%, rgba(241, 235, 222, 0.94) 100%);
+        border-right: 1px solid var(--line);
     }
     
     /* Custom Classes */
     .metric-card {
         background-color: #ffffff;
         padding: 20px;
-        border-radius: 12px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        border-radius: 16px;
+        box-shadow: var(--shadow);
         text-align: center;
         margin-bottom: 1rem;
+    }
+
+    .hero-panel {
+        background:
+            linear-gradient(135deg, rgba(18, 104, 97, 0.96) 0%, rgba(17, 83, 78, 0.94) 55%, rgba(36, 50, 48, 0.96) 100%);
+        color: #f8f6f0;
+        border-radius: 24px;
+        padding: 1.5rem 1.6rem;
+        margin-bottom: 1.2rem;
+        box-shadow: 0 24px 48px rgba(26, 39, 38, 0.16);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+
+    .hero-kicker {
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-size: 0.78rem;
+        color: rgba(248, 246, 240, 0.72);
+        margin-bottom: 0.55rem;
+    }
+
+    .hero-title {
+        font-family: 'Source Serif 4', Georgia, serif;
+        font-size: 2rem;
+        line-height: 1.12;
+        margin: 0;
+        color: #fff8eb;
+    }
+
+    .hero-desc {
+        color: rgba(248, 246, 240, 0.88);
+        margin: 0.75rem 0 0;
+        max-width: 58rem;
+        line-height: 1.6;
+    }
+
+    .hero-badges {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.55rem;
+        margin-top: 1rem;
+    }
+
+    .hero-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.45rem 0.8rem;
+        border-radius: 999px;
+        background: rgba(255, 248, 235, 0.12);
+        border: 1px solid rgba(255, 248, 235, 0.16);
+        color: #fff8eb;
+        font-size: 0.9rem;
+    }
+
+    .info-card {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 1rem 1rem 0.95rem;
+        min-height: 180px;
+        box-shadow: 0 12px 26px rgba(48, 44, 31, 0.06);
+    }
+
+    .info-card h4 {
+        margin: 0 0 0.5rem;
+        font-family: 'Source Serif 4', Georgia, serif;
+        color: var(--text);
+        font-size: 1.12rem;
+    }
+
+    .info-card p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.6;
+    }
+
+    .preset-card {
+        background: linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(248,243,234,0.92) 100%);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        padding: 0.95rem 1rem;
+        margin-bottom: 0.8rem;
+    }
+
+    .preset-card strong {
+        color: var(--text);
+        font-size: 1rem;
+    }
+
+    .preset-card p {
+        margin: 0.45rem 0 0;
+        color: var(--muted);
+        line-height: 1.5;
+    }
+
+    .section-note {
+        color: var(--muted);
+        margin-bottom: 0.6rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -363,6 +561,8 @@ if 'page' not in st.session_state:
     st.session_state.page = "Home"
 if 'training_pid' not in st.session_state:
     st.session_state.training_pid = None
+if 'training_pgid' not in st.session_state:
+    st.session_state.training_pgid = None
 if 'training_log_file' not in st.session_state:
     st.session_state.training_log_file = None
 if 'training_csv_file' not in st.session_state:
@@ -405,7 +605,7 @@ def folder_selector(label, key, default_path="."):
     return base_path
 
 def read_log_file(file_path, num_lines=100):
-    if not file_path or not os.path.exists(file_path): return t("Waiting for logs...")
+    if not file_path or not os.path.exists(file_path): return t("waiting_for_logs")
     try:
         with open(file_path, "r") as f:
             lines = f.readlines()
@@ -420,6 +620,11 @@ def read_status_file(file_path):
             return json.load(f)
     except Exception:
         return {}
+
+
+def clear_training_state():
+    st.session_state.training_pid = None
+    st.session_state.training_pgid = None
 
 
 def recommended_prepare_workers():
@@ -518,6 +723,109 @@ def render_prepared_cache_summary(summary):
     st.caption(f"{t('cache_dir_label')}: `{summary['cache_dir']}`")
 
 
+def load_preset_summary(preset_name):
+    config_path = Path("configs/train") / f"{preset_name}.yaml"
+    summary = {
+        "name": preset_name,
+        "config_path": str(config_path),
+        "description": "",
+        "target_vram_gb": "-",
+        "resolution": "-",
+        "batch_size": "-",
+        "gradient_accumulation_steps": 1,
+        "effective_batch": "-",
+    }
+    if not config_path.exists():
+        return summary
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except Exception:
+        return summary
+
+    meta = data.get("meta", {})
+    runtime = data.get("runtime", {})
+    optimization = data.get("optimization", {})
+    batch_size = int(optimization.get("batch_size", 1))
+    grad_acc = int(optimization.get("gradient_accumulation_steps", 1))
+    summary.update({
+        "name": meta.get("name", preset_name),
+        "description": meta.get("description", ""),
+        "target_vram_gb": meta.get("target_vram_gb", "-"),
+        "resolution": runtime.get("resolution", "-"),
+        "batch_size": batch_size,
+        "gradient_accumulation_steps": grad_acc,
+        "effective_batch": batch_size * grad_acc,
+    })
+    return summary
+
+
+def render_intro_card(title, subtitle, badges=None, kicker=None):
+    badges = badges or []
+    badges_html = "".join(
+        f"<span class='hero-badge'>{escape(str(badge))}</span>" for badge in badges if badge
+    )
+    kicker = kicker or "Diff-Img2Img"
+    st.markdown(
+        f"""
+        <div class="hero-panel">
+            <div class="hero-kicker">{escape(kicker)}</div>
+            <div class="hero-title">{escape(title)}</div>
+            <p class="hero-desc">{escape(subtitle)}</p>
+            {f"<div class='hero-badges'>{badges_html}</div>" if badges_html else ""}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def build_train_command(
+    model_scale,
+    data_dir,
+    output_dir,
+    resolution,
+    batch_size,
+    epochs,
+    lr,
+    train_profile,
+    variant_count,
+    prepare_workers,
+    synthesis_seed,
+    use_retinex,
+    resume,
+    prepared_cache_dir,
+    prepare_force,
+    darker_ranges_text,
+):
+    cmd = [
+        sys.executable, "-m", "accelerate.commands.launch", "main.py", "--mode", "train",
+        "--config", f"configs/train/{model_scale}.yaml",
+        "--data_dir", data_dir,
+        "--output_dir", output_dir,
+        "--resolution", str(resolution),
+        "--batch_size", str(batch_size),
+        "--epochs", str(epochs),
+        "--lr", str(lr),
+        "--train_profile", train_profile,
+        "--offline_variant_count", str(variant_count),
+        "--prepare_workers", str(prepare_workers),
+        "--synthesis_seed", str(synthesis_seed),
+    ]
+
+    if use_retinex:
+        cmd.append("--use_retinex")
+    if resume:
+        cmd.extend(["--resume", resume])
+    if prepared_cache_dir:
+        cmd.extend(["--prepared_cache_dir", prepared_cache_dir])
+    if prepare_force:
+        cmd.append("--prepare_force")
+    if darker_ranges_text.strip():
+        cmd.extend(["--darker_ranges", darker_ranges_text])
+    return cmd
+
+
 def build_prepare_command(config_path, data_dir, prepared_cache_dir, variant_count, prepare_workers, synthesis_seed, prepare_force, darker_ranges_text):
     cmd = [
         sys.executable, "main.py", "--mode", "prepare",
@@ -538,40 +846,79 @@ def build_prepare_command(config_path, data_dir, prepared_cache_dir, variant_cou
 # --- Pages ---
 
 def home_page():
-    st.title(t("app_title"))
-    
-    st.markdown(f"""
-    ### {t("home_subtitle")}
-    {t("home_desc")}
-    
-    #### {t("key_features")}
-    *   {t("feature_1")}
-    *   {t("feature_2")}
-    *   {t("feature_3")}
-    """)
-    
-    st.divider()
+    render_intro_card(
+        t("app_title"),
+        t("home_desc"),
+        badges=[t("dataset"), t("training"), t("evaluation"), t("visualization")],
+        kicker=t("home_kicker"),
+    )
 
-    # --- Setup & Installation Guide ---
-    with st.expander(t("setup_header")):
-        st.markdown(t("setup_desc"))
-        st.markdown(f"**{t('install_dependencies')}:**")
-        st.code("pip install -r requirements.txt")
-        st.markdown("---") # Separator
+    st.markdown(f"### {t('workflow_header')}")
+    flow_cols = st.columns(3)
+    cards = [
+        (t("workflow_prepare_title"), t("workflow_prepare_desc")),
+        (t("workflow_train_title"), t("workflow_train_desc")),
+        (t("workflow_eval_title"), t("workflow_eval_desc")),
+    ]
+    for col, (title, desc) in zip(flow_cols, cards):
+        with col:
+            st.markdown(
+                f"""
+                <div class="info-card">
+                    <h4>{escape(title)}</h4>
+                    <p>{escape(desc)}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-    st.subheader(t("example_results"))
+    quick_col, preset_col = st.columns([1.15, 0.85])
+    with quick_col:
+        st.markdown(f"### {t('quick_start')}")
+        st.code(
+            "MODEL_SIZE=middle \\\n"
+            "DATA_DIR=/path/to/dataset \\\n"
+            "OUTPUT_DIR=runs/middle_exp \\\n"
+            "TRAIN_PROFILE=auto \\\n"
+            "bash start_train.sh",
+            language="bash",
+        )
+        st.caption(t("monitoring_note"))
+        with st.expander(t("setup_header")):
+            st.markdown(t("setup_desc"))
+            st.markdown(f"**{t('install_dependencies')}:**")
+            st.code("python3 -m pip install -r requirements.txt", language="bash")
+            st.markdown(f"**{t('ui_command')}:**")
+            st.code("python3 main.py --mode ui", language="bash")
+
+    with preset_col:
+        st.markdown(f"### {t('preset_overview')}")
+        for preset_name in ["small", "middle", "max"]:
+            preset = load_preset_summary(preset_name)
+            st.markdown(
+                f"""
+                <div class="preset-card">
+                    <strong>{escape(preset_name)}</strong>
+                    <p>{escape(str(preset['description']))}</p>
+                    <p>{escape(t('target_vram'))}: {escape(str(preset['target_vram_gb']))} GB ·
+                    {escape(t('preset_resolution'))}: {escape(str(preset['resolution']))} ·
+                    {escape(t('effective_batch'))}: {escape(str(preset['effective_batch']))}</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown(f"### {t('example_results')}")
     c1, c2 = st.columns(2)
-    
-    # Load example images safely
     fake_path = "examples/fake.png"
     real_path = "examples/real.png"
-    
+
     with c1:
         if os.path.exists(fake_path):
             st.image(fake_path, caption=t("synthesized_input"), use_container_width=True)
         else:
             st.info("Example image (fake.png) not found.")
-            
+
     with c2:
         if os.path.exists(real_path):
             st.image(real_path, caption=t("ground_truth"), use_container_width=True)
@@ -581,8 +928,11 @@ def home_page():
     st.info(t("home_tip"))
 
 def dataset_page():
-    st.header(t("dataset_header"))
-    st.markdown(t("dataset_sub"))
+    render_intro_card(
+        t("dataset_header"),
+        t("dataset_sub"),
+        badges=["our485/high", ".prepared", "train_manifest.jsonl"],
+    )
     
     with st.expander(t("how_it_works"), expanded=False):
         st.markdown(t("darker_desc"))
@@ -624,6 +974,18 @@ def dataset_page():
 
     cache_summary = summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed)
     render_prepared_cache_summary(cache_summary)
+    preview_cmd = build_prepare_command(
+        config_path=f"configs/train/{model_scale}.yaml",
+        data_dir=data_dir,
+        prepared_cache_dir=prepared_cache_dir,
+        variant_count=variant_count,
+        prepare_workers=prepare_workers,
+        synthesis_seed=synthesis_seed,
+        prepare_force=prepare_force,
+        darker_ranges_text=darker_ranges_text,
+    )
+    with st.expander(t("command_preview"), expanded=False):
+        st.code(shlex.join(preview_cmd), language="bash")
 
     if prepare_btn:
         if not os.path.exists(data_dir):
@@ -653,7 +1015,11 @@ def dataset_page():
             st.code((result.stdout or "") + ("\n" + result.stderr if result.stderr else ""), language="bash")
 
 def training_page():
-    st.header(t("train_dashboard"))
+    render_intro_card(
+        t("train_dashboard"),
+        t("train_desc"),
+        badges=["small", "middle", "max"],
+    )
     
     # --- Sidebar Status ---
     with st.sidebar:
@@ -662,11 +1028,15 @@ def training_page():
             st.success(f"{t('running')} (PID: {st.session_state.training_pid})")
             if st.button(t("stop"), type="primary"):
                 try:
-                    os.kill(st.session_state.training_pid, signal.SIGTERM)
-                    st.session_state.training_pid = None
+                    training_pgid = st.session_state.get("training_pgid")
+                    if training_pgid:
+                        os.killpg(training_pgid, signal.SIGTERM)
+                    else:
+                        os.kill(st.session_state.training_pid, signal.SIGTERM)
+                    clear_training_state()
                     st.rerun()
                 except:
-                    st.session_state.training_pid = None
+                    clear_training_state()
         else:
             st.info(t("idle"))
 
@@ -687,11 +1057,8 @@ def training_page():
                 use_retinex = st.checkbox(t("use_retinex"), value=True, help="Highly recommended for low-light tasks.")
                 model_scale_options = ["small", "middle", "max"]
                 model_scale = st.selectbox(t("model_scale"), model_scale_options, index=1)
-                default_resolution = {
-                    "small": 256,
-                    "middle": 256,
-                    "max": 512,
-                }[model_scale]
+                preset_summary = load_preset_summary(model_scale)
+                default_resolution = int(preset_summary["resolution"]) if str(preset_summary["resolution"]).isdigit() else 256
                 res = st.selectbox(t("resolution"), [256, 320, 512], index=[256, 320, 512].index(default_resolution))
             
             with c2:
@@ -699,7 +1066,8 @@ def training_page():
                 epochs = st.number_input(t("epochs"), value=50, min_value=1)
                 batch_size = st.number_input(t("batch_size"), value=4, min_value=1)
                 lr = st.number_input(t("lr"), value=1e-4, format="%.1e", step=1e-5)
-                train_profile = st.selectbox(t("train_profile"), ["auto"], index=0)
+                train_profile_options = ["auto", "debug_online"]
+                train_profile = st.selectbox(t("train_profile"), train_profile_options, index=0)
                 st.subheader(t("prepared_settings"))
                 variant_count = st.number_input(t("variant_count"), min_value=1, max_value=8, value=3)
                 prepare_workers = st.number_input(t("prepare_workers"), min_value=1, max_value=64, value=recommended_prepare_workers())
@@ -718,8 +1086,43 @@ def training_page():
             prepare_btn = button_cols[0].form_submit_button(t("prepare_dataset"))
             train_btn = button_cols[1].form_submit_button(t("launch_train"), type="primary")
 
+        preset_summary = load_preset_summary(model_scale)
         cache_summary = summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed)
+        effective_batch = int(batch_size) * int(preset_summary.get("gradient_accumulation_steps", 1))
+        summary_cols = st.columns(4)
+        summary_cols[0].metric(t("target_vram"), f"{preset_summary['target_vram_gb']} GB")
+        summary_cols[1].metric(t("preset_resolution"), str(preset_summary["resolution"]))
+        summary_cols[2].metric(t("effective_batch"), effective_batch)
+        summary_cols[3].metric(t("prepared_status"), t(f"status_{cache_summary['status']}"))
+        st.caption(f"{t('preset_description')}: {preset_summary['description']}")
+
         render_prepared_cache_summary(cache_summary)
+        if effective_batch < 16:
+            st.warning(f"{t('recommended_effective_batch')}: 16")
+        else:
+            st.caption(f"{t('recommended_effective_batch')}: 16")
+
+        train_cmd_preview = build_train_command(
+            model_scale=model_scale,
+            data_dir=data_dir,
+            output_dir=output_dir,
+            resolution=res,
+            batch_size=batch_size,
+            epochs=epochs,
+            lr=lr,
+            train_profile=train_profile,
+            variant_count=variant_count,
+            prepare_workers=prepare_workers,
+            synthesis_seed=synthesis_seed,
+            use_retinex=use_retinex,
+            resume=resume,
+            prepared_cache_dir=prepared_cache_dir,
+            prepare_force=prepare_force,
+            darker_ranges_text=darker_ranges_text,
+        )
+        with st.expander(t("command_preview"), expanded=False):
+            st.code(shlex.join(train_cmd_preview), language="bash")
+
         if prepare_btn:
             if not os.path.exists(data_dir):
                 st.error(f"❌ Directory not found: {data_dir}")
@@ -746,31 +1149,24 @@ def training_page():
     
     # --- Launch Logic ---
     if train_btn and not st.session_state.training_pid:
-        # Use accelerate launch for mixed precision / distributed support
-        cmd = [
-            "accelerate", "launch", "main.py", "--mode", "train",
-            "--config", f"configs/train/{model_scale}.yaml",
-            "--data_dir", data_dir,
-            "--output_dir", output_dir,
-            "--resolution", str(res),
-            "--batch_size", str(batch_size),
-            "--epochs", str(epochs),
-            "--lr", str(lr),
-            "--train_profile", train_profile,
-            "--offline_variant_count", str(variant_count),
-            "--prepare_workers", str(prepare_workers),
-            "--synthesis_seed", str(synthesis_seed),
-        ]
-
-        if use_retinex: cmd.append("--use_retinex")
-        if resume:
-            cmd.extend(["--resume", resume])
-        if prepared_cache_dir:
-            cmd.extend(["--prepared_cache_dir", prepared_cache_dir])
-        if prepare_force:
-            cmd.append("--prepare_force")
-        if darker_ranges_text.strip():
-            cmd.extend(["--darker_ranges", darker_ranges_text])
+        cmd = build_train_command(
+            model_scale=model_scale,
+            data_dir=data_dir,
+            output_dir=output_dir,
+            resolution=res,
+            batch_size=batch_size,
+            epochs=epochs,
+            lr=lr,
+            train_profile=train_profile,
+            variant_count=variant_count,
+            prepare_workers=prepare_workers,
+            synthesis_seed=synthesis_seed,
+            use_retinex=use_retinex,
+            resume=resume,
+            prepared_cache_dir=prepared_cache_dir,
+            prepare_force=prepare_force,
+            darker_ranges_text=darker_ranges_text,
+        )
         
         os.makedirs(output_dir, exist_ok=True)
         log_file = os.path.join(output_dir, "train_ui_log.txt")
@@ -782,9 +1178,19 @@ def training_page():
         st.session_state.training_status_file = status_file
         
         try:
-            # Start subprocess
-            process = subprocess.Popen(cmd, stdout=open(log_file, "w"), stderr=subprocess.STDOUT)
+            with open(log_file, "w", encoding="utf-8") as log_handle:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+                )
             st.session_state.training_pid = process.pid
+            if hasattr(os, "getpgid"):
+                try:
+                    st.session_state.training_pgid = os.getpgid(process.pid)
+                except OSError:
+                    st.session_state.training_pgid = None
             st.success(t("train_launched"))
             time.sleep(1) # Wait for startup
             st.rerun()
@@ -794,12 +1200,13 @@ def training_page():
     # --- Monitoring Tab ---
     with tab_monitor:
         if not st.session_state.training_pid and not st.session_state.training_csv_file:
-            st.info("Start training to see metrics.")
+            st.info(t("start_training_hint"))
         else:
             # Auto-refresh toggle
             col_controls = st.container()
             with col_controls:
-                auto_refresh = st.toggle("🔄 Auto Refresh (5s)", value=False, help="Automatically refresh metrics and logs every 5 seconds.")
+                auto_refresh = st.toggle(t("auto_refresh"), value=False, help=t("auto_refresh_help"))
+                st.caption(t("monitoring_note"))
                 
             # Layout: Left (Logs), Right (Charts)
             c_logs, c_charts = st.columns([1, 1])
@@ -855,11 +1262,11 @@ def training_page():
                                 fig_timing = px.line(time_df, x='step', y='seconds', color='component', title='Data vs Compute Time', template="plotly_white")
                                 st.plotly_chart(fig_timing, use_container_width=True)
                         else:
-                            st.warning(t("Waiting for data points..."))
+                            st.warning(t("waiting_for_data_points"))
                     except Exception as e:
                         st.caption(f"Reading metrics... ({e})")
                 else:
-                    st.info(t("Initializing metrics log..."))
+                    st.info(t("initializing_metrics_log"))
 
             # Auto-refresh logic
             if auto_refresh and st.session_state.training_pid:
@@ -869,21 +1276,24 @@ def training_page():
             # Check process status
             if st.session_state.training_pid:
                 try:
-                    os.kill(st.session_state.training_pid, 0)
+                    training_pgid = st.session_state.get("training_pgid")
+                    if training_pgid:
+                        os.killpg(training_pgid, 0)
+                    else:
+                        os.kill(st.session_state.training_pid, 0)
                 except OSError:
                     st.warning(t("process_finished"))
-                    st.session_state.training_pid = None
+                    clear_training_state()
                     st.rerun()
 
 def evaluation_page():
-    st.header(t("eval_header"))
-    st.markdown(t("eval_desc"))
+    render_intro_card(t("eval_header"), t("eval_desc"), badges=["PSNR", "SSIM", "LPIPS"])
     
     with st.form("eval_form"):
         c1, c2 = st.columns(2)
         with c1:
             model_path = folder_selector(t("model_ckpt"), "eval_model", "run_diffusion_experiment")
-            data_dir = folder_selector(t("dataset"), "eval_data", "../datasets/kitti_LOL")
+            data_dir = folder_selector(t("dataset_root"), "eval_data", "../datasets/kitti_LOL")
         with c2:
             out_dir = st.text_input(t("output_folder"), value="eval_results")
             use_retinex = st.checkbox(t("use_retinex"), value=True)
@@ -925,17 +1335,17 @@ def evaluation_page():
                         elif "SSIM" in key: m_cols[1].metric("SSIM", f"{numeric_val:.4f}")
                         elif "LPIPS" in key: m_cols[2].metric("LPIPS", f"{numeric_val:.4f}")
         else:
-            st.error("Evaluation Failed")
+            st.error(t("evaluation_failed"))
             st.code(result.stderr)
 
 def visualization_page():
-    st.header(t("vis_header"))
+    render_intro_card(t("vis_header"), t("vis_desc"))
     
     # Import visual logic dynamically
     try:
         from scripts.visual_val import load_models, run_inference, tensor_to_pil, plot_histogram
     except ImportError:
-        st.error("Dependencies missing (scripts/visual_val.py).")
+        st.error(t("dependencies_missing"))
         return
 
     with st.sidebar:
@@ -950,11 +1360,11 @@ def visualization_page():
     try:
         models = load_models(model_path, use_retinex, device)
     except Exception as e:
-        st.error(f"Load failed: {e}")
+        st.error(f"{t('load_failed')}: {e}")
         return
 
     # Select Data
-    data_path = folder_selector(t("dataset"), "vis_data", "../datasets/kitti_LOL")
+    data_path = folder_selector(t("dataset_root"), "vis_data", "../datasets/kitti_LOL")
     test_low = os.path.join(data_path, "eval15", "low")
     
     if os.path.exists(test_low):
@@ -997,11 +1407,10 @@ def visualization_page():
             
             st.info(f"{t('displaying')}: {sel_file}")
     else:
-        st.warning(t("Dataset path invalid."))
+        st.warning(t("dataset_path_invalid"))
 
 def configuration_page():
-    st.header(t("accelerate_config_header"))
-    st.markdown(t("accelerate_config_desc"))
+    render_intro_card(t("accelerate_config_header"), t("accelerate_config_desc"))
 
     # Check for existing config
     config_path = "accelerate_config.yaml"
@@ -1061,7 +1470,7 @@ def configuration_page():
         except Exception as e:
             st.error(f"Error saving config: {e}")
             
-    st.info("💡 **Tip:** This config file (`accelerate_config.yaml`) will be used when launching training.")
+    st.info(t("config_tip"))
 
 # --- Main Nav ---
 with st.sidebar:
@@ -1072,7 +1481,8 @@ with st.sidebar:
         t("dataset"): "Dataset Preparation",
         t("training"): "Training",
         t("evaluation"): "Evaluation",
-        t("visualization"): "Visualization"
+        t("visualization"): "Visualization",
+        t("configuration"): "Configuration",
     }
     selected_nav = st.radio("", list(nav_options.keys()), label_visibility="collapsed")
     page = nav_options[selected_nav]
@@ -1082,3 +1492,4 @@ elif page == "Dataset Preparation": dataset_page()
 elif page == "Training": training_page()
 elif page == "Evaluation": evaluation_page()
 elif page == "Visualization": visualization_page()
+elif page == "Configuration": configuration_page()

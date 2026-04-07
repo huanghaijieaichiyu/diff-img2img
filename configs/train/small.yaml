@@ -63,7 +63,7 @@ loss:
   retinex_exposure_weight: 0.1
   x0_loss_weight: 0.18
   x0_loss_t_max: 180
-  x0_loss_warmup_steps: 1600
+  x0_loss_warmup_steps: 250
   residual_scale: 0.5
 
 schedule:
@@ -71,8 +71,8 @@ schedule:
   validation_steps: 500
   max_train_steps:
   freeze_decom_steps: 0
-  decom_warmup_steps: 2000
-  joint_retinex_ramp_steps: 1200
+  decom_warmup_steps: 300
+  joint_retinex_ramp_steps: 200
 
 evaluation:
   num_inference_steps: 8

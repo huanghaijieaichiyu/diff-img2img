@@ -40,7 +40,7 @@ optimization:
   gradient_accumulation_steps: 2
   lr: 1.0e-4
   lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 1000
+  lr_warmup_steps: 500
   grad_clip_norm: 5.0
 
 loss:
@@ -53,20 +53,20 @@ loss:
   retinex_exposure_weight: 0.1
   x0_loss_weight: 0.25
   x0_loss_t_max: 256
-  x0_loss_warmup_steps: 3000
+  x0_loss_warmup_steps: 300
   residual_scale: 0.5
 
 schedule:
-  checkpointing_steps: 1000
+  checkpointing_steps: 500
   validation_steps: 500
   max_train_steps:
   freeze_decom_steps: 0
-  decom_warmup_steps: 5000
-  joint_retinex_ramp_steps: 2000
+  decom_warmup_steps: 400
+  joint_retinex_ramp_steps: 200
 
 evaluation:
   num_inference_steps: 8
-  benchmark_inference_steps: [8, 20]
-  num_validation_images: 24
+  benchmark_inference_steps: [8, 16]
+  num_validation_images: 4
   semantic_backbone: resnet18
   nr_metric: niqe

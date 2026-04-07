@@ -16,6 +16,11 @@ runtime:
   prepare_force: false
   synthesis_seed: 42
   darker_ranges:
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: true
+  decode_cache_size: 24
+  opencv_threads_per_worker: 1
 
 model:
   architecture_scale: middle
@@ -55,7 +60,7 @@ loss:
   retinex_exposure_weight: 0.1
   x0_loss_weight: 0.18
   x0_loss_t_max: 192
-  x0_loss_warmup_steps: 1800
+  x0_loss_warmup_steps: 400
   residual_scale: 0.5
 
 schedule:
@@ -63,8 +68,8 @@ schedule:
   validation_steps: 500
   max_train_steps:
   freeze_decom_steps: 0
-  decom_warmup_steps: 2500
-  joint_retinex_ramp_steps: 1500
+  decom_warmup_steps: 500
+  joint_retinex_ramp_steps: 300
 
 evaluation:
   num_inference_steps: 8

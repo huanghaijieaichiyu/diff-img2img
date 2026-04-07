@@ -14,7 +14,7 @@ if __name__ == "__main__":
     os.environ["FROZEN_APP_PATH"] = resolve_path(".")
     
     # Path to your streamlit app
-    app_path = resolve_path("app.py")
+    app_path = resolve_path(os.path.join("ui", "app.py"))
     
     sys.argv = [
         "streamlit",

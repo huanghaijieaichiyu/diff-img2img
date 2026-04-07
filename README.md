@@ -1,216 +1,184 @@
-# Diff-Img2Img: Low-Light Image Enhancement with Retinex-Diffusion
+# Diff-Img2Img
 
-[![Model Download](https://img.shields.io/badge/Model%20Download-Cloud-blue?style=flat-square&logo=icloud)](https://cloud.189.cn/web/share?code=AJ7fUzBbuUzm) (Access Code: q2u9)
+[![Model Download](https://img.shields.io/badge/Model%20Download-Cloud-blue?style=flat-square&logo=icloud)](https://cloud.189.cn/web/share?code=AJ7fUzBbuUzm) (Access Code: `q2u9`)
 
-A **Conditional Diffusion Model** framework for low-light image enhancement, integrating **Retinex Theory** for physically-grounded illumination decomposition. Built with PyTorch and 🤗 Diffusers.
+Diff-Img2Img is a low-light image enhancement project built around a Retinex-guided conditional diffusion pipeline. The current training flow is preset-driven, uses a prepared offline low-light cache, and ships with a Streamlit studio for dataset preparation, training monitoring, evaluation, and qualitative visualization.
 
-## 🆕 Latest Updates (2026-04-06)
+## What Is In This Repo
 
-**SOTA Improvements Implemented:**
-- ✅ P0 fixes: Smooth Retinex loss ramp + corrected EMA timing
-- ✅ P1 enhancements: Charbonnier diffusion loss + cosine warmup + adaptive EMA
-- ✅ Architecture: NAFNet decomposition + Cross-Attention conditioning
-- ✅ Training engine: Min-SNR / P2 / EDM weighting support + optional uncertainty-based loss balancing
+- Retinex + diffusion training and inference entrypoint in `main.py`
+- Official training presets in `configs/train/{small,middle,max}.yaml`
+- Offline prepared-cache builder that regenerates low-light variants from `our485/high`
+- Streamlit UI in `ui/app.py`
+- Convenience launcher in `start_train.sh`
 
-**Expected improvements:** +30% stability, +15% convergence speed, +0.5-1.0 dB PSNR
+## Presets
 
-📚 See [IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md) for details.
+| Preset | Target VRAM | Default Resolution | Notes |
+| --- | --- | --- | --- |
+| `small` | 6 GB | 256 | Compact preset for 6-8 GB GPUs with lighter conditioning and effective batch 8 |
+| `middle` | 8 GB | 256 | Recommended preset with NAF decomposition and deep-only cross-attention conditioning |
+| `max` | 64 GB | 512 | High-capacity preset for maximum quality runs |
 
-## ✨ Key Features
+All three presets are versioned YAML configs under `configs/train/` and can also be passed directly to `--config`.
 
-| Feature | Description |
-|---------|-------------|
-| **Retinex-Diffusion Architecture** | DecomNet decomposes images into Reflectance/Illumination, conditioning the diffusion UNet |
-| **SOTA Training** | Preset-driven training with cosine warmup, adaptive EMA, smooth Retinex ramps |
-| **Physics-Based Synthesis** | Poisson-Gaussian noise, headlights, vignetting, motion blur, JPEG artifacts |
-| **Prepared Multi-Variant Cache** | Training auto-builds a 3-variant offline low-light cache from `our485/high` when prepared data is missing |
-| **Advanced Losses** | Charbonnier + SSIM + LPIPS with uncertainty weighting |
-| **Web UI Studio** | Streamlit dashboard for training, evaluation, and visualization |
-
-## 🖼️ Gallery
-
-|          Input (Low Light)          |      Output (Enhanced)      |
-| :------------------------------: | :------------------------------: |
-| ![Low Light](examples/fake.png) | ![Enhanced](examples/real.png) |
-
-## 🛠️ Requirements
-
-- Python 3.10+
-- PyTorch 2.0+ with CUDA
-- 8GB VRAM recommended for full training (`middle`)
-- 6GB VRAM is enough for the compact official preset (`small`)
-
-## 🚀 Quick Start
+## Quick Start
 
 ```bash
-# 1. Setup
-git clone https://github.com/yourusername/diff-img2img.git
-cd diff-img2img
-conda create -n diff-img2img python=3.10 && conda activate diff-img2img
-pip install -r requirements.txt
+# 1. Environment
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -r requirements.txt
 accelerate config default
 
-# 2. Train with the recommended 8GB preset
+# 2. Train with the recommended preset
 MODEL_SIZE=middle \
 DATA_DIR=/path/to/dataset \
 OUTPUT_DIR=runs/middle_exp \
 TRAIN_PROFILE=auto \
 bash start_train.sh
 
-# 3. Predict
-python main.py --mode predict \
-    --model_path runs/middle_exp \
-    --data_dir test_images/ \
-    --output_dir predictions
+# 3. Launch the UI studio
+python3 main.py --mode ui
 ```
 
-## 📋 Configuration Presets
+## Dataset And Prepared Cache
 
-| Config | VRAM | Features | Use Case |
-|--------|------|----------|----------|
-| `small` | ~6GB | Compact NAF + deep-only cross-attention preset | Best fit for 6-8GB GPUs |
-| `middle` | ~8GB | NAF decomposition + stronger conditioner + effective batch 8 | **Recommended full-training preset** |
-| `max` | 64GB+ | Transformer refinement, global context | Maximum quality |
+Training expects paired data under a dataset root such as:
 
-## 💻 Training
+```text
+<data_dir>/
+  our485/
+    high/
+  eval15/
+    low/
+    high/
+```
+
+Before the first epoch, training validates or builds a prepared cache under:
+
+```text
+<data_dir>/.prepared/
+  prepare_meta.json
+  train_manifest.jsonl
+  our485/low/...
+```
+
+Key points:
+
+- Training consumes the prepared cache, not a single pre-existing `our485/low` folder.
+- If the cache is missing or stale, `train` will rebuild it automatically.
+- Interrupted prepare runs can resume as long as the metadata still matches the requested settings.
+
+To prepare the cache explicitly:
 
 ```bash
-# Recommended wrapper (uses accelerate launch internally)
+python3 main.py --mode prepare \
+  --config configs/train/middle.yaml \
+  --data_dir /path/to/dataset \
+  --offline_variant_count 3 \
+  --prepare_workers 4 \
+  --synthesis_seed 42
+```
+
+## Training
+
+The recommended way to launch training is the wrapper script:
+
+```bash
 MODEL_SIZE=middle \
 DATA_DIR=/path/to/dataset \
 OUTPUT_DIR=runs/exp \
 TRAIN_PROFILE=auto \
+PREPARE_WORKERS=4 \
+OFFLINE_VARIANT_COUNT=3 \
+SYNTHESIS_SEED=42 \
 bash start_train.sh
-
-# Equivalent raw command
-accelerate launch main.py --mode train \
-    --config configs/train/middle.yaml \
-    --data_dir /path/to/dataset \
-    --output_dir runs/exp \
-    --train_profile auto
-
-# Build or rebuild the prepared multi-variant cache explicitly
-python main.py --mode prepare \
-    --config configs/train/middle.yaml \
-    --data_dir /path/to/dataset \
-    --offline_variant_count 3
 ```
 
-**Key flags:**
-- `--config`: Model preset or YAML path. Recommended full run: `configs/train/middle.yaml`
-- `--train_profile`: `auto` for normal training
-- `start_train.sh`: convenience entrypoint that reads `MODEL_SIZE`, `DATA_DIR`, `OUTPUT_DIR`, and `TRAIN_PROFILE`
-- training now only consumes prepared multi-variant low-light data; single-variant `our485/low` is not treated as ready-to-train
-- if `.prepared/train_manifest.jsonl` or `.prepared/prepare_meta.json` is missing/stale, training first regenerates a 3-variant offline cache from `our485/high`
-- the prepare step now prints scan/build progress, supports interruption, and resumes from missing variants on the next run when metadata still matches
-- `--mode prepare`: run the same offline cache builder without starting training
-- `--offline_variant_count`: target number of prepared low-light variants per training image (default: `3`)
-- `--prepare_force`: force rebuilding the prepared cache
-- `--use_retinex`: enabled by the training presets already; keep it on unless you are doing ablations
-- `--ema` / `--no-ema`: EMA model (default: on with adaptive decay)
-- `--mixed_precision`: fp16/bf16/no (default: fp16)
+Environment variables understood by `start_train.sh`:
 
-## 🔬 Validation & Prediction
+- `MODEL_SIZE`: `small`, `middle`, or `max`
+- `DATA_DIR`: dataset root
+- `OUTPUT_DIR`: run directory
+- `TRAIN_PROFILE`: `auto` or `debug_online`
+- `CONFIG_PATH`: optional explicit YAML path override
+- `PREPARED_CACHE_DIR`: optional cache override, defaults to `<DATA_DIR>/.prepared`
+- `PREPARE_WORKERS`: worker count for offline cache generation
+- `OFFLINE_VARIANT_COUNT`: number of synthetic low-light variants per training image
+- `SYNTHESIS_SEED`: base seed for offline synthesis
+- `PREPARE_FORCE`: set to `1` to rebuild the cache from scratch
+
+Equivalent raw command:
 
 ```bash
-# Validate
-python main.py --mode validate \
-    --model_path runs/exp \
-    --data_dir /path/to/dataset
-
-# Predict images
-python main.py --mode predict \
-    --model_path runs/exp \
-    --data_dir test_images/ \
-    --output_dir results/
-
-# Predict video
-python main.py --mode predict \
-    --model_path runs/exp \
-    --video_path input.mp4 \
-    --output_dir video_results/
+python3 -m accelerate.commands.launch main.py --mode train \
+  --config configs/train/middle.yaml \
+  --data_dir /path/to/dataset \
+  --output_dir runs/exp \
+  --train_profile auto
 ```
 
-## 🎨 Web UI
+## Validation And Prediction
 
 ```bash
-python main.py --mode ui
-# Opens Streamlit dashboard at http://localhost:8501
+# Quantitative validation
+python3 main.py --mode validate \
+  --model_path runs/exp \
+  --data_dir /path/to/dataset \
+  --output_dir runs/exp_eval
+
+# Image prediction
+python3 main.py --mode predict \
+  --model_path runs/exp \
+  --data_dir /path/to/test_images \
+  --output_dir predictions
+
+# Video prediction
+python3 main.py --mode predict \
+  --model_path runs/exp \
+  --video_path input.mp4 \
+  --output_dir video_results
 ```
 
-## 📚 Documentation
+## Web UI
 
-- [IMPROVEMENTS_SUMMARY.md](IMPROVEMENTS_SUMMARY.md) - Quick overview of SOTA improvements
-- [P0_P1_FIXES_REPORT.md](P0_P1_FIXES_REPORT.md) - Detailed P0/P1 fixes
-- [SOTA_IMPROVEMENTS_REPORT.md](SOTA_IMPROVEMENTS_REPORT.md) - Complete SOTA report
-- [TRAINING_LOGIC_REVIEW.md](TRAINING_LOGIC_REVIEW.md) - Training logic analysis
-- [CHANGELOG.md](CHANGELOG.md) - Version history
-- [notebooks/train_test_notebook.ipynb](notebooks/train_test_notebook.ipynb) - End-to-end notebook walkthrough for dataset prep, training, inference, and evaluation
+The Streamlit studio provides:
 
-## 🏗️ Architecture
+- prepared-cache inspection and manual rebuild
+- preset-aware training launch
+- live logs and metric plots from `training_metrics.csv`
+- validation entrypoints
+- single-image visualization on `eval15`
 
-```
-Input (Low-Light) 
-    ↓
-Retinex Decomposition (NAFNet/U-Net)
-    ├─ Reflectance (R)
-    └─ Illumination (I)
-    ↓
-Condition Adapter (FiLM + Cross-Attention)
-    ↓
-Diffusion UNet (v-prediction)
-    ↓
-Enhanced Output
+Start it with either of the following:
+
+```bash
+python3 main.py --mode ui
+python3 run_app.py
 ```
 
-## 📊 Training Details
+Default URL: `http://localhost:8501`
 
-**Loss Functions:**
-- Diffusion: Charbonnier + EDM weighting
-- X0 reconstruction: Charbonnier + SSIM + LPIPS (uncertainty weighted)
-- Retinex: Reconstruction + consistency + exposure + TV
+## Repo Layout
 
-**Optimization:**
-- Optimizer: AdamW (lr=1e-4, betas=(0.9, 0.999))
-- Scheduler: Cosine annealing with warmup
-- EMA: Adaptive decay (0.95 → 0.9999)
-- Gradient clipping: 4.0
-
-**Training Stages:**
-1. Retinex warmup (optional): Train decomposition network
-2. Joint training: Train diffusion + decomposition together
-
-## 🎯 Performance
-
-Expected improvements with SOTA configurations:
-- Training stability: +30%
-- Convergence speed: +15%
-- Final PSNR: +0.5-1.0 dB vs baseline
-
-## 📝 Citation
-
-```bibtex
-@article{diff-img2img,
-  title={Diff-Img2Img: Low-Light Image Enhancement with Retinex-Diffusion},
-  author={Your Name},
-  year={2026}
-}
+```text
+configs/train/      preset YAMLs
+core/               engine and training logic
+datasets/           data preparation helpers
+models/             Retinex, conditioning, diffusion modules
+scripts/            utilities and visualization helpers
+ui/                 Streamlit app
+main.py             unified CLI entrypoint
+start_train.sh      shell wrapper for training
 ```
 
-## 📄 License
+## Example Gallery
 
-See [LICENCE](LICENCE) file.
+| Input | Output |
+| :---: | :---: |
+| ![Low Light](examples/fake.png) | ![Enhanced](examples/real.png) |
 
-## 🙏 Acknowledgments
+## License
 
-Built with:
-- [PyTorch](https://pytorch.org/)
-- [🤗 Diffusers](https://github.com/huggingface/diffusers)
-- [Accelerate](https://github.com/huggingface/accelerate)
-- [Streamlit](https://streamlit.io/)
-
-SOTA improvements inspired by:
-- EDM (Karras et al., 2022)
-- NAFNet (Chen et al., 2022)
-- Min-SNR (Hang et al., 2023)
-- Stable Diffusion (Rombach et al., 2022)
+See [LICENCE](LICENCE).

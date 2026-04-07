@@ -99,6 +99,11 @@ class DiffusionEngine:
         if args.seed is not None:
             set_seed(args.seed)
 
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
+
         if self.accelerator.is_main_process:
             os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1127,13 +1132,19 @@ class DiffusionEngine:
             phase="test",
             decode_cache_size=getattr(self.args, "decode_cache_size", 0),
         )
-        eval_dataloader = DataLoader(
-            eval_dataset,
-            batch_size=self.args.batch_size,
-            shuffle=False,
-            num_workers=self.args.num_workers,
-            pin_memory=bool(getattr(self.args, "pin_memory", True)),
-        )
+        eval_loader_kwargs = {
+            "batch_size": self.args.batch_size,
+            "shuffle": False,
+            "num_workers": self.args.num_workers,
+            "pin_memory": bool(getattr(self.args, "pin_memory", True)),
+            "worker_init_fn": self._worker_init_fn,
+        }
+        if self.args.num_workers > 0:
+            eval_loader_kwargs.update({
+                "persistent_workers": bool(getattr(self.args, "persistent_workers", True)),
+                "prefetch_factor": max(2, int(getattr(self.args, "prefetch_factor", 4))),
+            })
+        eval_dataloader = DataLoader(eval_dataset, **eval_loader_kwargs)
         eval_dataloader = self.accelerator.prepare(eval_dataloader)
         unwrapped = self.accelerator.unwrap_model(self.training_model)
         unet = unwrapped.unet
