@@ -14,6 +14,12 @@ from utils.project_config import (
 )
 
 MIN_EFFECTIVE_BATCH_SIZE = 16
+CPU_BOUND_CROSS_MOUNT_DEFAULTS = {
+    "prefetch_factor": 2,
+    "decode_cache_size": 32,
+    "validation_steps": 2000,
+    "num_validation_images": 6,
+}
 
 
 @dataclass(frozen=True)
@@ -176,6 +182,79 @@ def _normalize_darker_ranges_arg(darker_ranges):
     raise TypeError(f"Unsupported darker_ranges type: {type(darker_ranges)!r}")
 
 
+def _normalize_validation_metrics_arg(metrics):
+    if metrics in (None, "", []):
+        return None
+    if isinstance(metrics, str):
+        metrics = [part.strip() for part in metrics.replace(",", " ").split() if part.strip()]
+    normalized = []
+    for metric in metrics:
+        metric_name = str(metric).strip().lower()
+        if metric_name:
+            normalized.append(metric_name)
+    return normalized or None
+
+
+def _normalize_step_counts_arg(step_counts):
+    if step_counts in (None, "", []):
+        return None
+    if isinstance(step_counts, str):
+        step_counts = [part.strip() for part in step_counts.replace(",", " ").split() if part.strip()]
+    normalized = []
+    for step_count in step_counts:
+        value = int(step_count)
+        if value > 0 and value not in normalized:
+            normalized.append(value)
+    return normalized or None
+
+
+def _looks_cross_mounted(path: str | None) -> bool:
+    if not path:
+        return False
+    return os.path.abspath(path).startswith("/mnt/")
+
+
+def _collect_explicit_cli_destinations(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    option_to_dest = {}
+    for action in parser._actions:
+        for option_string in action.option_strings:
+            option_to_dest[option_string] = action.dest
+
+    explicit_dests: set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("-"):
+            continue
+        option = token.split("=", 1)[0]
+        dest = option_to_dest.get(option)
+        if dest:
+            explicit_dests.add(dest)
+    return explicit_dests
+
+
+def _apply_cross_mount_throughput_defaults(args):
+    if args.mode != "train":
+        args.cross_mount_warning_paths = []
+        args.cross_mount_tuning_applied = {}
+        return
+
+    active_cache_dir = getattr(args, "prepared_cache_dir", None) or os.path.join(args.data_dir, ".prepared")
+    slow_paths = [path for path in [args.data_dir, active_cache_dir] if _looks_cross_mounted(path)]
+    args.cross_mount_warning_paths = slow_paths
+    args.cross_mount_tuning_applied = {}
+    if not slow_paths:
+        return
+
+    explicit_dests = getattr(args, "_explicit_cli_dests", set())
+    for field_name, tuned_value in CPU_BOUND_CROSS_MOUNT_DEFAULTS.items():
+        if field_name in explicit_dests:
+            continue
+        if getattr(args, field_name, None) != tuned_value:
+            setattr(args, field_name, tuned_value)
+            args.cross_mount_tuning_applied[field_name] = tuned_value
+
+
 def apply_profile_defaults(args):
     profile = TRAIN_PROFILES[args.train_profile]
     for key, value in profile.__dict__.items():
@@ -217,6 +296,41 @@ def apply_profile_defaults(args):
         args.lpips_resize = None
     if getattr(args, "wavelet_loss_weight", None) is None:
         args.wavelet_loss_weight = 0.0
+    if getattr(args, "attention_backend", None) in ("", None):
+        args.attention_backend = "auto"
+    if getattr(args, "use_torch_compile", None) is None:
+        args.use_torch_compile = True
+    if getattr(args, "torch_compile_mode", None) in ("", None):
+        args.torch_compile_mode = "reduce-overhead"
+    if getattr(args, "allow_unsafe_compile_with_film", None) is None:
+        args.allow_unsafe_compile_with_film = False
+    if getattr(args, "train_fast_validation", None) is None:
+        args.train_fast_validation = True
+    args.train_validation_metrics = _normalize_validation_metrics_arg(getattr(args, "train_validation_metrics", None))
+    if args.train_validation_metrics is None:
+        args.train_validation_metrics = ["psnr", "ssim"]
+    args.train_validation_benchmark_steps = _normalize_step_counts_arg(
+        getattr(args, "train_validation_benchmark_steps", None)
+    )
+    if args.train_validation_benchmark_steps is None:
+        args.train_validation_benchmark_steps = list(dict.fromkeys([args.num_inference_steps]))
+
+    _apply_cross_mount_throughput_defaults(args)
+    if args.cross_mount_warning_paths:
+        joined_paths = ", ".join(args.cross_mount_warning_paths)
+        print(
+            "[throughput-warning] dataset or prepared cache appears to be on a cross-mounted path. "
+            f"Prefer a local Linux SSD for better throughput: {joined_paths}",
+            flush=True,
+        )
+        if args.cross_mount_tuning_applied:
+            applied = " ".join(
+                f"{field_name}={value}" for field_name, value in args.cross_mount_tuning_applied.items()
+            )
+            print(
+                f"[throughput-tuning] applied CPU-bound cross-mount defaults: {applied}",
+                flush=True,
+            )
 
     # Legacy compatibility
     if getattr(args, "use_ema", None) is None:
@@ -386,7 +500,11 @@ def get_args():
     _add_hidden_argument(parser, "--decom_base_channels", type=int)
     _add_hidden_argument(parser, "--decom_variant", type=str, choices=["small", "middle", "max", "naf", "naf_lite"])
     _add_hidden_argument(parser, "--condition_variant", type=str, choices=["small", "small_v2", "middle", "max", "max_v2", "cross_attn"])
+    _add_hidden_argument(parser, "--attention_backend", type=str, choices=["auto", "compile", "xformers", "native"])
     _add_hidden_argument(parser, "--enable_xformers_memory_efficient_attention", action="store_true", default=None)
+    _add_hidden_argument(parser, "--use_torch_compile", action=argparse.BooleanOptionalAction, default=None)
+    _add_hidden_argument(parser, "--torch_compile_mode", type=str, choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
+    _add_hidden_argument(parser, "--allow_unsafe_compile_with_film", action=argparse.BooleanOptionalAction, default=None)
     _add_hidden_argument(parser, "--benchmark_inference_steps", nargs="+", type=int)
     _add_hidden_argument(parser, "--num_workers", type=int)
     _add_hidden_argument(parser, "--prefetch_factor", type=int)
@@ -403,9 +521,14 @@ def get_args():
     _add_hidden_argument(parser, "--use_lpips", action=argparse.BooleanOptionalAction, default=None)
     _add_hidden_argument(parser, "--lpips_resize", type=int)
     _add_hidden_argument(parser, "--wavelet_loss_weight", type=float)
+    _add_hidden_argument(parser, "--train_fast_validation", action=argparse.BooleanOptionalAction, default=None)
+    _add_hidden_argument(parser, "--train_validation_metrics", nargs="+", type=str)
+    _add_hidden_argument(parser, "--train_validation_benchmark_steps", nargs="+", type=int)
 
     parser.set_defaults(**config_defaults)
+    explicit_cli_dests = _collect_explicit_cli_destinations(parser, sys.argv[1:])
     args = parser.parse_args()
+    args._explicit_cli_dests = explicit_cli_dests
     args.config = resolve_config_path(args.config)
     return apply_profile_defaults(args)
 

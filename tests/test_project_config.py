@@ -36,9 +36,49 @@ def test_build_preview_namespace_and_runtime_summary():
     assert summary["config_name"] == "middle"
     assert summary["effective_batch_size"] == 15
     assert summary["prepared_cache_dir"] == "/tmp/data/.prepared"
+    assert summary["train_fast_validation"] is None
 
 
 def test_load_preset_summary_matches_yaml_shape():
     summary = load_preset_summary("middle")
     assert summary["name"] == "middle"
     assert summary["effective_batch"] == summary["batch_size"] * summary["gradient_accumulation_steps"]
+
+
+def test_runtime_summary_includes_train_validation_fields():
+    summary = build_runtime_summary(
+        {
+            "mode": "train",
+            "config": "middle",
+            "config_name": "middle",
+            "data_dir": "/tmp/data",
+            "output_dir": "/tmp/run",
+            "train_fast_validation": True,
+            "train_validation_metrics": ["psnr", "ssim"],
+            "train_validation_benchmark_steps": [8],
+        }
+    )
+    assert summary["train_fast_validation"] is True
+    assert summary["train_validation_metrics"] == ["psnr", "ssim"]
+    assert summary["train_validation_benchmark_steps"] == [8]
+
+
+def test_runtime_summary_includes_backend_fields():
+    summary = build_runtime_summary(
+        {
+            "mode": "train",
+            "config": "small",
+            "config_name": "small",
+            "attention_backend": "auto",
+            "use_torch_compile": True,
+            "torch_compile_mode": "reduce-overhead",
+            "enable_xformers_memory_efficient_attention": True,
+            "unet_backend_resolved_backend": "xformers",
+        }
+    )
+
+    assert summary["attention_backend"] == "auto"
+    assert summary["use_torch_compile"] is True
+    assert summary["torch_compile_mode"] == "reduce-overhead"
+    assert summary["enable_xformers_memory_efficient_attention"] is True
+    assert summary["resolved_unet_backend"] == "xformers"

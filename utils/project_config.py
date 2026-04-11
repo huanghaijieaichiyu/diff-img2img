@@ -165,12 +165,20 @@ def build_runtime_summary(args: argparse.Namespace | SimpleNamespace | dict[str,
         "num_validation_images": payload.get("num_validation_images"),
         "num_inference_steps": payload.get("num_inference_steps"),
         "benchmark_inference_steps": benchmark_steps,
+        "train_fast_validation": payload.get("train_fast_validation"),
+        "train_validation_metrics": payload.get("train_validation_metrics"),
+        "train_validation_benchmark_steps": payload.get("train_validation_benchmark_steps"),
         "use_retinex": payload.get("use_retinex"),
         "conditioning_space": payload.get("conditioning_space"),
         "decom_variant": payload.get("decom_variant"),
         "condition_variant": payload.get("condition_variant"),
         "semantic_backbone": payload.get("semantic_backbone"),
         "nr_metric": payload.get("nr_metric"),
+        "attention_backend": payload.get("attention_backend"),
+        "use_torch_compile": payload.get("use_torch_compile"),
+        "torch_compile_mode": payload.get("torch_compile_mode"),
+        "enable_xformers_memory_efficient_attention": payload.get("enable_xformers_memory_efficient_attention"),
+        "resolved_unet_backend": payload.get("unet_backend_resolved_backend"),
         "resume": payload.get("resume"),
     }
     return summary
@@ -187,8 +195,13 @@ def runtime_summary_lines(summary: dict[str, Any], prefix: str = "[config-summar
         f"decode_cache_size:{summary.get('decode_cache_size')} opencv_threads_per_worker:{summary.get('opencv_threads_per_worker')}",
         f"{prefix} validation=steps:{summary.get('validation_steps')} num_validation_images:{summary.get('num_validation_images')} "
         f"num_inference_steps:{summary.get('num_inference_steps')} benchmark_inference_steps:{summary.get('benchmark_inference_steps')}",
+        f"{prefix} train_validation=fast:{summary.get('train_fast_validation')} "
+        f"metrics:{summary.get('train_validation_metrics')} steps:{summary.get('train_validation_benchmark_steps')}",
         f"{prefix} model=use_retinex:{summary.get('use_retinex')} decom_variant:{summary.get('decom_variant')} "
         f"condition_variant:{summary.get('condition_variant')} conditioning_space:{summary.get('conditioning_space')}",
+        f"{prefix} backend=requested:{summary.get('attention_backend')} compile:{summary.get('use_torch_compile')} "
+        f"compile_mode:{summary.get('torch_compile_mode')} xformers_requested:{summary.get('enable_xformers_memory_efficient_attention')} "
+        f"resolved:{summary.get('resolved_unet_backend')}",
     ]
 
 

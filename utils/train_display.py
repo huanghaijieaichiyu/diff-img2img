@@ -87,9 +87,9 @@ class RichTrainingDisplay:
         resources.add_column(justify="right")
         resources.add_row("cpu%", self._fmt(state.get("cpu_percent"), 1))
         resources.add_row("cpu_rss_gb", self._fmt(state.get("cpu_rss_gb"), 2))
-        resources.add_row("gpu_alloc_gb", self._fmt(state.get("gpu_allocated_gb"), 2))
-        resources.add_row("gpu_resv_gb", self._fmt(state.get("gpu_reserved_gb"), 2))
-        resources.add_row("gpu_max_gb", self._fmt(state.get("gpu_max_reserved_gb"), 2))
+        resources.add_row("gpu_alloc(active)", self._fmt(state.get("gpu_allocated_gb"), 2))
+        resources.add_row("gpu_resv(cache)", self._fmt(state.get("gpu_reserved_gb"), 2))
+        resources.add_row("gpu_peak_resv", self._fmt(state.get("gpu_max_reserved_gb"), 2))
 
         validation = Table.grid(expand=True)
         validation.add_column(justify="left")

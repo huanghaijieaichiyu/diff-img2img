@@ -10,7 +10,7 @@ Diff-Img2Img is a low-light image enhancement project built around a Retinex-gui
 - Official training presets in `configs/train/{small,middle,max}.yaml`
 - Offline prepared-cache builder that regenerates low-light variants from `our485/high`
 - Streamlit UI in `ui/app.py`
-- Convenience launcher in `start_train.sh`
+- Convenience launcher in `start_train.sh` backed by `utils/train_launcher.py`
 
 ## Presets
 
@@ -113,7 +113,7 @@ Environment variables understood by `start_train.sh`:
 - `RUN_FULL_EVAL_AFTER_TRAIN`: set to `1` to launch the standardized offline validation right after a successful train run
 - Explicit runtime overrides such as `NUM_WORKERS`, `PREFETCH_FACTOR`, `BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS`, `VALIDATION_STEPS`, `BENCHMARK_INFERENCE_STEPS`, `SEMANTIC_BACKBONE`, and `NR_METRIC`
 
-`start_train.sh` now only forwards the environment variables you explicitly set; the resolved defaults still come from `configs/train/*.yaml` and `main.py`.
+`start_train.sh` is now a thin shell wrapper. The detailed environment-variable parsing and command assembly live in `utils/train_launcher.py`, while the resolved defaults still come from `configs/train/*.yaml` and `main.py`.
 
 Equivalent raw command:
 
@@ -193,7 +193,8 @@ models/             Retinex, conditioning, diffusion modules
 scripts/            utilities and visualization helpers
 ui/                 Streamlit app
 main.py             unified CLI entrypoint
-start_train.sh      shell wrapper for training
+start_train.sh      thin shell wrapper for training
+utils/train_launcher.py
 ```
 
 ## Example Gallery

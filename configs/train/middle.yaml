@@ -6,6 +6,9 @@ meta:
 runtime:
   train_profile: auto
   mixed_precision: fp16
+  attention_backend: auto
+  use_torch_compile: true
+  torch_compile_mode: reduce-overhead
   resolution: 256
   log_interval: 10
   num_workers: 4
@@ -19,7 +22,7 @@ runtime:
   prefetch_factor: 4
   persistent_workers: true
   pin_memory: true
-  decode_cache_size: 24
+  decode_cache_size: 128
   opencv_threads_per_worker: 1
 
 model:
@@ -34,11 +37,15 @@ model:
   decom_variant: naf
   base_condition_channels: 32
   decom_base_channels: 32
+  cond_out_channels: 7
   unet_layers_per_block: 2
   unet_block_channels: [32, 64, 128, 256]
   unet_down_block_types: [DownBlock2D, DownBlock2D, AttnDownBlock2D, AttnDownBlock2D]
   unet_up_block_types: [AttnUpBlock2D, AttnUpBlock2D, UpBlock2D, UpBlock2D]
   enable_xformers_memory_efficient_attention: true
+  enable_gradient_checkpointing: true
+  use_cfg: true
+  cfg_drop_prob: 0.1
 
 optimization:
   batch_size: 2
@@ -47,6 +54,7 @@ optimization:
   lr_scheduler: cosine_with_warmup
   lr_warmup_steps: 500
   grad_clip_norm: 4.0
+  use_grouped_lr: true
 
 loss:
   offset_noise: true
@@ -65,15 +73,18 @@ loss:
 
 schedule:
   checkpointing_steps: 1000
-  validation_steps: 500
+  validation_steps: 1000
   max_train_steps:
-  freeze_decom_steps: 0
+  stage1_decom_only_steps: 500
+  stage2_adapter_steps: 500
+  freeze_decom_steps: 1000
   decom_warmup_steps: 500
   joint_retinex_ramp_steps: 300
 
 evaluation:
   num_inference_steps: 8
   benchmark_inference_steps: [8, 20]
-  num_validation_images: 12
-  semantic_backbone: resnet18
-  nr_metric: niqe
+  num_validation_images: 8
+  semantic_backbone: none
+  nr_metric: none
+  guidance_scale: 1.5

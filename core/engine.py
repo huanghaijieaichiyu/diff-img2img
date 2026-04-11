@@ -7,6 +7,7 @@ import random
 import shutil
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -36,10 +37,54 @@ from utils.loss import CompositeLoss
 from utils.metrics import SemanticFeatureMetric, try_compute_niqe
 from utils.misc import charbonnier_loss_elementwise, compute_min_snr_loss_weights, compute_adaptive_loss_weights, ssim
 from utils.project_config import build_runtime_summary, serialize_args
+from utils.runtime_backend import (
+    resolve_unet_runtime_backend,
+    unwrap_compiled_module,
+)
 from utils.train_display import create_training_display
 from utils.video_writer import video_writer
 
 logger = get_logger(__name__, log_level="INFO")
+
+SUPPORTED_VALIDATION_METRICS = ("psnr", "ssim", "lpips", "semantic_distance", "niqe")
+
+
+def normalize_validation_metrics(metrics) -> tuple[str, ...]:
+    if metrics in (None, "", []):
+        return ("psnr", "ssim")
+    if isinstance(metrics, str):
+        metrics = [part.strip() for part in metrics.replace(",", " ").split() if part.strip()]
+    normalized = []
+    requested = []
+    for metric in metrics:
+        metric_name = str(metric).strip().lower()
+        if metric_name in SUPPORTED_VALIDATION_METRICS and metric_name not in requested:
+            requested.append(metric_name)
+    for metric_name in ("psnr", "ssim"):
+        if metric_name not in normalized:
+            normalized.append(metric_name)
+    for metric_name in requested:
+        if metric_name not in normalized:
+            normalized.append(metric_name)
+    return tuple(normalized)
+
+
+def resolve_validation_step_counts(
+    num_inference_steps: int,
+    benchmark_inference_steps,
+    train_validation_benchmark_steps,
+    *,
+    fast: bool,
+) -> list[int]:
+    raw_steps = train_validation_benchmark_steps if fast else benchmark_inference_steps
+    if raw_steps in (None, "", []):
+        raw_steps = [num_inference_steps]
+    ordered_steps = []
+    for step_count in list(raw_steps) + [num_inference_steps]:
+        value = int(step_count)
+        if value > 0 and value not in ordered_steps:
+            ordered_steps.append(value)
+    return ordered_steps
 
 
 class DiffusionEngine:
@@ -79,6 +124,10 @@ class DiffusionEngine:
         self.status_json_path = os.path.join(args.output_dir, "training_status.json")
         self.resolved_config_path = os.path.join(args.output_dir, "resolved_config.json")
         self.runtime_summary = build_runtime_summary(args)
+        self._eval_dataloader = None
+        self._lpips_fn = None
+        self._lpips_load_attempted = False
+        self._semantic_metric = None
 
         logging_dir = os.path.join(args.output_dir, "logs")
         accelerator_project_config = ProjectConfiguration(
@@ -109,11 +158,17 @@ class DiffusionEngine:
 
         if self.accelerator.is_main_process:
             os.makedirs(args.output_dir, exist_ok=True)
-            self._write_resolved_config()
+            logger.info(
+                "GPU memory note: gpu_allocated_gb tracks active tensor memory, while gpu_reserved_gb tracks the allocator cache pool."
+            )
 
         self.metrics_csv_path = os.path.join(args.output_dir, "training_metrics.csv")
         self._joint_decom_trainable = None
+        self.unet_runtime_backend = None
         self._setup_models()
+
+        if self.accelerator.is_main_process:
+            self._write_resolved_config()
 
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=1000,
@@ -129,9 +184,74 @@ class DiffusionEngine:
             w_wavelet=getattr(args, "wavelet_loss_weight", 0.0),
         ).to(self.accelerator.device)
 
+    def _validation_plan(self, fast: bool) -> tuple[list[int], tuple[str, ...]]:
+        if fast:
+            metric_names = normalize_validation_metrics(getattr(self.args, "train_validation_metrics", ("psnr", "ssim")))
+        else:
+            metric_names = ("psnr", "ssim", "lpips", "semantic_distance", "niqe")
+        step_counts = resolve_validation_step_counts(
+            self.args.num_inference_steps,
+            self.args.benchmark_inference_steps,
+            getattr(self.args, "train_validation_benchmark_steps", None),
+            fast=fast,
+        )
+        return step_counts, metric_names
+
+    def _get_eval_dataloader(self):
+        if self._eval_dataloader is not None:
+            return self._eval_dataloader
+
+        eval_dataset = LowLightDataset(
+            image_dir=self.args.data_dir,
+            img_size=self.args.resolution,
+            phase="test",
+            decode_cache_size=getattr(self.args, "decode_cache_size", 0),
+        )
+        eval_loader_kwargs = {
+            "batch_size": self.args.batch_size,
+            "shuffle": False,
+            "num_workers": self.args.num_workers,
+            "pin_memory": bool(getattr(self.args, "pin_memory", True)),
+            "worker_init_fn": self._worker_init_fn,
+        }
+        if self.args.num_workers > 0:
+            eval_loader_kwargs.update({
+                "persistent_workers": bool(getattr(self.args, "persistent_workers", True)),
+                "prefetch_factor": max(2, int(getattr(self.args, "prefetch_factor", 4))),
+            })
+        eval_dataloader = DataLoader(eval_dataset, **eval_loader_kwargs)
+        self._eval_dataloader = self.accelerator.prepare(eval_dataloader)
+        return self._eval_dataloader
+
+    def _get_lpips_fn(self):
+        if self._lpips_fn is not None:
+            return self._lpips_fn
+        if self._lpips_load_attempted:
+            return None
+        self._lpips_load_attempted = True
+        try:
+            import lpips
+
+            self._lpips_fn = lpips.LPIPS(net="vgg", verbose=False).to(self.accelerator.device)
+            self._lpips_fn.eval()
+        except ImportError:
+            logger.warning("lpips not installed. Skipping LPIPS metric.")
+            self._lpips_fn = None
+        return self._lpips_fn
+
+    def _get_semantic_metric(self):
+        if self._semantic_metric is None:
+            self._semantic_metric = SemanticFeatureMetric(
+                self.accelerator.device,
+                backbone=self.args.semantic_backbone,
+            )
+        return self._semantic_metric
+
     def _setup_models(self):
-        input_channels = 10
-        logger.info(f"Initializing UNet (Input Channels={input_channels})...")
+        # Dynamic channel calculation based on preset
+        cond_channels = getattr(self.args, 'cond_out_channels', 7)
+        input_channels = 3 + cond_channels  # noisy + condition_map
+        logger.info(f"Initializing UNet (Input Channels={input_channels}, Condition Channels={cond_channels})...")
         self.unet = UNet2DModel(
             sample_size=self.args.resolution,
             in_channels=input_channels,
@@ -141,11 +261,6 @@ class DiffusionEngine:
             down_block_types=tuple(self.args.unet_down_block_types),
             up_block_types=tuple(self.args.unet_up_block_types),
         )
-
-        if self.args.enable_xformers_memory_efficient_attention:
-            if self.accelerator.is_main_process:
-                logger.info("Enabling xformers memory efficient attention")
-            self.unet.enable_xformers_memory_efficient_attention()
 
         self.decom_model = None
         if self.args.use_retinex:
@@ -158,7 +273,7 @@ class DiffusionEngine:
         self.condition_adapter = build_condition_adapter(
             variant=self.args.condition_variant,
             block_channels=self.args.unet_block_channels,
-            cond_out_channels=7,
+            cond_out_channels=cond_channels,
             base_channels=self.args.base_condition_channels,
             use_retinex=self.args.use_retinex,
             conditioning_space=self.args.conditioning_space,
@@ -166,6 +281,8 @@ class DiffusionEngine:
 
         if self.args.model_path:
             self._load_checkpoint(self.args.model_path)
+
+        self.unet_runtime_backend = self._configure_unet_runtime_backend()
 
         if self.args.use_retinex and self.args.decom_warmup_steps > 0:
             self._set_trainable(self.unet, False)
@@ -185,7 +302,7 @@ class DiffusionEngine:
                 self.unet.parameters(),
                 decay=self.args.ema_decay,
                 model_cls=UNet2DModel,
-                model_config=self.unet.config,
+                model_config=unwrap_compiled_module(self.unet).config,
             )
             if self.decom_model is not None:
                 self.ema_models["decom_model"] = EMAModel(
@@ -200,6 +317,73 @@ class DiffusionEngine:
             for ema_model in self.ema_models.values():
                 ema_model.to(self.accelerator.device)
 
+    def _record_unet_backend_summary(self, backend):
+        if backend is None:
+            return
+        payload = backend.as_dict()
+        for key, value in payload.items():
+            self.runtime_summary[f"unet_backend_{key}"] = value
+
+    def _configure_unet_runtime_backend(self):
+        backend = resolve_unet_runtime_backend(self.args)
+        checkpointing_enabled = bool(getattr(self.args, "enable_gradient_checkpointing", False))
+
+        if checkpointing_enabled:
+            self.unet.enable_gradient_checkpointing()
+            if self.accelerator.is_main_process:
+                logger.info("Enabled gradient checkpointing on UNet")
+
+        try:
+            backend = self._apply_unet_runtime_backend(backend)
+        finally:
+            self._record_unet_backend_summary(backend)
+
+        if self.accelerator.is_main_process:
+            reason_text = "; ".join(backend.reasons) if backend.reasons else "no extra notes"
+            logger.info(
+                "UNet runtime backend: requested=%s resolved=%s compile=%s xformers=%s gradient_checkpointing=%s (%s)",
+                backend.requested_backend,
+                backend.resolved_backend,
+                backend.compile_enabled,
+                backend.xformers_enabled,
+                checkpointing_enabled,
+                reason_text,
+            )
+        return backend
+
+    def _apply_unet_runtime_backend(self, backend):
+        if backend.compile_enabled:
+            try:
+                self.unet.compile(mode=backend.torch_compile_mode)
+            except Exception as exc:
+                if backend.requested_backend == "compile":
+                    raise
+                fallback_backend = "xformers" if backend.xformers_requested else "native"
+                backend = replace(
+                    backend,
+                    resolved_backend=fallback_backend,
+                    compile_enabled=False,
+                    xformers_enabled=fallback_backend == "xformers",
+                ).with_reason(f"torch.compile failed and auto backend fell back to {fallback_backend}: {exc}")
+            else:
+                return backend.with_reason("Applied torch.compile to the UNet in-place.")
+
+        if backend.xformers_enabled:
+            try:
+                self.unet.enable_xformers_memory_efficient_attention()
+            except Exception as exc:
+                if backend.requested_backend == "xformers":
+                    raise
+                backend = replace(
+                    backend,
+                    resolved_backend="native",
+                    xformers_enabled=False,
+                ).with_reason(f"xformers enable failed and backend fell back to native attention: {exc}")
+            else:
+                return backend.with_reason("Enabled xformers memory efficient attention.")
+
+        return backend
+
     @staticmethod
     def _set_trainable(module, trainable: bool):
         if module is None:
@@ -207,9 +391,39 @@ class DiffusionEngine:
         for parameter in module.parameters():
             parameter.requires_grad = trainable
 
+    @staticmethod
+    def _unwrap_compiled_module(module):
+        return unwrap_compiled_module(module)
+
+    @staticmethod
+    def _parallel_wrapper_types():
+        wrapper_types = [torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel]
+        try:
+            from deepspeed import DeepSpeedEngine
+
+            wrapper_types.append(DeepSpeedEngine)
+        except Exception:
+            pass
+        try:
+            from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
+
+            wrapper_types.append(FSDP)
+        except Exception:
+            pass
+        return tuple(wrapper_types)
+
+    def _unwrap_training_model(self, model=None):
+        model = self.training_model if model is None else model
+        model = self._unwrap_compiled_module(model)
+        wrapper_types = self._parallel_wrapper_types()
+        while isinstance(model, wrapper_types):
+            model = model.module
+            model = self._unwrap_compiled_module(model)
+        return model
+
     def _named_core_modules(self, unwrapped_model=None):
         if unwrapped_model is None:
-            unwrapped_model = self.accelerator.unwrap_model(self.training_model)
+            unwrapped_model = self._unwrap_training_model()
         return {
             "unet": unwrapped_model.unet,
             "decom_model": unwrapped_model.decom_model,
@@ -256,12 +470,67 @@ class DiffusionEngine:
         return param_groups
 
     def _params_for_gradient_clipping(self):
-        params = list(self.training_model.parameters())
-        params.extend(list(self.criterion.parameters()))
+        params = [parameter for parameter in self.training_model.parameters() if parameter.requires_grad]
+        params.extend(parameter for parameter in self.criterion.parameters() if parameter.requires_grad)
         return params
 
+    @staticmethod
+    def _optimizer_has_gradients(optimizer) -> bool:
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is not None:
+                    return True
+        return False
+
+    def _stage_boundaries(self) -> tuple[int, int]:
+        stage1_end = getattr(self.args, "stage1_decom_only_steps", 0)
+        stage2_end = stage1_end + getattr(self.args, "stage2_adapter_steps", 0)
+        return stage1_end, stage2_end
+
+    def _set_training_stage(self, global_step: int):
+        """
+        Three-stage training strategy:
+        Stage 1 (0-stage1_end): Retinex decomposition only
+        Stage 2 (stage1_end-stage2_end): Decomposition + Adapter (UNet frozen)
+        Stage 3 (stage2_end+): Full joint training with gradual decom unfreezing
+        """
+        unwrapped = self._unwrap_training_model()
+
+        stage1_end, stage2_end = self._stage_boundaries()
+
+        if global_step < stage1_end:
+            # Stage 1: Only decomposition
+            self._set_trainable(unwrapped.decom_model, True)
+            self._set_trainable(unwrapped.condition_adapter, False)
+            self._set_trainable(unwrapped.unet, False)
+            return "stage1_decom"
+
+        elif global_step < stage2_end:
+            # Stage 2: Decomposition + Adapter
+            self._set_trainable(unwrapped.decom_model, True)
+            self._set_trainable(unwrapped.condition_adapter, True)
+            self._set_trainable(unwrapped.unet, False)
+            return "stage2_adapter"
+
+        else:
+            # Stage 3: Full joint training
+            joint_step = global_step - stage2_end
+            self._set_trainable(unwrapped.unet, True)
+            self._set_trainable(unwrapped.condition_adapter, True)
+
+            # Gradual decom unfreezing
+            decom_trainable = joint_step >= self.args.freeze_decom_steps
+            if self._joint_decom_trainable != decom_trainable:
+                self._set_trainable(unwrapped.decom_model, decom_trainable)
+                self._joint_decom_trainable = decom_trainable
+                state = "trainable" if decom_trainable else "frozen"
+                logger.info(f"Setting decomposition network to {state} at joint_step={joint_step}")
+
+            return "stage3_joint"
+
     def _set_joint_phase_trainability(self, joint_step: int):
-        unwrapped_model = self.accelerator.unwrap_model(self.training_model)
+        """Legacy method for backward compatibility"""
+        unwrapped_model = self._unwrap_training_model()
         self._set_trainable(unwrapped_model.unet, True)
         self._set_trainable(unwrapped_model.condition_adapter, True)
 
@@ -518,20 +787,35 @@ class DiffusionEngine:
             return True
         return step % interval == 0
 
-    def _x0_branch_weight(self, global_step: int) -> float:
+    def _x0_branch_weight(self, global_step: int, timesteps: torch.Tensor = None):
         """
-        P1 Fix: Use cosine warmup instead of linear for smoother x0 loss introduction.
-        Cosine warmup starts slow and accelerates, reducing early training instability.
+        Improved x0 loss scheduling with:
+        1. Cosine warmup (existing)
+        2. Time-dependent decay (new) - reduce weight for high-noise timesteps
         """
-        if global_step < self.args.decom_warmup_steps:
-            return 0.0
+        _, stage2_end = self._stage_boundaries()
+
+        if global_step < stage2_end:
+            return 0.0 if timesteps is None else torch.zeros_like(timesteps, dtype=torch.float32)
+
         if self.args.x0_loss_warmup_steps <= 0:
-            return self.args.x0_loss_weight
-        progress = (global_step - self.args.decom_warmup_steps) / float(self.args.x0_loss_warmup_steps)
-        progress = max(0.0, min(1.0, progress))
-        # Cosine warmup: slow start, fast finish
-        cosine_progress = 0.5 * (1 - math.cos(math.pi * progress))
-        return self.args.x0_loss_weight * cosine_progress
+            base_weight = self.args.x0_loss_weight
+        else:
+            progress = (global_step - stage2_end) / float(self.args.x0_loss_warmup_steps)
+            progress = max(0.0, min(1.0, progress))
+            # Cosine warmup: slow start, fast finish
+            cosine_progress = 0.5 * (1 - math.cos(math.pi * progress))
+            base_weight = self.args.x0_loss_weight * cosine_progress
+
+        # Time-dependent decay (new)
+        if timesteps is not None:
+            t_ratio = timesteps.float() / self.args.x0_loss_t_max
+            t_ratio = t_ratio.clamp(0, 1)
+            # Cosine decay: full weight at t=0, reduced at t=t_max
+            time_decay = 0.5 * (1 + torch.cos(math.pi * t_ratio))
+            return base_weight * time_decay
+
+        return base_weight
 
     def _residual_target(self, clean_images: torch.Tensor, low_light_images: torch.Tensor) -> torch.Tensor:
         return (clean_images - low_light_images) * self.args.residual_scale
@@ -616,13 +900,88 @@ class DiffusionEngine:
             "l_tv": tv_loss,
         }
 
+    def _build_optimizer_with_grouped_lr(self):
+        """
+        Create optimizer with component-specific learning rates:
+        - UNet: base LR (1e-4)
+        - Retinex: 0.5x base LR (more stable)
+        - Adapter: 2x base LR (learns faster)
+        """
+        unwrapped = self._unwrap_training_model()
+        base_lr = self.args.lr
+
+        # Separate parameters by component
+        unet_params = []
+        decom_params = []
+        adapter_params = []
+        criterion_params = []
+
+        for name, param in unwrapped.named_parameters():
+            if 'unet' in name:
+                unet_params.append(param)
+            elif 'decom_model' in name:
+                decom_params.append(param)
+            elif 'condition_adapter' in name:
+                adapter_params.append(param)
+
+        # Add criterion parameters (uncertainty weights)
+        for param in self.criterion.parameters():
+            if param.requires_grad:
+                criterion_params.append(param)
+
+        # Build parameter groups with weight decay separation
+        param_groups = []
+
+        def add_group(params, lr_mult, name):
+            decay = [p for p in params if p.ndim > 1]
+            no_decay = [p for p in params if p.ndim <= 1]
+
+            if decay:
+                param_groups.append({
+                    'params': decay,
+                    'lr': base_lr * lr_mult,
+                    'weight_decay': 0.01,
+                })
+            if no_decay:
+                param_groups.append({
+                    'params': no_decay,
+                    'lr': base_lr * lr_mult,
+                    'weight_decay': 0.0,
+                })
+
+        add_group(unet_params, 1.0, 'unet')
+        add_group(decom_params, 0.5, 'decom')
+        add_group(adapter_params, 2.0, 'adapter')
+        add_group(criterion_params, 1.0, 'criterion')
+
+        return torch.optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
+
+    def _load_checkpoint_metadata(self, checkpoint_dir: str):
+        metadata_path = os.path.join(checkpoint_dir, "checkpoint_metadata.json")
+        if not os.path.exists(metadata_path):
+            return
+
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+        except Exception as exc:
+            logger.warning(f"Failed to read checkpoint metadata from {metadata_path}: {exc}")
+            return
+
+        best_psnr = metadata.get("best_psnr")
+        if isinstance(best_psnr, (int, float)):
+            self.best_psnr = float(best_psnr)
+
     def train(self):
-        optimizer = torch.optim.AdamW(
-            self._build_optimizer_param_groups(),
-            lr=self.args.lr,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        )
+        if getattr(self.args, 'use_grouped_lr', False):
+            optimizer = self._build_optimizer_with_grouped_lr()
+        else:
+            optimizer = torch.optim.AdamW(
+                self._build_optimizer_param_groups(),
+                lr=self.args.lr,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+            )
 
         train_dataset = LowLightDataset(
             image_dir=self.args.data_dir,
@@ -630,6 +989,7 @@ class DiffusionEngine:
             phase="train",
             manifest_path=getattr(self.args, "train_manifest_path", None),
             decode_cache_size=getattr(self.args, "decode_cache_size", 0),
+            prepared_cache_dir=getattr(self.args, "prepared_cache_dir", None),
         )
         train_loader_kwargs = {
             "batch_size": self.args.batch_size,
@@ -715,9 +1075,10 @@ class DiffusionEngine:
                 completed_joint_steps = max(0, global_step - warmup_steps)
                 first_epoch = completed_joint_steps // max(1, num_update_steps_per_epoch)
                 self._load_ema_state(self.args.resume)
+                self._load_checkpoint_metadata(self.args.resume)
 
         if global_step >= warmup_steps:
-            self._set_joint_phase_trainability(completed_joint_steps)
+            self._set_training_stage(completed_joint_steps)
 
         logger.info("***** Running training *****")
         logger.info(
@@ -791,7 +1152,8 @@ class DiffusionEngine:
                             f"loss={logs['loss']:.4f} l_ret={logs['l_ret']:.4f} "
                             f"samples/s={logs['samples_per_sec']:.2f} "
                             f"data={logs['data_time']:.3f}s compute={logs['compute_time']:.3f}s "
-                            f"cpu={logs['cpu_percent']:.1f}% gpu={logs['gpu_reserved_gb']:.2f}GB"
+                            f"cpu={logs['cpu_percent']:.1f}% gpu_alloc={logs['gpu_allocated_gb']:.2f}GB "
+                            f"gpu_resv={logs['gpu_reserved_gb']:.2f}GB"
                         )
                     self.accelerator.log(numeric_logs, step=global_step)
                     self._append_training_metrics(global_step, "decom_warmup", numeric_logs)
@@ -805,7 +1167,7 @@ class DiffusionEngine:
 
         completed_joint_steps = max(0, global_step - warmup_steps)
         if global_step >= warmup_steps:
-            self._set_joint_phase_trainability(completed_joint_steps)
+            self._set_training_stage(completed_joint_steps)
         accum_data_time = 0.0
         accum_compute_time = 0.0
         accum_samples = 0
@@ -815,15 +1177,15 @@ class DiffusionEngine:
                 if completed_joint_steps >= self.args.max_train_steps:
                     break
 
-                self._set_joint_phase_trainability(completed_joint_steps)
+                phase = self._set_training_stage(completed_joint_steps)
                 data_time = time.perf_counter() - last_iter_end
                 compute_start = time.perf_counter()
                 _, logs = self._train_step(
                     batch,
                     optimizer,
                     lr_scheduler,
-                    global_step=global_step,
-                    phase="joint",
+                    global_step=completed_joint_steps,
+                    phase=phase,
                     joint_step=completed_joint_steps,
                 )
                 compute_time = time.perf_counter() - compute_start
@@ -847,24 +1209,38 @@ class DiffusionEngine:
 
                     logs["epoch"] = epoch + 1
                     logs["step"] = global_step
-                    logs["phase"] = "joint"
+                    logs["phase"] = phase
                     numeric_logs = {k: v for k, v in logs.items() if isinstance(v, (int, float))}
                     if self.accelerator.is_main_process and self._should_log_step(global_step, terminal_step=total_training_steps):
                         live_display.update(logs)
                         if not rich_enabled:
-                            logger.info(
-                                f"[joint] epoch={epoch + 1} step={global_step}/{total_training_steps} "
-                                f"loss={logs['loss']:.4f} l_diff={logs['l_diff']:.4f} "
-                                f"l_x0={logs['l_x0']:.4f} l_ret={logs['l_ret']:.4f} "
-                                f"samples/s={logs['samples_per_sec']:.2f} "
-                                f"data={logs['data_time']:.3f}s compute={logs['compute_time']:.3f}s "
-                                f"cpu={logs['cpu_percent']:.1f}% gpu={logs['gpu_reserved_gb']:.2f}GB"
-                            )
+                            if phase == "stage1_decom":
+                                logger.info(
+                                    f"[{phase}] epoch={epoch + 1} step={global_step}/{total_training_steps} "
+                                    f"loss={logs['loss']:.4f} l_ret={logs['l_ret']:.4f} "
+                                    f"samples/s={logs['samples_per_sec']:.2f} "
+                                    f"data={logs['data_time']:.3f}s compute={logs['compute_time']:.3f}s "
+                                    f"cpu={logs['cpu_percent']:.1f}% gpu_alloc={logs['gpu_allocated_gb']:.2f}GB "
+                                    f"gpu_resv={logs['gpu_reserved_gb']:.2f}GB"
+                                )
+                            else:
+                                logger.info(
+                                    f"[{phase}] epoch={epoch + 1} step={global_step}/{total_training_steps} "
+                                    f"loss={logs['loss']:.4f} l_diff={logs['l_diff']:.4f} "
+                                    f"l_x0={logs['l_x0']:.4f} l_ret={logs['l_ret']:.4f} "
+                                    f"samples/s={logs['samples_per_sec']:.2f} "
+                                    f"data={logs['data_time']:.3f}s compute={logs['compute_time']:.3f}s "
+                                    f"cpu={logs['cpu_percent']:.1f}% gpu_alloc={logs['gpu_allocated_gb']:.2f}GB "
+                                    f"gpu_resv={logs['gpu_reserved_gb']:.2f}GB"
+                                )
                         self.accelerator.log(numeric_logs, step=global_step)
-                        self._append_training_metrics(global_step, "joint", numeric_logs)
+                        self._append_training_metrics(global_step, phase, numeric_logs)
 
                     if global_step > 0 and self.args.validation_steps > 0 and global_step % self.args.validation_steps == 0:
-                        self.validate(step=global_step)
+                        self.validate(
+                            step=global_step,
+                            fast=bool(getattr(self.args, "train_fast_validation", True)),
+                        )
 
                     if global_step > 0 and self.args.checkpointing_steps > 0 and global_step % self.args.checkpointing_steps == 0:
                         self._save_checkpoint(global_step)
@@ -883,8 +1259,23 @@ class DiffusionEngine:
     def _train_step(self, batch, optimizer, lr_scheduler, global_step: int, phase: str, joint_step: int):
         low_light_images, clean_images = batch
 
+        # CFG: Randomly drop conditions during training (10% probability)
+        use_cfg = getattr(self.args, 'use_cfg', False)
+        if use_cfg and phase not in ["stage1_decom", "decom_warmup"]:
+            cfg_drop_prob = getattr(self.args, 'cfg_drop_prob', 0.1)
+            drop_mask = torch.rand(low_light_images.shape[0], device=low_light_images.device) < cfg_drop_prob
+
+            # Create unconditional input (zero condition)
+            if drop_mask.any():
+                low_light_uncond = torch.zeros_like(low_light_images)
+                low_light_images = torch.where(
+                    drop_mask.view(-1, 1, 1, 1),
+                    low_light_uncond,
+                    low_light_images
+                )
+
         with self.accelerator.accumulate(self.training_model):
-            if phase == "decom_warmup":
+            if phase in ["stage1_decom", "decom_warmup"]:
                 _, aux = self.training_model(
                     low_light_images,
                     clean_images=clean_images,
@@ -895,9 +1286,17 @@ class DiffusionEngine:
 
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
-                    optimizer.step()
-                    lr_scheduler.step()
+                    if self._optimizer_has_gradients(optimizer):
+                        self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
+                        self._ema_step()
+                        optimizer.step()
+                        lr_scheduler.step()
+                    elif self.accelerator.is_main_process:
+                        logger.warning(
+                            "Skipping optimizer step in %s at global_step=%s because no gradients were recorded.",
+                            phase,
+                            global_step,
+                        )
                     optimizer.zero_grad()
 
                 logs = {
@@ -962,14 +1361,20 @@ class DiffusionEngine:
             pred_residual = self._reconstruct_x0(noisy_target, model_pred, timesteps)
             pred_clean = self._decode_residual(low_light_images, pred_residual)
 
-            x0_weight = self._x0_branch_weight(global_step)
             timestep_mask = timesteps <= self.args.x0_loss_t_max
             x0_loss = torch.tensor(0.0, device=clean_images.device)
             x0_logs = {}
-            if x0_weight > 0.0 and torch.any(timestep_mask):
-                x0_loss, x0_logs = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
+            if torch.any(timestep_mask):
+                x0_weights = self._x0_branch_weight(joint_step, timesteps[timestep_mask])
+                if isinstance(x0_weights, torch.Tensor) and x0_weights.sum() > 0:
+                    x0_loss_raw, x0_logs = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
+                    # Apply per-sample time-dependent weighting
+                    x0_loss = x0_loss_raw * x0_weights.mean()
+                elif isinstance(x0_weights, float) and x0_weights > 0:
+                    x0_loss, x0_logs = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
+                    x0_loss = x0_loss * x0_weights
 
-            loss = loss_diffusion + x0_weight * x0_loss
+            loss = loss_diffusion + x0_loss
 
             retinex_losses = self._compute_retinex_losses(aux)
             if self.args.use_retinex:
@@ -983,12 +1388,24 @@ class DiffusionEngine:
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
-                # P0 Fix: Update EMA before optimizer.step() to use pre-update parameters
-                self._ema_step()
-                optimizer.step()
-                lr_scheduler.step()
+                if self._optimizer_has_gradients(optimizer):
+                    self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
+                    # P0 Fix: Update EMA before optimizer.step() to use pre-update parameters
+                    self._ema_step()
+                    optimizer.step()
+                    lr_scheduler.step()
+                elif self.accelerator.is_main_process:
+                    logger.warning(
+                        "Skipping optimizer step in %s at global_step=%s because no gradients were recorded.",
+                        phase,
+                        global_step,
+                    )
                 optimizer.zero_grad()
+
+            # Get x0_weight for logging
+            x0_weight_log = self._x0_branch_weight(joint_step)
+            if isinstance(x0_weight_log, torch.Tensor):
+                x0_weight_log = x0_weight_log.mean().item()
 
             logs = {
                 "loss": loss.item(),
@@ -996,7 +1413,7 @@ class DiffusionEngine:
                 "l_diff": loss_diffusion.item(),
                 "l_x0": x0_loss.item(),
                 "l_wavelet": float(x0_logs.get("l_wavelet", torch.tensor(0.0, device=clean_images.device)).item()) if x0_logs else 0.0,
-                "x0_w": x0_weight,
+                "x0_w": x0_weight_log,
                 "l_ret": retinex_losses["retinex_total"].item(),
                 "l_recon_low": retinex_losses["l_recon_low"].item(),
                 "l_recon_high": retinex_losses["l_recon_high"].item(),
@@ -1006,8 +1423,16 @@ class DiffusionEngine:
             }
             return loss, logs
 
-    def _inference_step(self, low_light, unet, decom, condition_adapter, scheduler, num_inference_steps=None):
+    def _inference_step(self, low_light, unet, decom, condition_adapter, scheduler, num_inference_steps=None, guidance_scale=None):
+        """
+        CFG-enabled inference:
+        - guidance_scale=1.0: No CFG (conditional only)
+        - guidance_scale>1.0: Enhanced conditioning
+        """
         step_count = num_inference_steps or self.args.num_inference_steps
+        if guidance_scale is None:
+            guidance_scale = getattr(self.args, 'guidance_scale', 1.0)
+
         scheduler.set_timesteps(step_count)
         latents = torch.randn_like(low_light) * scheduler.init_noise_sigma
         inference_model = CombinedModel(
@@ -1017,10 +1442,27 @@ class DiffusionEngine:
             conditioning_space=self.args.conditioning_space,
         )
 
+        use_cfg = guidance_scale > 1.0
+
         for timestep in scheduler.timesteps:
             latent_input = scheduler.scale_model_input(latents, timestep)
-            model_input, aux = inference_model.build_model_input(low_light, latent_input)
-            noise_pred = inference_model.run_unet(model_input, timestep, aux)
+
+            if use_cfg:
+                # Conditional prediction
+                model_input_cond, aux_cond = inference_model.build_model_input(low_light, latent_input)
+                noise_pred_cond = inference_model.run_unet(model_input_cond, timestep, aux_cond)
+
+                # Unconditional prediction (zero condition)
+                low_light_uncond = torch.zeros_like(low_light)
+                model_input_uncond, aux_uncond = inference_model.build_model_input(low_light_uncond, latent_input)
+                noise_pred_uncond = inference_model.run_unet(model_input_uncond, timestep, aux_uncond)
+
+                # CFG formula
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            else:
+                model_input, aux = inference_model.build_model_input(low_light, latent_input)
+                noise_pred = inference_model.run_unet(model_input, timestep, aux)
+
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
         enhanced = self._decode_residual(low_light, latents)
@@ -1049,6 +1491,7 @@ class DiffusionEngine:
         step=None,
         lpips_fn=None,
         semantic_metric=None,
+        compute_niqe: bool = True,
     ):
         scheduler = DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config)
 
@@ -1110,7 +1553,7 @@ class DiffusionEngine:
                     if semantic_distance is not None:
                         total_semantic += semantic_distance * batch_size
 
-                if self.args.nr_metric == "niqe":
+                if compute_niqe and self.args.nr_metric == "niqe":
                     niqe_score = try_compute_niqe(enhanced_01)
                     if niqe_score is not None:
                         total_niqe += niqe_score * batch_size
@@ -1136,30 +1579,12 @@ class DiffusionEngine:
         }
         return metrics
 
-    def validate(self, step=None):
-        logger.info(f"Running validation at step {step}...")
- 
-        eval_dataset = LowLightDataset(
-            image_dir=self.args.data_dir,
-            img_size=self.args.resolution,
-            phase="test",
-            decode_cache_size=getattr(self.args, "decode_cache_size", 0),
-        )
-        eval_loader_kwargs = {
-            "batch_size": self.args.batch_size,
-            "shuffle": False,
-            "num_workers": self.args.num_workers,
-            "pin_memory": bool(getattr(self.args, "pin_memory", True)),
-            "worker_init_fn": self._worker_init_fn,
-        }
-        if self.args.num_workers > 0:
-            eval_loader_kwargs.update({
-                "persistent_workers": bool(getattr(self.args, "persistent_workers", True)),
-                "prefetch_factor": max(2, int(getattr(self.args, "prefetch_factor", 4))),
-            })
-        eval_dataloader = DataLoader(eval_dataset, **eval_loader_kwargs)
-        eval_dataloader = self.accelerator.prepare(eval_dataloader)
-        unwrapped = self.accelerator.unwrap_model(self.training_model)
+    def validate(self, step=None, fast: bool = False):
+        mode_label = "fast" if fast else "full"
+        logger.info(f"Running {mode_label} validation at step {step}...")
+
+        eval_dataloader = self._get_eval_dataloader()
+        unwrapped = self._unwrap_training_model()
         unet = unwrapped.unet
         decom = unwrapped.decom_model
         condition_adapter = unwrapped.condition_adapter
@@ -1173,25 +1598,21 @@ class DiffusionEngine:
         if condition_adapter is not None:
             condition_adapter.eval()
 
-        lpips_fn = None
-        try:
-            import lpips
+        benchmark_steps, metric_names = self._validation_plan(fast)
+        compute_lpips = "lpips" in metric_names
+        compute_semantic = "semantic_distance" in metric_names
+        compute_niqe = "niqe" in metric_names and self.args.nr_metric == "niqe"
 
-            lpips_fn = lpips.LPIPS(net="vgg", verbose=False).to(self.accelerator.device)
-            lpips_fn.eval()
-        except ImportError:
-            logger.warning("lpips not installed. Skipping LPIPS metric.")
-
-        semantic_metric = SemanticFeatureMetric(self.accelerator.device, backbone=self.args.semantic_backbone)
-
-        benchmark_steps = []
-        for step_count in self.args.benchmark_inference_steps + [self.args.num_inference_steps]:
-            if step_count not in benchmark_steps:
-                benchmark_steps.append(step_count)
+        lpips_fn = self._get_lpips_fn() if compute_lpips else None
+        semantic_metric = self._get_semantic_metric() if compute_semantic else None
 
         validation_results = {}
         if self.accelerator.is_main_process:
-            logger.info(f"Benchmarking validation at inference steps: {benchmark_steps}")
+            logger.info(
+                "Validation plan: steps=%s metrics=%s",
+                benchmark_steps,
+                list(metric_names),
+            )
 
         for step_count in benchmark_steps:
             result = self._validate_for_step_count(
@@ -1203,6 +1624,7 @@ class DiffusionEngine:
                 step=step,
                 lpips_fn=lpips_fn,
                 semantic_metric=semantic_metric,
+                compute_niqe=compute_niqe,
             )
             if result is not None:
                 validation_results[step_count] = result
@@ -1376,6 +1798,7 @@ class DiffusionEngine:
             "best_psnr": self.best_psnr,
             "metrics": metrics or {},
             "effective_batch_size": getattr(self.args, "effective_batch_size", None),
+            "unet_backend": self.unet_runtime_backend.as_dict() if self.unet_runtime_backend is not None else None,
             "args": serializable_args,
         }
 
@@ -1384,6 +1807,7 @@ class DiffusionEngine:
             return
 
         os.makedirs(base_dir, exist_ok=True)
+        unet = self._unwrap_compiled_module(unet)
         unet_dirname = f"unet_{prefix}"
         decom_filename = f"decom_model_{prefix}.pth"
         adapter_filename = f"condition_adapter_{prefix}.pth"
@@ -1412,7 +1836,7 @@ class DiffusionEngine:
 
         self._save_ema_state(save_path)
 
-        unwrapped = self.accelerator.unwrap_model(self.training_model)
+        unwrapped = self._unwrap_training_model()
         if unwrapped.decom_model is not None:
             torch.save(unwrapped.decom_model.state_dict(), os.path.join(save_path, "decom_model.pth"))
         if unwrapped.condition_adapter is not None:
@@ -1439,11 +1863,11 @@ class DiffusionEngine:
 
         self._ema_store()
         self._ema_copy_to_modules()
-        unwrapped = self.accelerator.unwrap_model(self.training_model)
+        unwrapped = self._unwrap_training_model()
         try:
             self._save_model_bundle(
                 self.args.output_dir,
-                unwrapped.unet,
+                self._unwrap_compiled_module(unwrapped.unet),
                 unwrapped.decom_model,
                 unwrapped.condition_adapter,
                 prefix="final",

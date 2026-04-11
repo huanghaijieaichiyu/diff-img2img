@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .conditioning import rgb_to_hvi_lite
+from utils.runtime_backend import has_compiled_module
 
 
 class UNetBlockFiLMContext:
@@ -72,6 +73,16 @@ class CombinedModel(nn.Module):
         self.condition_adapter = condition_adapter
         self.conditioning_space = conditioning_space
 
+    def _uses_compiled_unet(self) -> bool:
+        return has_compiled_module(self.unet)
+
+    @staticmethod
+    def _mark_cudagraph_step_begin():
+        compiler_ns = getattr(torch, "compiler", None)
+        mark_step = getattr(compiler_ns, "cudagraph_mark_step_begin", None)
+        if callable(mark_step):
+            mark_step()
+
     def _build_condition_space(self, low_light_01: torch.Tensor) -> torch.Tensor:
         if self.condition_adapter is not None and hasattr(self.condition_adapter, "build_condition_space"):
             return self.condition_adapter.build_condition_space(low_light_01, conditioning_space=self.conditioning_space)
@@ -139,11 +150,24 @@ class CombinedModel(nn.Module):
         return model_input, aux
 
     def run_unet(self, model_input: torch.Tensor, timesteps: torch.Tensor, aux: dict):
+        compiled_unet = self._uses_compiled_unet()
+        if compiled_unet:
+            # `torch.compile(mode="reduce-overhead")` may reuse CUDAGraph outputs
+            # across invocations unless we mark explicit step boundaries.
+            self._mark_cudagraph_step_begin()
+
         film_state = aux.get("film_state")
         if film_state:
             with UNetBlockFiLMContext(self.unet, film_state):
-                return self.unet(model_input, timesteps).sample
-        return self.unet(model_input, timesteps).sample
+                sample = self.unet(model_input, timesteps).sample
+        else:
+            sample = self.unet(model_input, timesteps).sample
+
+        # Clone compiled outputs outside the graph so later invocations do not
+        # overwrite tensors that autograd still needs for backward.
+        if compiled_unet:
+            sample = sample.clone()
+        return sample
 
     def forward(
         self,

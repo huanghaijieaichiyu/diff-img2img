@@ -6,6 +6,9 @@ meta:
 runtime:
   train_profile: auto
   mixed_precision: bf16
+  attention_backend: auto
+  use_torch_compile: true
+  torch_compile_mode: reduce-overhead
   resolution: 512
   log_interval: 10
   num_workers: 8
@@ -29,11 +32,15 @@ model:
   decom_variant: max
   base_condition_channels: 48
   decom_base_channels: 48
+  cond_out_channels: 7
   unet_layers_per_block: 3
   unet_block_channels: [64, 128, 256, 512, 768]
   unet_down_block_types: [DownBlock2D, AttnDownBlock2D, AttnDownBlock2D, AttnDownBlock2D, AttnDownBlock2D]
   unet_up_block_types: [AttnUpBlock2D, AttnUpBlock2D, AttnUpBlock2D, AttnUpBlock2D, UpBlock2D]
   enable_xformers_memory_efficient_attention: true
+  enable_gradient_checkpointing: false
+  use_cfg: true
+  cfg_drop_prob: 0.1
 
 optimization:
   batch_size: 8
@@ -42,6 +49,7 @@ optimization:
   lr_scheduler: constant_with_warmup
   lr_warmup_steps: 500
   grad_clip_norm: 5.0
+  use_grouped_lr: true
 
 loss:
   offset_noise: true
@@ -60,7 +68,9 @@ schedule:
   checkpointing_steps: 500
   validation_steps: 500
   max_train_steps:
-  freeze_decom_steps: 0
+  stage1_decom_only_steps: 400
+  stage2_adapter_steps: 400
+  freeze_decom_steps: 800
   decom_warmup_steps: 400
   joint_retinex_ramp_steps: 200
 
@@ -70,3 +80,4 @@ evaluation:
   num_validation_images: 4
   semantic_backbone: resnet18
   nr_metric: niqe
+  guidance_scale: 1.5

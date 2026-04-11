@@ -66,3 +66,4 @@ uv.lock
 package-lock.json
 *.spec
 .claude
+.latex

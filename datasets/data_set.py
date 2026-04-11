@@ -8,7 +8,12 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from datasets.prepare_data import load_manifest_entries
+from datasets.prepare_data import (
+    load_manifest_entries,
+    load_manifest_info,
+    manifest_info_path,
+    resolve_manifest_entry_path,
+)
 from scripts.darker import Darker
 
 
@@ -36,6 +41,7 @@ class LowLightDataset(Dataset):
         manifest_path: Optional[str] = None,
         paired_samples: Optional[list[dict]] = None,
         decode_cache_size: int = 0,
+        prepared_cache_dir: Optional[str] = None,
     ):
         self.image_dir = image_dir
         self.img_size = img_size
@@ -46,6 +52,7 @@ class LowLightDataset(Dataset):
         self.data = []
         self.decode_cache_size = max(0, int(decode_cache_size or 0))
         self.decode_cache = OrderedDict()
+        self.prepared_cache_dir = prepared_cache_dir
 
         if phase == "predict":
             if os.path.exists(image_dir):
@@ -59,12 +66,25 @@ class LowLightDataset(Dataset):
             return
 
         if phase == "train" and (manifest_path or paired_samples):
-            manifest_entries = paired_samples if paired_samples is not None else load_manifest_entries(manifest_path)
-            self.data = [
-                (entry["low_path"], entry["high_path"])
-                for entry in manifest_entries
-                if entry.get("low_path") and entry.get("high_path")
-            ]
+            manifest_entries = paired_samples if paired_samples is not None else self._load_prepared_entries(manifest_path)
+            self.data = []
+            for entry in manifest_entries:
+                if not entry.get("low_path") or not entry.get("high_path"):
+                    continue
+                low_path = resolve_manifest_entry_path(
+                    entry,
+                    "low_path",
+                    data_dir=self.image_dir,
+                    prepared_cache_dir=self.prepared_cache_dir,
+                )
+                high_path = resolve_manifest_entry_path(
+                    entry,
+                    "high_path",
+                    data_dir=self.image_dir,
+                    prepared_cache_dir=self.prepared_cache_dir,
+                )
+                if low_path and high_path:
+                    self.data.append((low_path, high_path))
             if not self.data:
                 raise RuntimeError(f"Prepared training manifest is empty: {manifest_path}")
             return
@@ -105,6 +125,17 @@ class LowLightDataset(Dataset):
         if self.darker is None:
             self.darker = Darker(randomize=True, param_ranges=self.darker_ranges)
         return self.darker
+
+    @staticmethod
+    def _load_prepared_entries(manifest_path: str | None) -> list[dict]:
+        if not manifest_path:
+            return []
+        info_payload = load_manifest_info(manifest_info_path(manifest_path))
+        if isinstance(info_payload, dict):
+            info_entries = info_payload.get("entries")
+            if info_payload.get("manifest_path") == os.path.abspath(manifest_path) and isinstance(info_entries, list):
+                return info_entries
+        return load_manifest_entries(manifest_path)
 
     def _read_rgb(self, path: str) -> np.ndarray:
         if self.decode_cache_size > 0 and path in self.decode_cache:
