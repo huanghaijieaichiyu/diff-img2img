@@ -27,7 +27,7 @@ model:
   ema_decay: 0.9999
   prediction_type: v_prediction
   conditioning_space: hvi_lite
-  inject_mode: film_pyramid
+  inject_mode: concat_pyramid
   condition_variant: max
   decom_variant: max
   base_condition_channels: 48

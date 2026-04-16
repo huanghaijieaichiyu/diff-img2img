@@ -19,6 +19,7 @@
     python start_train.py --mode validate --model-path runs/retinex/best_model
 """
 
+from utils.project_config import load_preset_summary, resolve_config_path
 import argparse
 import subprocess
 import sys
@@ -28,8 +29,6 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from utils.project_config import load_preset_summary, resolve_config_path
 
 
 def _warn_if_cross_mounted_data(data_dir: str) -> None:
@@ -50,7 +49,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=str,
-        default="small",
+        default="small_throughput",
         help="配置文件: small / middle / max 或 YAML 文件路径 (默认: small)",
     )
 
@@ -95,7 +94,8 @@ def create_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--compile-mode",
-        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        choices=["default", "reduce-overhead",
+                 "max-autotune", "max-autotune-no-cudagraphs"],
         help="torch.compile 模式",
     )
 

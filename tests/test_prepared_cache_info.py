@@ -83,6 +83,48 @@ def test_manifest_info_invalidates_when_expected_fingerprint_changes(tmp_path):
     ) is None
 
 
+def test_prepare_training_data_writes_train_resolution_cache_when_requested(tmp_path):
+    data_dir = tmp_path / "dataset"
+    cache_dir = tmp_path / "cache"
+    _write_rgb_image(data_dir / "our485" / "high" / "0.png", 96)
+
+    manifest_path = prepare_training_data(
+        data_dir,
+        cache_dir,
+        variant_count=1,
+        synthesis_seed=13,
+        darker_ranges=None,
+        prepare_workers=1,
+        prepared_train_resolution=8,
+        force=False,
+    )
+
+    manifest_entries = load_manifest_entries(manifest_path)
+    entry = manifest_entries[0]
+    assert entry["train_resolution"] == 8
+    assert entry["train_low_path_root"] == "prepared_cache_dir"
+    assert entry["train_high_path_root"] == "prepared_cache_dir"
+    assert validate_prepared_cache(
+        data_dir,
+        cache_dir,
+        variant_count=1,
+        synthesis_seed=13,
+        darker_ranges=None,
+        prepared_train_resolution=8,
+    ) == manifest_path
+
+    dataset = LowLightDataset(
+        image_dir=str(data_dir),
+        img_size=8,
+        phase="train",
+        manifest_path=str(manifest_path),
+        prepared_cache_dir=str(cache_dir),
+    )
+    low_path, high_path = dataset.data[0]
+    assert "train_cache/8" in low_path
+    assert "train_cache/8" in high_path
+
+
 def test_dataset_falls_back_to_jsonl_when_manifest_info_missing(tmp_path):
     manifest_path = tmp_path / "train_manifest.jsonl"
     entries = [

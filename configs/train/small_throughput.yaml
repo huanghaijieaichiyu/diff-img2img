@@ -1,7 +1,7 @@
 meta:
-  name: middle
+  name: small_throughput
   target_vram_gb: 8
-  description: Official recommended 8GB preset with NAF decomposition and deep-only cross-attention conditioning.
+  description: Throughput-oriented 8GB variant of the small preset with compile-safe conditioning, train-resolution prepared cache, and lighter UNet/decomposition widths.
 
 runtime:
   train_profile: auto
@@ -10,6 +10,7 @@ runtime:
   use_torch_compile: true
   torch_compile_mode: reduce-overhead
   resolution: 256
+  prepared_train_resolution: 256
   log_interval: 10
   num_workers: 4
   prepare_on_train: true
@@ -26,33 +27,33 @@ runtime:
   opencv_threads_per_worker: 1
 
 model:
-  architecture_scale: middle
+  architecture_scale: small
   use_retinex: true
   use_ema: true
   ema_decay: 0.9999
   prediction_type: v_prediction
   conditioning_space: hvi_lite
   inject_mode: concat_pyramid
-  condition_variant: max_v2
-  decom_variant: naf
-  base_condition_channels: 32
-  decom_base_channels: 32
-  cond_out_channels: 7
+  condition_variant: small_v2
+  decom_variant: naf_lite
+  base_condition_channels: 16
+  decom_base_channels: 16
+  cond_out_channels: 5
   unet_layers_per_block: 2
-  unet_block_channels: [32, 64, 128, 256]
-  unet_down_block_types: [DownBlock2D, DownBlock2D, AttnDownBlock2D, AttnDownBlock2D]
-  unet_up_block_types: [AttnUpBlock2D, AttnUpBlock2D, UpBlock2D, UpBlock2D]
+  unet_block_channels: [32, 64, 96, 128]
+  unet_down_block_types: [DownBlock2D, DownBlock2D, DownBlock2D, AttnDownBlock2D]
+  unet_up_block_types: [AttnUpBlock2D, UpBlock2D, UpBlock2D, UpBlock2D]
   enable_xformers_memory_efficient_attention: true
-  enable_gradient_checkpointing: true
+  enable_gradient_checkpointing: false
   use_cfg: true
   cfg_drop_prob: 0.1
 
 optimization:
-  batch_size: 2
+  batch_size: 4
   gradient_accumulation_steps: 4
   lr: 1.0e-4
   lr_scheduler: cosine_with_warmup
-  lr_warmup_steps: 500
+  lr_warmup_steps: 400
   grad_clip_norm: 4.0
   use_grouped_lr: true
 
@@ -62,29 +63,32 @@ loss:
   snr_gamma: 5.0
   loss_weighting_scheme: min_snr
   use_uncertainty_weighting: false
+  use_lpips: false
+  lpips_resize: 128
+  wavelet_loss_weight: 0.0
   retinex_loss_weight: 0.1
   tv_loss_weight: 0.1
   retinex_consistency_weight: 1.0
   retinex_exposure_weight: 0.1
   x0_loss_weight: 0.18
-  x0_loss_t_max: 192
-  x0_loss_warmup_steps: 400
+  x0_loss_t_max: 180
+  x0_loss_warmup_steps: 250
   residual_scale: 0.5
 
 schedule:
-  checkpointing_steps: 1000
-  validation_steps: 1000
+  checkpointing_steps: 2000
+  validation_steps: 2000
   max_train_steps:
-  stage1_decom_only_steps: 500
-  stage2_adapter_steps: 500
-  freeze_decom_steps: 1000
-  decom_warmup_steps: 500
-  joint_retinex_ramp_steps: 300
+  stage1_decom_only_steps: 300
+  stage2_adapter_steps: 300
+  freeze_decom_steps: 800
+  decom_warmup_steps: 200
+  joint_retinex_ramp_steps: 150
 
 evaluation:
   num_inference_steps: 8
   benchmark_inference_steps: [8, 20]
-  num_validation_images: 8
+  num_validation_images: 6
   semantic_backbone: none
   nr_metric: none
   guidance_scale: 1.5

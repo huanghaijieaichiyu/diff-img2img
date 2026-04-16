@@ -71,15 +71,18 @@ class LowLightDataset(Dataset):
             for entry in manifest_entries:
                 if not entry.get("low_path") or not entry.get("high_path"):
                     continue
+                use_train_cache = int(entry.get("train_resolution") or 0) == int(self.img_size)
+                low_field = "train_low_path" if use_train_cache and entry.get("train_low_path") else "low_path"
+                high_field = "train_high_path" if use_train_cache and entry.get("train_high_path") else "high_path"
                 low_path = resolve_manifest_entry_path(
                     entry,
-                    "low_path",
+                    low_field,
                     data_dir=self.image_dir,
                     prepared_cache_dir=self.prepared_cache_dir,
                 )
                 high_path = resolve_manifest_entry_path(
                     entry,
-                    "high_path",
+                    high_field,
                     data_dir=self.image_dir,
                     prepared_cache_dir=self.prepared_cache_dir,
                 )

@@ -11,6 +11,7 @@ from utils.project_config import (
 
 def test_resolve_config_path_for_named_preset():
     assert resolve_config_path("middle").endswith("configs/train/middle.yaml")
+    assert resolve_config_path("small_throughput").endswith("configs/train/small_throughput.yaml")
 
 
 def test_load_config_defaults_exposes_flattened_values():
@@ -82,3 +83,18 @@ def test_runtime_summary_includes_backend_fields():
     assert summary["torch_compile_mode"] == "reduce-overhead"
     assert summary["enable_xformers_memory_efficient_attention"] is True
     assert summary["resolved_unet_backend"] == "xformers"
+
+
+def test_runtime_summary_includes_inject_mode_and_prepared_train_resolution():
+    summary = build_runtime_summary(
+        {
+            "mode": "train",
+            "config": "small_throughput",
+            "config_name": "small_throughput",
+            "inject_mode": "concat_pyramid",
+            "prepared_train_resolution": 256,
+        }
+    )
+
+    assert summary["inject_mode"] == "concat_pyramid"
+    assert summary["prepared_train_resolution"] == 256

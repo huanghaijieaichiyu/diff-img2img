@@ -117,6 +117,11 @@ class DiffusionEngine:
             "gpu_allocated_gb",
             "gpu_reserved_gb",
             "gpu_max_reserved_gb",
+            "val_psnr",
+            "val_ssim",
+            "val_lpips",
+            "val_seconds_per_image",
+            "val_step_count",
         ]
         self.process = psutil.Process(os.getpid())
         self.process.cpu_percent(None)
@@ -293,6 +298,7 @@ class DiffusionEngine:
             self.decom_model,
             self.condition_adapter,
             conditioning_space=self.args.conditioning_space,
+            inject_mode=getattr(self.args, "inject_mode", "concat_pyramid"),
         )
 
         self.ema_models = {}
@@ -817,6 +823,19 @@ class DiffusionEngine:
 
         return base_weight
 
+    def _retinex_branch_multiplier(self, phase: str, joint_step: int) -> float:
+        if not self.args.use_retinex:
+            return 0.0
+        if phase in {"stage1_decom", "decom_warmup", "stage2_adapter"}:
+            return float(self.args.retinex_loss_weight)
+        if phase != "stage3_joint":
+            return float(self.args.retinex_loss_weight)
+        if joint_step < self.args.joint_retinex_ramp_steps:
+            ramp_progress = joint_step / max(1, self.args.joint_retinex_ramp_steps)
+            ramp_weight = 0.5 * (1 - math.cos(math.pi * ramp_progress))
+            return float(self.args.retinex_loss_weight) * float(ramp_weight)
+        return float(self.args.retinex_loss_weight)
+
     def _residual_target(self, clean_images: torch.Tensor, low_light_images: torch.Tensor) -> torch.Tensor:
         return (clean_images - low_light_images) * self.args.residual_scale
 
@@ -1275,11 +1294,20 @@ class DiffusionEngine:
                 )
 
         with self.accelerator.accumulate(self.training_model):
+            decom_trainable = phase in {"stage1_decom", "decom_warmup", "stage2_adapter"} or (
+                phase == "stage3_joint" and joint_step >= self.args.freeze_decom_steps
+            )
+            retinex_branch_multiplier = self._retinex_branch_multiplier(phase, joint_step)
+            compute_clean_decomposition = phase in {"stage1_decom", "decom_warmup"} or retinex_branch_multiplier > 0.0
+            clean_decomposition_requires_grad = decom_trainable and compute_clean_decomposition
             if phase in ["stage1_decom", "decom_warmup"]:
                 _, aux = self.training_model(
                     low_light_images,
                     clean_images=clean_images,
                     decomposition_only=True,
+                    decomposition_requires_grad=decom_trainable,
+                    compute_clean_decomposition=compute_clean_decomposition,
+                    clean_decomposition_requires_grad=clean_decomposition_requires_grad,
                 )
                 retinex_losses = self._compute_retinex_losses(aux)
                 loss = retinex_losses["retinex_total"]
@@ -1288,9 +1316,9 @@ class DiffusionEngine:
                 if self.accelerator.sync_gradients:
                     if self._optimizer_has_gradients(optimizer):
                         self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
-                        self._ema_step()
                         optimizer.step()
                         lr_scheduler.step()
+                        self._ema_step()
                     elif self.accelerator.is_main_process:
                         logger.warning(
                             "Skipping optimizer step in %s at global_step=%s because no gradients were recorded.",
@@ -1338,6 +1366,9 @@ class DiffusionEngine:
                 noisy_target,
                 timesteps,
                 clean_images=clean_images,
+                decomposition_requires_grad=decom_trainable,
+                compute_clean_decomposition=compute_clean_decomposition,
+                clean_decomposition_requires_grad=clean_decomposition_requires_grad,
             )
 
             if self.args.prediction_type == "epsilon":
@@ -1367,9 +1398,13 @@ class DiffusionEngine:
             if torch.any(timestep_mask):
                 x0_weights = self._x0_branch_weight(joint_step, timesteps[timestep_mask])
                 if isinstance(x0_weights, torch.Tensor) and x0_weights.sum() > 0:
-                    x0_loss_raw, x0_logs = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
-                    # Apply per-sample time-dependent weighting
-                    x0_loss = x0_loss_raw * x0_weights.mean()
+                    pred_clean_masked = pred_clean[timestep_mask]
+                    clean_masked = clean_images[timestep_mask]
+                    x0_loss, x0_logs = self.criterion(
+                        pred_clean_masked,
+                        clean_masked,
+                        sample_weight=x0_weights,
+                    )
                 elif isinstance(x0_weights, float) and x0_weights > 0:
                     x0_loss, x0_logs = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
                     x0_loss = x0_loss * x0_weights
@@ -1377,23 +1412,16 @@ class DiffusionEngine:
             loss = loss_diffusion + x0_loss
 
             retinex_losses = self._compute_retinex_losses(aux)
-            if self.args.use_retinex:
-                # P0 Fix: Use smooth cosine ramp instead of sudden jump
-                if joint_step < self.args.joint_retinex_ramp_steps:
-                    ramp_progress = joint_step / max(1, self.args.joint_retinex_ramp_steps)
-                    ramp_weight = 0.5 * (1 - math.cos(math.pi * ramp_progress))
-                    loss = loss + self.args.retinex_loss_weight * ramp_weight * retinex_losses["retinex_total"]
-                else:
-                    loss = loss + self.args.retinex_loss_weight * retinex_losses["retinex_total"]
+            if retinex_branch_multiplier > 0.0:
+                loss = loss + retinex_branch_multiplier * retinex_losses["retinex_total"]
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
                 if self._optimizer_has_gradients(optimizer):
                     self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
-                    # P0 Fix: Update EMA before optimizer.step() to use pre-update parameters
-                    self._ema_step()
                     optimizer.step()
                     lr_scheduler.step()
+                    self._ema_step()
                 elif self.accelerator.is_main_process:
                     logger.warning(
                         "Skipping optimizer step in %s at global_step=%s because no gradients were recorded.",
@@ -1440,6 +1468,7 @@ class DiffusionEngine:
             decom_model=decom,
             condition_adapter=condition_adapter,
             conditioning_space=self.args.conditioning_space,
+            inject_mode=getattr(self.args, "inject_mode", "concat_pyramid"),
         )
 
         use_cfg = guidance_scale > 1.0
@@ -1607,6 +1636,7 @@ class DiffusionEngine:
         semantic_metric = self._get_semantic_metric() if compute_semantic else None
 
         validation_results = {}
+        validation_started_at = time.perf_counter()
         if self.accelerator.is_main_process:
             logger.info(
                 "Validation plan: steps=%s metrics=%s",
@@ -1637,6 +1667,7 @@ class DiffusionEngine:
                 "val_lpips": primary_metrics.get("lpips"),
                 "val_step": step,
             }
+            primary_seconds_per_image = primary_metrics.get("seconds_per_image")
 
             log_dict = {}
             lines = []
@@ -1667,6 +1698,40 @@ class DiffusionEngine:
                 "phase": "validation",
                 **self.latest_validation_metrics,
             })
+            self._append_training_metrics(
+                step or 0,
+                "validation",
+                {
+                    "epoch": "",
+                    "loss": "",
+                    "lr": "",
+                    "l_diff": "",
+                    "l_x0": "",
+                    "l_wavelet": "",
+                    "x0_w": "",
+                    "l_ret": "",
+                    "l_recon_low": "",
+                    "l_recon_high": "",
+                    "l_consistency": "",
+                    "l_exposure": "",
+                    "l_tv": "",
+                    "data_time": "",
+                    "compute_time": time.perf_counter() - validation_started_at,
+                    "iter_time": "",
+                    "data_wait_ratio": "",
+                    "samples_per_sec": "",
+                    "cpu_percent": "",
+                    "cpu_rss_gb": "",
+                    "gpu_allocated_gb": "",
+                    "gpu_reserved_gb": "",
+                    "gpu_max_reserved_gb": "",
+                    "val_psnr": primary_metrics.get("psnr"),
+                    "val_ssim": primary_metrics.get("ssim"),
+                    "val_lpips": primary_metrics.get("lpips"),
+                    "val_seconds_per_image": primary_seconds_per_image,
+                    "val_step_count": self.args.num_inference_steps,
+                },
+            )
 
             metrics_path = os.path.join(self.args.output_dir, "metrics.txt")
             with open(metrics_path, "w") as metrics_file:

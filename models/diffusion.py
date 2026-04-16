@@ -66,12 +66,14 @@ class CombinedModel(nn.Module):
         decom_model=None,
         condition_adapter=None,
         conditioning_space: str = "hvi_lite",
+        inject_mode: str = "concat_pyramid",
     ):
         super().__init__()
         self.unet = unet
         self.decom_model = decom_model
         self.condition_adapter = condition_adapter
         self.conditioning_space = conditioning_space
+        self.inject_mode = inject_mode
 
     def _uses_compiled_unet(self) -> bool:
         return has_compiled_module(self.unet)
@@ -90,26 +92,37 @@ class CombinedModel(nn.Module):
             return rgb_to_hvi_lite(low_light_01)
         return low_light_01
 
-    def _decompose(self, images_01: torch.Tensor):
+    def _decompose(self, images_01: torch.Tensor, *, requires_grad: bool = True):
         if self.decom_model is None:
             return None, None
-        return self.decom_model(images_01)
+        if requires_grad:
+            return self.decom_model(images_01)
+        with torch.no_grad():
+            return self.decom_model(images_01)
 
-    def _build_auxiliary(self, low_light_images: torch.Tensor, clean_images: torch.Tensor | None = None):
+    def _build_auxiliary(
+        self,
+        low_light_images: torch.Tensor,
+        clean_images: torch.Tensor | None = None,
+        *,
+        decomposition_requires_grad: bool = True,
+        compute_clean_decomposition: bool = True,
+        clean_decomposition_requires_grad: bool = True,
+    ):
         low_light_01 = (low_light_images / 2 + 0.5).clamp(0, 1)
         aux = {
             "low_light_01": low_light_01,
             "conditioning_space": self.conditioning_space,
         }
 
-        r_low, i_low = self._decompose(low_light_01)
+        r_low, i_low = self._decompose(low_light_01, requires_grad=decomposition_requires_grad)
         aux["r_low"] = r_low
         aux["i_low"] = i_low
 
-        if clean_images is not None:
+        if clean_images is not None and compute_clean_decomposition:
             clean_images_01 = (clean_images / 2 + 0.5).clamp(0, 1)
             aux["clean_images_01"] = clean_images_01
-            r_high, i_high = self._decompose(clean_images_01)
+            r_high, i_high = self._decompose(clean_images_01, requires_grad=clean_decomposition_requires_grad)
             aux["r_high"] = r_high
             aux["i_high"] = i_high
 
@@ -130,8 +143,23 @@ class CombinedModel(nn.Module):
         aux["detail_input"] = detail_input
         return aux
 
-    def build_model_input(self, low_light_images: torch.Tensor, noisy_images: torch.Tensor, clean_images: torch.Tensor | None = None):
-        aux = self._build_auxiliary(low_light_images, clean_images=clean_images)
+    def build_model_input(
+        self,
+        low_light_images: torch.Tensor,
+        noisy_images: torch.Tensor,
+        clean_images: torch.Tensor | None = None,
+        *,
+        decomposition_requires_grad: bool = True,
+        compute_clean_decomposition: bool = True,
+        clean_decomposition_requires_grad: bool = True,
+    ):
+        aux = self._build_auxiliary(
+            low_light_images,
+            clean_images=clean_images,
+            decomposition_requires_grad=decomposition_requires_grad,
+            compute_clean_decomposition=compute_clean_decomposition,
+            clean_decomposition_requires_grad=clean_decomposition_requires_grad,
+        )
 
         if self.condition_adapter is not None:
             adapter_output = self.condition_adapter(noisy_images, aux["illumination_input"], aux["detail_input"])
@@ -157,7 +185,7 @@ class CombinedModel(nn.Module):
             self._mark_cudagraph_step_begin()
 
         film_state = aux.get("film_state")
-        if film_state:
+        if self.inject_mode == "film_pyramid" and film_state:
             with UNetBlockFiLMContext(self.unet, film_state):
                 sample = self.unet(model_input, timesteps).sample
         else:
@@ -176,12 +204,28 @@ class CombinedModel(nn.Module):
         timesteps: torch.Tensor | None = None,
         clean_images: torch.Tensor | None = None,
         decomposition_only: bool = False,
+        decomposition_requires_grad: bool = True,
+        compute_clean_decomposition: bool = True,
+        clean_decomposition_requires_grad: bool = True,
     ):
         if decomposition_only:
-            return None, self._build_auxiliary(low_light_images, clean_images=clean_images)
+            return None, self._build_auxiliary(
+                low_light_images,
+                clean_images=clean_images,
+                decomposition_requires_grad=decomposition_requires_grad,
+                compute_clean_decomposition=compute_clean_decomposition,
+                clean_decomposition_requires_grad=clean_decomposition_requires_grad,
+            )
 
         if noisy_images is None or timesteps is None:
             raise ValueError("noisy_images and timesteps are required for diffusion forward.")
 
-        model_input, aux = self.build_model_input(low_light_images, noisy_images, clean_images=clean_images)
+        model_input, aux = self.build_model_input(
+            low_light_images,
+            noisy_images,
+            clean_images=clean_images,
+            decomposition_requires_grad=decomposition_requires_grad,
+            compute_clean_decomposition=compute_clean_decomposition,
+            clean_decomposition_requires_grad=clean_decomposition_requires_grad,
+        )
         return self.run_unet(model_input, timesteps, aux), aux

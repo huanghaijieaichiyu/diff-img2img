@@ -11,6 +11,7 @@ import yaml
 
 MODEL_CONFIG_PRESETS = {
     "small": "configs/train/small.yaml",
+    "small_throughput": "configs/train/small_throughput.yaml",
     "middle": "configs/train/middle.yaml",
     "max": "configs/train/max.yaml",
 }
@@ -170,8 +171,10 @@ def build_runtime_summary(args: argparse.Namespace | SimpleNamespace | dict[str,
         "train_validation_benchmark_steps": payload.get("train_validation_benchmark_steps"),
         "use_retinex": payload.get("use_retinex"),
         "conditioning_space": payload.get("conditioning_space"),
+        "inject_mode": payload.get("inject_mode"),
         "decom_variant": payload.get("decom_variant"),
         "condition_variant": payload.get("condition_variant"),
+        "prepared_train_resolution": payload.get("prepared_train_resolution"),
         "semantic_backbone": payload.get("semantic_backbone"),
         "nr_metric": payload.get("nr_metric"),
         "attention_backend": payload.get("attention_backend"),
@@ -198,7 +201,8 @@ def runtime_summary_lines(summary: dict[str, Any], prefix: str = "[config-summar
         f"{prefix} train_validation=fast:{summary.get('train_fast_validation')} "
         f"metrics:{summary.get('train_validation_metrics')} steps:{summary.get('train_validation_benchmark_steps')}",
         f"{prefix} model=use_retinex:{summary.get('use_retinex')} decom_variant:{summary.get('decom_variant')} "
-        f"condition_variant:{summary.get('condition_variant')} conditioning_space:{summary.get('conditioning_space')}",
+        f"condition_variant:{summary.get('condition_variant')} conditioning_space:{summary.get('conditioning_space')} "
+        f"inject_mode:{summary.get('inject_mode')} prepared_train_resolution:{summary.get('prepared_train_resolution')}",
         f"{prefix} backend=requested:{summary.get('attention_backend')} compile:{summary.get('use_torch_compile')} "
         f"compile_mode:{summary.get('torch_compile_mode')} xformers_requested:{summary.get('enable_xformers_memory_efficient_attention')} "
         f"resolved:{summary.get('resolved_unet_backend')}",

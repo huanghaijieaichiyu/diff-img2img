@@ -290,6 +290,8 @@ def apply_profile_defaults(args):
         args.decode_cache_size = 0
     if getattr(args, "opencv_threads_per_worker", None) is None:
         args.opencv_threads_per_worker = 1
+    if getattr(args, "prepared_train_resolution", None) in ("", None):
+        args.prepared_train_resolution = None
     if getattr(args, "use_lpips", None) is None:
         args.use_lpips = True
     if getattr(args, "lpips_resize", None) in ("", None):
@@ -298,6 +300,8 @@ def apply_profile_defaults(args):
         args.wavelet_loss_weight = 0.0
     if getattr(args, "attention_backend", None) in ("", None):
         args.attention_backend = "auto"
+    if getattr(args, "inject_mode", None) in ("", None):
+        args.inject_mode = "concat_pyramid"
     if getattr(args, "use_torch_compile", None) is None:
         args.use_torch_compile = True
     if getattr(args, "torch_compile_mode", None) in ("", None):
@@ -386,6 +390,7 @@ def _ensure_prepared_training_manifest(args):
         synthesis_seed=args.synthesis_seed,
         darker_ranges=args.darker_ranges,
         prepare_workers=args.prepare_workers,
+        prepared_train_resolution=args.prepared_train_resolution,
         force=args.prepare_force,
         prepare_on_train=args.prepare_on_train,
     )
@@ -495,7 +500,7 @@ def get_args():
     _add_hidden_argument(parser, "--unet_down_block_types", nargs="+", type=str)
     _add_hidden_argument(parser, "--unet_up_block_types", nargs="+", type=str)
     _add_hidden_argument(parser, "--conditioning_space", type=str, choices=["hvi_lite", "rgb"])
-    _add_hidden_argument(parser, "--inject_mode", type=str, choices=["film_pyramid"])
+    _add_hidden_argument(parser, "--inject_mode", type=str, choices=["film_pyramid", "concat_pyramid"])
     _add_hidden_argument(parser, "--base_condition_channels", type=int)
     _add_hidden_argument(parser, "--decom_base_channels", type=int)
     _add_hidden_argument(parser, "--decom_variant", type=str, choices=["small", "middle", "max", "naf", "naf_lite"])
@@ -512,6 +517,7 @@ def get_args():
     _add_hidden_argument(parser, "--pin_memory", action=argparse.BooleanOptionalAction, default=None)
     _add_hidden_argument(parser, "--decode_cache_size", type=int)
     _add_hidden_argument(parser, "--opencv_threads_per_worker", type=int)
+    _add_hidden_argument(parser, "--prepared_train_resolution", type=int)
     _add_hidden_argument(parser, "--semantic_backbone", type=str, choices=["none", "resnet18"])
     _add_hidden_argument(parser, "--nr_metric", type=str, choices=["none", "niqe"])
     _add_hidden_argument(parser, "--port", type=int)

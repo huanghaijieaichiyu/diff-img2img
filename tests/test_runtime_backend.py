@@ -32,7 +32,7 @@ def test_auto_backend_uses_compile_when_hooks_are_not_dynamic():
             use_torch_compile=True,
             torch_compile_mode="reduce-overhead",
             enable_xformers_memory_efficient_attention=False,
-            inject_mode="none",
+            inject_mode="concat_pyramid",
             allow_unsafe_compile_with_film=False,
         )
     )
