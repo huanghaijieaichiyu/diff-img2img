@@ -46,14 +46,16 @@ from utils.video_writer import video_writer
 
 logger = get_logger(__name__, log_level="INFO")
 
-SUPPORTED_VALIDATION_METRICS = ("psnr", "ssim", "lpips", "semantic_distance", "niqe")
+SUPPORTED_VALIDATION_METRICS = (
+    "psnr", "ssim", "lpips", "semantic_distance", "niqe")
 
 
 def normalize_validation_metrics(metrics) -> tuple[str, ...]:
     if metrics in (None, "", []):
         return ("psnr", "ssim")
     if isinstance(metrics, str):
-        metrics = [part.strip() for part in metrics.replace(",", " ").split() if part.strip()]
+        metrics = [part.strip() for part in metrics.replace(
+            ",", " ").split() if part.strip()]
     normalized = []
     requested = []
     for metric in metrics:
@@ -126,8 +128,10 @@ class DiffusionEngine:
         self.process = psutil.Process(os.getpid())
         self.process.cpu_percent(None)
         self.latest_validation_metrics = {}
-        self.status_json_path = os.path.join(args.output_dir, "training_status.json")
-        self.resolved_config_path = os.path.join(args.output_dir, "resolved_config.json")
+        self.status_json_path = os.path.join(
+            args.output_dir, "training_status.json")
+        self.resolved_config_path = os.path.join(
+            args.output_dir, "resolved_config.json")
         self.runtime_summary = build_runtime_summary(args)
         self._eval_dataloader = None
         self._lpips_fn = None
@@ -167,7 +171,8 @@ class DiffusionEngine:
                 "GPU memory note: gpu_allocated_gb tracks active tensor memory, while gpu_reserved_gb tracks the allocator cache pool."
             )
 
-        self.metrics_csv_path = os.path.join(args.output_dir, "training_metrics.csv")
+        self.metrics_csv_path = os.path.join(
+            args.output_dir, "training_metrics.csv")
         self._joint_decom_trainable = None
         self.unet_runtime_backend = None
         self._setup_models()
@@ -191,9 +196,11 @@ class DiffusionEngine:
 
     def _validation_plan(self, fast: bool) -> tuple[list[int], tuple[str, ...]]:
         if fast:
-            metric_names = normalize_validation_metrics(getattr(self.args, "train_validation_metrics", ("psnr", "ssim")))
+            metric_names = normalize_validation_metrics(
+                getattr(self.args, "train_validation_metrics", ("psnr", "ssim")))
         else:
-            metric_names = ("psnr", "ssim", "lpips", "semantic_distance", "niqe")
+            metric_names = ("psnr", "ssim", "lpips",
+                            "semantic_distance", "niqe")
         step_counts = resolve_validation_step_counts(
             self.args.num_inference_steps,
             self.args.benchmark_inference_steps,
@@ -212,6 +219,10 @@ class DiffusionEngine:
             phase="test",
             decode_cache_size=getattr(self.args, "decode_cache_size", 0),
         )
+        if len(eval_dataset) == 0:
+            raise RuntimeError(
+                "Validation dataset is empty. Expected files under '<data_dir>/eval15/{low,high}'."
+            )
         eval_loader_kwargs = {
             "batch_size": self.args.batch_size,
             "shuffle": False,
@@ -237,7 +248,8 @@ class DiffusionEngine:
         try:
             import lpips
 
-            self._lpips_fn = lpips.LPIPS(net="vgg", verbose=False).to(self.accelerator.device)
+            self._lpips_fn = lpips.LPIPS(
+                net="vgg", verbose=False).to(self.accelerator.device)
             self._lpips_fn.eval()
         except ImportError:
             logger.warning("lpips not installed. Skipping LPIPS metric.")
@@ -256,7 +268,8 @@ class DiffusionEngine:
         # Dynamic channel calculation based on preset
         cond_channels = getattr(self.args, 'cond_out_channels', 7)
         input_channels = 3 + cond_channels  # noisy + condition_map
-        logger.info(f"Initializing UNet (Input Channels={input_channels}, Condition Channels={cond_channels})...")
+        logger.info(
+            f"Initializing UNet (Input Channels={input_channels}, Condition Channels={cond_channels})...")
         self.unet = UNet2DModel(
             sample_size=self.args.resolution,
             in_channels=input_channels,
@@ -332,7 +345,8 @@ class DiffusionEngine:
 
     def _configure_unet_runtime_backend(self):
         backend = resolve_unet_runtime_backend(self.args)
-        checkpointing_enabled = bool(getattr(self.args, "enable_gradient_checkpointing", False))
+        checkpointing_enabled = bool(
+            getattr(self.args, "enable_gradient_checkpointing", False))
 
         if checkpointing_enabled:
             self.unet.enable_gradient_checkpointing()
@@ -345,7 +359,8 @@ class DiffusionEngine:
             self._record_unet_backend_summary(backend)
 
         if self.accelerator.is_main_process:
-            reason_text = "; ".join(backend.reasons) if backend.reasons else "no extra notes"
+            reason_text = "; ".join(
+                backend.reasons) if backend.reasons else "no extra notes"
             logger.info(
                 "UNet runtime backend: requested=%s resolved=%s compile=%s xformers=%s gradient_checkpointing=%s (%s)",
                 backend.requested_backend,
@@ -403,7 +418,8 @@ class DiffusionEngine:
 
     @staticmethod
     def _parallel_wrapper_types():
-        wrapper_types = [torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel]
+        wrapper_types = [
+            torch.nn.parallel.DistributedDataParallel, torch.nn.DataParallel]
         try:
             from deepspeed import DeepSpeedEngine
 
@@ -465,19 +481,24 @@ class DiffusionEngine:
                 else:
                     no_decay_params.append(parameter)
 
-        add_named_params(self.training_model.named_parameters(), include_frozen=True)
-        add_named_params(self.criterion.named_parameters(), include_frozen=False)
+        add_named_params(
+            self.training_model.named_parameters(), include_frozen=True)
+        add_named_params(self.criterion.named_parameters(),
+                         include_frozen=False)
 
         param_groups = []
         if decay_params:
             param_groups.append({"params": decay_params, "weight_decay": 0.01})
         if no_decay_params:
-            param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+            param_groups.append(
+                {"params": no_decay_params, "weight_decay": 0.0})
         return param_groups
 
     def _params_for_gradient_clipping(self):
-        params = [parameter for parameter in self.training_model.parameters() if parameter.requires_grad]
-        params.extend(parameter for parameter in self.criterion.parameters() if parameter.requires_grad)
+        params = [parameter for parameter in self.training_model.parameters()
+                  if parameter.requires_grad]
+        params.extend(parameter for parameter in self.criterion.parameters(
+        ) if parameter.requires_grad)
         return params
 
     @staticmethod
@@ -492,6 +513,10 @@ class DiffusionEngine:
         stage1_end = getattr(self.args, "stage1_decom_only_steps", 0)
         stage2_end = stage1_end + getattr(self.args, "stage2_adapter_steps", 0)
         return stage1_end, stage2_end
+
+    @staticmethod
+    def _resolve_training_epoch_limit(max_train_steps: int, num_update_steps_per_epoch: int) -> int:
+        return max(1, math.ceil(max_train_steps / max(1, num_update_steps_per_epoch)))
 
     def _set_training_stage(self, global_step: int):
         """
@@ -530,7 +555,8 @@ class DiffusionEngine:
                 self._set_trainable(unwrapped.decom_model, decom_trainable)
                 self._joint_decom_trainable = decom_trainable
                 state = "trainable" if decom_trainable else "frozen"
-                logger.info(f"Setting decomposition network to {state} at joint_step={joint_step}")
+                logger.info(
+                    f"Setting decomposition network to {state} at joint_step={joint_step}")
 
             return "stage3_joint"
 
@@ -551,7 +577,8 @@ class DiffusionEngine:
         self._set_trainable(unwrapped_model.decom_model, decom_trainable)
         self._joint_decom_trainable = decom_trainable
         state = "trainable" if decom_trainable else "frozen"
-        logger.info(f"Setting decomposition network to {state} at joint_step={joint_step}")
+        logger.info(
+            f"Setting decomposition network to {state} at joint_step={joint_step}")
 
     def _ema_file_map(self, save_path: str):
         return {
@@ -574,8 +601,10 @@ class DiffusionEngine:
             for candidate_path in candidate_paths:
                 if not os.path.exists(candidate_path):
                     continue
-                ema_model.load_state_dict(torch.load(candidate_path, map_location=self.accelerator.device))
-                logger.info(f"Loaded EMA state for {module_name} from {candidate_path}")
+                ema_model.load_state_dict(torch.load(
+                    candidate_path, map_location=self.accelerator.device))
+                logger.info(
+                    f"Loaded EMA state for {module_name} from {candidate_path}")
                 break
 
     def _save_ema_state(self, save_path: str):
@@ -587,7 +616,8 @@ class DiffusionEngine:
             target_path = file_map[module_name][0]
             torch.save(ema_model.state_dict(), target_path)
             if module_name == "unet":
-                torch.save(ema_model.state_dict(), os.path.join(save_path, "ema_model.pth"))
+                torch.save(ema_model.state_dict(), os.path.join(
+                    save_path, "ema_model.pth"))
 
     def _ema_store(self):
         if not self.args.use_ema or not self.ema_models:
@@ -638,7 +668,8 @@ class DiffusionEngine:
             decay_start = 0.95
             decay_end = self.args.ema_decay
             # Smooth cosine interpolation
-            decay = decay_start + (decay_end - decay_start) * (0.5 * (1 - math.cos(math.pi * progress)))
+            decay = decay_start + (decay_end - decay_start) * \
+                (0.5 * (1 - math.cos(math.pi * progress)))
         else:
             decay = self.args.ema_decay
 
@@ -657,6 +688,17 @@ class DiffusionEngine:
             os.path.join(os.path.dirname(path), filename),
         ]
 
+    def _ordered_weight_candidates(self, path: str, *filenames: str):
+        ordered = []
+        seen = set()
+        for filename in filenames:
+            for candidate in self._candidate_paths(path, filename):
+                if candidate in seen:
+                    continue
+                ordered.append(candidate)
+                seen.add(candidate)
+        return ordered
+
     def _load_checkpoint(self, path):
         logger.info(f"Loading model from {path}...")
 
@@ -667,10 +709,12 @@ class DiffusionEngine:
             unet_path = path
 
         try:
-            self.unet = UNet2DModel.from_pretrained(unet_path, use_safetensors=True)
+            self.unet = UNet2DModel.from_pretrained(
+                unet_path, use_safetensors=True)
         except Exception:
             try:
-                self.unet = UNet2DModel.from_pretrained(unet_path, use_safetensors=False)
+                self.unet = UNet2DModel.from_pretrained(
+                    unet_path, use_safetensors=False)
             except Exception as exc:
                 logger.warning(f"Could not load UNet from {unet_path}: {exc}")
 
@@ -678,45 +722,53 @@ class DiffusionEngine:
 
         if self.decom_model is not None:
             loaded = False
-            for decom_path in self._candidate_paths(path, "decom_model.pth") + self._candidate_paths(path, "decom_model_best.pth"):
+            for decom_path in self._ordered_weight_candidates(path, "decom_model_best.pth", "decom_model.pth"):
                 if os.path.exists(decom_path):
                     try:
-                        self.decom_model.load_state_dict(torch.load(decom_path, map_location=self.accelerator.device))
+                        self.decom_model.load_state_dict(torch.load(
+                            decom_path, map_location=self.accelerator.device))
                         logger.info(f"DecomNet loaded from {decom_path}.")
                         loaded = True
                         break
                     except Exception as exc:
-                        logger.warning(f"Failed to load DecomNet from {decom_path}: {exc}")
+                        logger.warning(
+                            f"Failed to load DecomNet from {decom_path}: {exc}")
             if not loaded:
                 logger.warning("DecomNet weights not found.")
 
         loaded_adapter = False
-        adapter_candidates = (
-            self._candidate_paths(path, "condition_adapter.pth") +
-            self._candidate_paths(path, "condition_adapter_best.pth") +
-            self._candidate_paths(path, "condition_adapter_final.pth")
+        adapter_candidates = self._ordered_weight_candidates(
+            path,
+            "condition_adapter_best.pth",
+            "condition_adapter_final.pth",
+            "condition_adapter.pth",
         )
         for adapter_path in adapter_candidates:
             if os.path.exists(adapter_path):
                 try:
                     self.condition_adapter.load_state_dict(
-                        torch.load(adapter_path, map_location=self.accelerator.device),
+                        torch.load(
+                            adapter_path, map_location=self.accelerator.device),
                         strict=False,
                     )
-                    logger.info(f"Condition adapter loaded from {adapter_path}.")
+                    logger.info(
+                        f"Condition adapter loaded from {adapter_path}.")
                     loaded_adapter = True
                     break
                 except Exception as exc:
-                    logger.warning(f"Failed to load condition adapter from {adapter_path}: {exc}")
+                    logger.warning(
+                        f"Failed to load condition adapter from {adapter_path}: {exc}")
         if not loaded_adapter:
             logger.warning("Condition adapter weights not found.")
 
     def _worker_init_fn(self, worker_id: int):
         worker_info = get_worker_info()
-        worker_seed = worker_info.seed if worker_info is not None else (self.args.seed or 42) + worker_id
+        worker_seed = worker_info.seed if worker_info is not None else (
+            self.args.seed or 42) + worker_id
         random.seed(worker_seed)
         np.random.seed(worker_seed % (2 ** 32 - 1))
-        cv2.setNumThreads(max(0, int(getattr(self.args, "opencv_threads_per_worker", 1))))
+        cv2.setNumThreads(
+            max(0, int(getattr(self.args, "opencv_threads_per_worker", 1))))
 
     def _collect_runtime_metrics(self, data_time: float, compute_time: float, batch_size: int) -> dict:
         iter_time = max(data_time + compute_time, 1e-8)
@@ -807,7 +859,8 @@ class DiffusionEngine:
         if self.args.x0_loss_warmup_steps <= 0:
             base_weight = self.args.x0_loss_weight
         else:
-            progress = (global_step - stage2_end) / float(self.args.x0_loss_warmup_steps)
+            progress = (global_step - stage2_end) / \
+                float(self.args.x0_loss_warmup_steps)
             progress = max(0.0, min(1.0, progress))
             # Cosine warmup: slow start, fast finish
             cosine_progress = 0.5 * (1 - math.cos(math.pi * progress))
@@ -831,7 +884,8 @@ class DiffusionEngine:
         if phase != "stage3_joint":
             return float(self.args.retinex_loss_weight)
         if joint_step < self.args.joint_retinex_ramp_steps:
-            ramp_progress = joint_step / max(1, self.args.joint_retinex_ramp_steps)
+            ramp_progress = joint_step / \
+                max(1, self.args.joint_retinex_ramp_steps)
             ramp_weight = 0.5 * (1 - math.cos(math.pi * ramp_progress))
             return float(self.args.retinex_loss_weight) * float(ramp_weight)
         return float(self.args.retinex_loss_weight)
@@ -844,12 +898,14 @@ class DiffusionEngine:
         return (low_light_images + residual).clamp(-1, 1)
 
     def _reconstruct_x0(self, noisy_target: torch.Tensor, model_pred: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
-        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(noisy_target.device)
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod.to(
+            noisy_target.device)
         alpha_prod_t = alphas_cumprod[timesteps][:, None, None, None]
         beta_prod_t = 1 - alpha_prod_t
 
         if self.args.prediction_type == "epsilon":
-            pred_x0 = (noisy_target - beta_prod_t.sqrt() * model_pred) / (alpha_prod_t.sqrt() + 1e-8)
+            pred_x0 = (noisy_target - beta_prod_t.sqrt() *
+                       model_pred) / (alpha_prod_t.sqrt() + 1e-8)
         else:
             pred_x0 = alpha_prod_t.sqrt() * noisy_target - beta_prod_t.sqrt() * model_pred
         return pred_x0
@@ -976,7 +1032,8 @@ class DiffusionEngine:
         return torch.optim.AdamW(param_groups, betas=(0.9, 0.999), eps=1e-8)
 
     def _load_checkpoint_metadata(self, checkpoint_dir: str):
-        metadata_path = os.path.join(checkpoint_dir, "checkpoint_metadata.json")
+        metadata_path = os.path.join(
+            checkpoint_dir, "checkpoint_metadata.json")
         if not os.path.exists(metadata_path):
             return
 
@@ -984,7 +1041,8 @@ class DiffusionEngine:
             with open(metadata_path, "r", encoding="utf-8") as metadata_file:
                 metadata = json.load(metadata_file)
         except Exception as exc:
-            logger.warning(f"Failed to read checkpoint metadata from {metadata_path}: {exc}")
+            logger.warning(
+                f"Failed to read checkpoint metadata from {metadata_path}: {exc}")
             return
 
         best_psnr = metadata.get("best_psnr")
@@ -1010,6 +1068,11 @@ class DiffusionEngine:
             decode_cache_size=getattr(self.args, "decode_cache_size", 0),
             prepared_cache_dir=getattr(self.args, "prepared_cache_dir", None),
         )
+        if len(train_dataset) == 0:
+            raise RuntimeError(
+                "Training dataset is empty. Please check prepared cache and source files under "
+                "'<data_dir>/our485/high'."
+            )
         train_loader_kwargs = {
             "batch_size": self.args.batch_size,
             "shuffle": True,
@@ -1019,13 +1082,20 @@ class DiffusionEngine:
             "worker_init_fn": self._worker_init_fn,
         }
         if self.args.num_workers > 0:
-            train_loader_kwargs["persistent_workers"] = bool(getattr(self.args, "persistent_workers", True))
-            train_loader_kwargs["prefetch_factor"] = max(2, int(getattr(self.args, "prefetch_factor", 4)))
+            train_loader_kwargs["persistent_workers"] = bool(
+                getattr(self.args, "persistent_workers", True))
+            train_loader_kwargs["prefetch_factor"] = max(
+                2, int(getattr(self.args, "prefetch_factor", 4)))
         train_dataloader = DataLoader(train_dataset, **train_loader_kwargs)
 
-        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / self.args.gradient_accumulation_steps)
+        num_update_steps_per_epoch = math.ceil(
+            len(train_dataloader) / self.args.gradient_accumulation_steps)
         if self.args.max_train_steps is None:
             self.args.max_train_steps = self.args.epochs * num_update_steps_per_epoch
+        max_train_epochs = self._resolve_training_epoch_limit(
+            self.args.max_train_steps,
+            num_update_steps_per_epoch,
+        )
 
         warmup_steps = self.args.decom_warmup_steps if self.args.use_retinex and self.decom_model is not None else 0
         total_training_steps = self.args.max_train_steps + warmup_steps
@@ -1035,16 +1105,20 @@ class DiffusionEngine:
             from diffusers.optimization import get_cosine_schedule_with_warmup
             lr_scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
-                num_warmup_steps=self.args.lr_warmup_steps * self.args.gradient_accumulation_steps,
-                num_training_steps=total_training_steps * self.args.gradient_accumulation_steps,
+                num_warmup_steps=self.args.lr_warmup_steps *
+                self.args.gradient_accumulation_steps,
+                num_training_steps=total_training_steps *
+                self.args.gradient_accumulation_steps,
                 num_cycles=0.5,
             )
         else:
             lr_scheduler = get_scheduler(
                 self.args.lr_scheduler,
                 optimizer=optimizer,
-                num_warmup_steps=self.args.lr_warmup_steps * self.args.gradient_accumulation_steps,
-                num_training_steps=total_training_steps * self.args.gradient_accumulation_steps,
+                num_warmup_steps=self.args.lr_warmup_steps *
+                self.args.gradient_accumulation_steps,
+                num_training_steps=total_training_steps *
+                self.args.gradient_accumulation_steps,
             )
 
         if self.args.use_uncertainty_weighting:
@@ -1073,26 +1147,33 @@ class DiffusionEngine:
                         tracker_config[key] = "None"
                     else:
                         del tracker_config[key]
-            self.accelerator.init_trackers(Path(self.args.output_dir).name, config=tracker_config)
+            self.accelerator.init_trackers(
+                Path(self.args.output_dir).name, config=tracker_config)
 
         global_step = 0
         first_epoch = 0
         completed_joint_steps = 0
         if self.args.resume:
             if self.args.resume == "latest":
-                checkpoints = [d for d in os.listdir(self.args.output_dir) if d.startswith("checkpoint-")]
+                checkpoints = [d for d in os.listdir(
+                    self.args.output_dir) if d.startswith("checkpoint-")]
                 if checkpoints:
-                    checkpoints = sorted(checkpoints, key=lambda item: int(item.split("-")[1]))
-                    self.args.resume = os.path.join(self.args.output_dir, checkpoints[-1])
+                    checkpoints = sorted(
+                        checkpoints, key=lambda item: int(item.split("-")[1]))
+                    self.args.resume = os.path.join(
+                        self.args.output_dir, checkpoints[-1])
                 else:
                     self.args.resume = None
 
             if self.args.resume and os.path.isdir(self.args.resume):
-                logger.info(f"Resuming training from checkpoint: {self.args.resume}")
+                logger.info(
+                    f"Resuming training from checkpoint: {self.args.resume}")
                 self.accelerator.load_state(self.args.resume)
-                global_step = int(os.path.basename(self.args.resume).split("-")[1])
+                global_step = int(os.path.basename(
+                    self.args.resume).split("-")[1])
                 completed_joint_steps = max(0, global_step - warmup_steps)
-                first_epoch = completed_joint_steps // max(1, num_update_steps_per_epoch)
+                first_epoch = completed_joint_steps // max(
+                    1, num_update_steps_per_epoch)
                 self._load_ema_state(self.args.resume)
                 self._load_checkpoint_metadata(self.args.resume)
 
@@ -1102,7 +1183,8 @@ class DiffusionEngine:
         logger.info("***** Running training *****")
         logger.info(
             "Effective batch size: %s (batch_size=%s x grad_accum=%s)",
-            getattr(self.args, "effective_batch_size", self.args.batch_size * self.args.gradient_accumulation_steps),
+            getattr(self.args, "effective_batch_size",
+                    self.args.batch_size * self.args.gradient_accumulation_steps),
             self.args.batch_size,
             self.args.gradient_accumulation_steps,
         )
@@ -1114,7 +1196,8 @@ class DiffusionEngine:
             total=total_training_steps,
             disable=not use_tqdm,
         )
-        live_display = create_training_display(total_steps=total_training_steps, enabled=rich_enabled)
+        live_display = create_training_display(
+            total_steps=total_training_steps, enabled=rich_enabled)
         live_display.start()
 
         # Track global step for EMA warmup
@@ -1162,7 +1245,8 @@ class DiffusionEngine:
                 logs["epoch"] = 0
                 logs["step"] = global_step
                 logs["phase"] = "decom_warmup"
-                numeric_logs = {k: v for k, v in logs.items() if isinstance(v, (int, float))}
+                numeric_logs = {
+                    k: v for k, v in logs.items() if isinstance(v, (int, float))}
                 if self.accelerator.is_main_process and self._should_log_step(global_step, terminal_step=warmup_steps):
                     live_display.update(logs)
                     if not rich_enabled:
@@ -1175,14 +1259,16 @@ class DiffusionEngine:
                             f"gpu_resv={logs['gpu_reserved_gb']:.2f}GB"
                         )
                     self.accelerator.log(numeric_logs, step=global_step)
-                    self._append_training_metrics(global_step, "decom_warmup", numeric_logs)
+                    self._append_training_metrics(
+                        global_step, "decom_warmup", numeric_logs)
                 last_iter_end = time.perf_counter()
                 accum_data_time = 0.0
                 accum_compute_time = 0.0
                 accum_samples = 0
 
         if warmup_steps > 0:
-            logger.info("Retinex warmup finished. Transitioning into joint training.")
+            logger.info(
+                "Retinex warmup finished. Transitioning into joint training.")
 
         completed_joint_steps = max(0, global_step - warmup_steps)
         if global_step >= warmup_steps:
@@ -1190,7 +1276,7 @@ class DiffusionEngine:
         accum_data_time = 0.0
         accum_compute_time = 0.0
         accum_samples = 0
-        for epoch in range(first_epoch, self.args.epochs):
+        for epoch in range(first_epoch, max_train_epochs):
             self.training_model.train()
             for batch in train_dataloader:
                 if completed_joint_steps >= self.args.max_train_steps:
@@ -1229,7 +1315,8 @@ class DiffusionEngine:
                     logs["epoch"] = epoch + 1
                     logs["step"] = global_step
                     logs["phase"] = phase
-                    numeric_logs = {k: v for k, v in logs.items() if isinstance(v, (int, float))}
+                    numeric_logs = {
+                        k: v for k, v in logs.items() if isinstance(v, (int, float))}
                     if self.accelerator.is_main_process and self._should_log_step(global_step, terminal_step=total_training_steps):
                         live_display.update(logs)
                         if not rich_enabled:
@@ -1253,12 +1340,14 @@ class DiffusionEngine:
                                     f"gpu_resv={logs['gpu_reserved_gb']:.2f}GB"
                                 )
                         self.accelerator.log(numeric_logs, step=global_step)
-                        self._append_training_metrics(global_step, phase, numeric_logs)
+                        self._append_training_metrics(
+                            global_step, phase, numeric_logs)
 
                     if global_step > 0 and self.args.validation_steps > 0 and global_step % self.args.validation_steps == 0:
                         self.validate(
                             step=global_step,
-                            fast=bool(getattr(self.args, "train_fast_validation", True)),
+                            fast=bool(
+                                getattr(self.args, "train_fast_validation", True)),
                         )
 
                     if global_step > 0 and self.args.checkpointing_steps > 0 and global_step % self.args.checkpointing_steps == 0:
@@ -1282,7 +1371,8 @@ class DiffusionEngine:
         use_cfg = getattr(self.args, 'use_cfg', False)
         if use_cfg and phase not in ["stage1_decom", "decom_warmup"]:
             cfg_drop_prob = getattr(self.args, 'cfg_drop_prob', 0.1)
-            drop_mask = torch.rand(low_light_images.shape[0], device=low_light_images.device) < cfg_drop_prob
+            drop_mask = torch.rand(
+                low_light_images.shape[0], device=low_light_images.device) < cfg_drop_prob
 
             # Create unconditional input (zero condition)
             if drop_mask.any():
@@ -1297,8 +1387,10 @@ class DiffusionEngine:
             decom_trainable = phase in {"stage1_decom", "decom_warmup", "stage2_adapter"} or (
                 phase == "stage3_joint" and joint_step >= self.args.freeze_decom_steps
             )
-            retinex_branch_multiplier = self._retinex_branch_multiplier(phase, joint_step)
-            compute_clean_decomposition = phase in {"stage1_decom", "decom_warmup"} or retinex_branch_multiplier > 0.0
+            retinex_branch_multiplier = self._retinex_branch_multiplier(
+                phase, joint_step)
+            compute_clean_decomposition = phase in {
+                "stage1_decom", "decom_warmup"} or retinex_branch_multiplier > 0.0
             clean_decomposition_requires_grad = decom_trainable and compute_clean_decomposition
             if phase in ["stage1_decom", "decom_warmup"]:
                 _, aux = self.training_model(
@@ -1315,7 +1407,8 @@ class DiffusionEngine:
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
                     if self._optimizer_has_gradients(optimizer):
-                        self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
+                        self.accelerator.clip_grad_norm_(
+                            self._params_for_gradient_clipping(), self.args.grad_clip_norm)
                         optimizer.step()
                         lr_scheduler.step()
                         self._ema_step()
@@ -1339,7 +1432,8 @@ class DiffusionEngine:
                 }
                 return loss, logs
 
-            residual_target = self._residual_target(clean_images, low_light_images)
+            residual_target = self._residual_target(
+                clean_images, low_light_images)
 
             noise = torch.randn_like(residual_target)
             if self.args.offset_noise:
@@ -1359,7 +1453,8 @@ class DiffusionEngine:
                 (bsz,),
                 device=residual_target.device,
             ).long()
-            noisy_target = self.noise_scheduler.add_noise(residual_target, noise, timesteps)
+            noisy_target = self.noise_scheduler.add_noise(
+                residual_target, noise, timesteps)
 
             model_pred, aux = self.training_model(
                 low_light_images,
@@ -1374,11 +1469,14 @@ class DiffusionEngine:
             if self.args.prediction_type == "epsilon":
                 target = noise
             else:
-                target = self.noise_scheduler.get_velocity(residual_target, noise, timesteps)
+                target = self.noise_scheduler.get_velocity(
+                    residual_target, noise, timesteps)
 
-            weighting_scheme = getattr(self.args, "loss_weighting_scheme", "min_snr")
+            weighting_scheme = getattr(
+                self.args, "loss_weighting_scheme", "min_snr")
             if weighting_scheme == "min_snr":
-                snr_weights = compute_min_snr_loss_weights(self.noise_scheduler, timesteps, self.args.snr_gamma)
+                snr_weights = compute_min_snr_loss_weights(
+                    self.noise_scheduler, timesteps, self.args.snr_gamma)
             else:
                 snr_weights = compute_adaptive_loss_weights(
                     self.noise_scheduler,
@@ -1387,16 +1485,19 @@ class DiffusionEngine:
                     snr_gamma=self.args.snr_gamma,
                 )
             loss_diff_elem = charbonnier_loss_elementwise(model_pred, target)
-            loss_diffusion = (loss_diff_elem.mean(dim=[1, 2, 3]) * snr_weights).mean()
+            loss_diffusion = (loss_diff_elem.mean(
+                dim=[1, 2, 3]) * snr_weights).mean()
 
-            pred_residual = self._reconstruct_x0(noisy_target, model_pred, timesteps)
+            pred_residual = self._reconstruct_x0(
+                noisy_target, model_pred, timesteps)
             pred_clean = self._decode_residual(low_light_images, pred_residual)
 
             timestep_mask = timesteps <= self.args.x0_loss_t_max
             x0_loss = torch.tensor(0.0, device=clean_images.device)
             x0_logs = {}
             if torch.any(timestep_mask):
-                x0_weights = self._x0_branch_weight(joint_step, timesteps[timestep_mask])
+                x0_weights = self._x0_branch_weight(
+                    joint_step, timesteps[timestep_mask])
                 if isinstance(x0_weights, torch.Tensor) and x0_weights.sum() > 0:
                     pred_clean_masked = pred_clean[timestep_mask]
                     clean_masked = clean_images[timestep_mask]
@@ -1406,19 +1507,22 @@ class DiffusionEngine:
                         sample_weight=x0_weights,
                     )
                 elif isinstance(x0_weights, float) and x0_weights > 0:
-                    x0_loss, x0_logs = self.criterion(pred_clean[timestep_mask], clean_images[timestep_mask])
+                    x0_loss, x0_logs = self.criterion(
+                        pred_clean[timestep_mask], clean_images[timestep_mask])
                     x0_loss = x0_loss * x0_weights
 
             loss = loss_diffusion + x0_loss
 
             retinex_losses = self._compute_retinex_losses(aux)
             if retinex_branch_multiplier > 0.0:
-                loss = loss + retinex_branch_multiplier * retinex_losses["retinex_total"]
+                loss = loss + retinex_branch_multiplier * \
+                    retinex_losses["retinex_total"]
 
             self.accelerator.backward(loss)
             if self.accelerator.sync_gradients:
                 if self._optimizer_has_gradients(optimizer):
-                    self.accelerator.clip_grad_norm_(self._params_for_gradient_clipping(), self.args.grad_clip_norm)
+                    self.accelerator.clip_grad_norm_(
+                        self._params_for_gradient_clipping(), self.args.grad_clip_norm)
                     optimizer.step()
                     lr_scheduler.step()
                     self._ema_step()
@@ -1478,19 +1582,26 @@ class DiffusionEngine:
 
             if use_cfg:
                 # Conditional prediction
-                model_input_cond, aux_cond = inference_model.build_model_input(low_light, latent_input)
-                noise_pred_cond = inference_model.run_unet(model_input_cond, timestep, aux_cond)
+                model_input_cond, aux_cond = inference_model.build_model_input(
+                    low_light, latent_input)
+                noise_pred_cond = inference_model.run_unet(
+                    model_input_cond, timestep, aux_cond)
 
                 # Unconditional prediction (zero condition)
                 low_light_uncond = torch.zeros_like(low_light)
-                model_input_uncond, aux_uncond = inference_model.build_model_input(low_light_uncond, latent_input)
-                noise_pred_uncond = inference_model.run_unet(model_input_uncond, timestep, aux_uncond)
+                model_input_uncond, aux_uncond = inference_model.build_model_input(
+                    low_light_uncond, latent_input)
+                noise_pred_uncond = inference_model.run_unet(
+                    model_input_uncond, timestep, aux_uncond)
 
                 # CFG formula
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                noise_pred = noise_pred_uncond + guidance_scale * \
+                    (noise_pred_cond - noise_pred_uncond)
             else:
-                model_input, aux = inference_model.build_model_input(low_light, latent_input)
-                noise_pred = inference_model.run_unet(model_input, timestep, aux)
+                model_input, aux = inference_model.build_model_input(
+                    low_light, latent_input)
+                noise_pred = inference_model.run_unet(
+                    model_input, timestep, aux)
 
             latents = scheduler.step(noise_pred, timestep, latents).prev_sample
 
@@ -1506,7 +1617,8 @@ class DiffusionEngine:
 
         grid = torch.cat([low_01, enhanced_01, clean_01], dim=0)
         grid_image = make_grid(grid, nrow=low_01.shape[0], padding=2)
-        grid_path = os.path.join(val_dir, f"val_step_{step}_steps_{step_count}.png")
+        grid_path = os.path.join(
+            val_dir, f"val_step_{step}_steps_{step_count}.png")
         transforms.ToPILImage()(grid_image).save(grid_path)
         logger.info(f"Saved validation grid to {grid_path}")
 
@@ -1522,7 +1634,8 @@ class DiffusionEngine:
         semantic_metric=None,
         compute_niqe: bool = True,
     ):
-        scheduler = DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config)
+        scheduler = DPMSolverMultistepScheduler.from_config(
+            self.noise_scheduler.config)
 
         total_psnr = 0.0
         total_ssim = 0.0
@@ -1542,16 +1655,19 @@ class DiffusionEngine:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize(self.accelerator.device)
                 start_time = time.perf_counter()
-                enhanced = self._inference_step(val_low, unet, decom, condition_adapter, scheduler, num_inference_steps=step_count)
+                enhanced = self._inference_step(
+                    val_low, unet, decom, condition_adapter, scheduler, num_inference_steps=step_count)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize(self.accelerator.device)
                 elapsed = time.perf_counter() - start_time
 
                 elapsed_tensor = torch.tensor([elapsed], device=val_low.device)
-                gathered_elapsed = self.accelerator.gather_for_metrics(elapsed_tensor)
+                gathered_elapsed = self.accelerator.gather_for_metrics(
+                    elapsed_tensor)
                 gathered_low = self.accelerator.gather_for_metrics(val_low)
                 gathered_clean = self.accelerator.gather_for_metrics(val_clean)
-                gathered_enhanced = self.accelerator.gather_for_metrics(enhanced)
+                gathered_enhanced = self.accelerator.gather_for_metrics(
+                    enhanced)
 
                 if not self.accelerator.is_main_process:
                     continue
@@ -1569,16 +1685,19 @@ class DiffusionEngine:
                 enhanced_01 = gathered_enhanced
 
                 batch_size = enhanced_01.shape[0]
-                total_psnr += peak_signal_noise_ratio(enhanced_01, clean_01, data_range=1.0).item() * batch_size
+                total_psnr += peak_signal_noise_ratio(
+                    enhanced_01, clean_01, data_range=1.0).item() * batch_size
                 total_ssim += ssim(enhanced_01, clean_01).item() * batch_size
 
                 if lpips_fn is not None:
                     enhanced_11 = enhanced_01 * 2 - 1
                     clean_11 = clean_01 * 2 - 1
-                    total_lpips += lpips_fn(enhanced_11, clean_11).mean().item() * batch_size
+                    total_lpips += lpips_fn(enhanced_11,
+                                            clean_11).mean().item() * batch_size
 
                 if semantic_metric is not None and semantic_metric.available:
-                    semantic_distance = semantic_metric.compute(enhanced_01.to(self.accelerator.device), clean_01.to(self.accelerator.device))
+                    semantic_distance = semantic_metric.compute(enhanced_01.to(
+                        self.accelerator.device), clean_01.to(self.accelerator.device))
                     if semantic_distance is not None:
                         total_semantic += semantic_distance * batch_size
 
@@ -1592,7 +1711,8 @@ class DiffusionEngine:
                 num_samples += batch_size
 
                 if not saved_grid and step_count == self.args.num_inference_steps:
-                    self._save_validation_grid(step, step_count, low_01, enhanced_01, clean_01)
+                    self._save_validation_grid(
+                        step, step_count, low_01, enhanced_01, clean_01)
                     saved_grid = True
 
         if not self.accelerator.is_main_process or num_samples == 0:
@@ -1660,14 +1780,16 @@ class DiffusionEngine:
                 validation_results[step_count] = result
 
         if self.accelerator.is_main_process and validation_results:
-            primary_metrics = validation_results.get(self.args.num_inference_steps, next(iter(validation_results.values())))
+            primary_metrics = validation_results.get(
+                self.args.num_inference_steps, next(iter(validation_results.values())))
             self.latest_validation_metrics = {
                 "val_psnr": primary_metrics.get("psnr"),
                 "val_ssim": primary_metrics.get("ssim"),
                 "val_lpips": primary_metrics.get("lpips"),
                 "val_step": step,
             }
-            primary_seconds_per_image = primary_metrics.get("seconds_per_image")
+            primary_seconds_per_image = primary_metrics.get(
+                "seconds_per_image")
 
             log_dict = {}
             lines = []
@@ -1675,7 +1797,8 @@ class DiffusionEngine:
                 lines.append(f"[steps={step_count}]")
                 lines.append(f"PSNR: {metrics['psnr']:.4f}")
                 lines.append(f"SSIM: {metrics['ssim']:.4f}")
-                lines.append(f"SecondsPerImage: {metrics['seconds_per_image']:.6f}")
+                lines.append(
+                    f"SecondsPerImage: {metrics['seconds_per_image']:.6f}")
 
                 log_dict[f"val/psnr_{step_count}step"] = metrics["psnr"]
                 log_dict[f"val/ssim_{step_count}step"] = metrics["ssim"]
@@ -1685,7 +1808,8 @@ class DiffusionEngine:
                     lines.append(f"LPIPS: {metrics['lpips']:.4f}")
                     log_dict[f"val/lpips_{step_count}step"] = metrics["lpips"]
                 if metrics["semantic_distance"] is not None:
-                    lines.append(f"SemanticDistance: {metrics['semantic_distance']:.4f}")
+                    lines.append(
+                        f"SemanticDistance: {metrics['semantic_distance']:.4f}")
                     log_dict[f"val/semantic_distance_{step_count}step"] = metrics["semantic_distance"]
                 if metrics["niqe"] is not None:
                     lines.append(f"NIQE: {metrics['niqe']:.4f}")
@@ -1740,7 +1864,8 @@ class DiffusionEngine:
 
             if primary_metrics["psnr"] > self.best_psnr:
                 self.best_psnr = primary_metrics["psnr"]
-                logger.info(f"New best model found (PSNR: {primary_metrics['psnr']:.4f}). Saving...")
+                logger.info(
+                    f"New best model found (PSNR: {primary_metrics['psnr']:.4f}). Saving...")
                 self._save_model_bundle(
                     os.path.join(self.args.output_dir, "best_model"),
                     unet,
@@ -1764,7 +1889,8 @@ class DiffusionEngine:
         if self.condition_adapter is not None:
             self.condition_adapter.eval()
 
-        scheduler = DPMSolverMultistepScheduler.from_config(self.noise_scheduler.config)
+        scheduler = DPMSolverMultistepScheduler.from_config(
+            self.noise_scheduler.config)
 
         if self.args.video_path:
             self._predict_video(scheduler)
@@ -1773,8 +1899,21 @@ class DiffusionEngine:
 
     def _predict_image(self, scheduler):
         logger.info(f"Starting image prediction from {self.args.data_dir}")
-        dataset = LowLightDataset(image_dir=self.args.data_dir, img_size=self.args.resolution, phase="predict")
-        dataloader = DataLoader(dataset, batch_size=self.args.batch_size, shuffle=False, num_workers=self.args.num_workers)
+        dataset = LowLightDataset(
+            image_dir=self.args.data_dir, img_size=self.args.resolution, phase="predict")
+        predict_loader_kwargs = {
+            "batch_size": self.args.batch_size,
+            "shuffle": False,
+            "num_workers": self.args.num_workers,
+            "pin_memory": bool(getattr(self.args, "pin_memory", True)),
+            "worker_init_fn": self._worker_init_fn,
+        }
+        if self.args.num_workers > 0:
+            predict_loader_kwargs.update({
+                "persistent_workers": bool(getattr(self.args, "persistent_workers", True)),
+                "prefetch_factor": max(2, int(getattr(self.args, "prefetch_factor", 4))),
+            })
+        dataloader = DataLoader(dataset, **predict_loader_kwargs)
 
         out_dir = os.path.join(self.args.output_dir, "predictions")
         os.makedirs(out_dir, exist_ok=True)
@@ -1783,7 +1922,8 @@ class DiffusionEngine:
         index = 0
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Predicting"):
-                low_light = batch[0] if isinstance(batch, (list, tuple)) else batch
+                low_light = batch[0] if isinstance(
+                    batch, (list, tuple)) else batch
                 low_light = low_light.to(self.accelerator.device)
                 enhanced = self._inference_step(
                     low_light,
@@ -1795,7 +1935,8 @@ class DiffusionEngine:
                 )
 
                 for item in enhanced:
-                    to_pil(item.cpu()).save(os.path.join(out_dir, f"enhanced_{index:05d}.png"))
+                    to_pil(item.cpu()).save(os.path.join(
+                        out_dir, f"enhanced_{index:05d}.png"))
                     index += 1
 
         logger.info(f"Saved prediction results to {out_dir}")
@@ -1826,7 +1967,8 @@ class DiffusionEngine:
                     break
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                input_tensor = transform(frame_rgb).unsqueeze(0).to(self.accelerator.device)
+                input_tensor = transform(frame_rgb).unsqueeze(
+                    0).to(self.accelerator.device)
                 enhanced = self._inference_step(
                     input_tensor,
                     self.unet,
@@ -1836,9 +1978,12 @@ class DiffusionEngine:
                     num_inference_steps=self.args.num_inference_steps,
                 )
 
-                enhanced_np = enhanced.squeeze(0).cpu().numpy().transpose(1, 2, 0)
-                enhanced_bgr = cv2.cvtColor((enhanced_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-                cv2.imwrite(os.path.join(frames_dir, f"frame_{frame_index:06d}.png"), enhanced_bgr)
+                enhanced_np = enhanced.squeeze(
+                    0).cpu().numpy().transpose(1, 2, 0)
+                enhanced_bgr = cv2.cvtColor(
+                    (enhanced_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+                cv2.imwrite(os.path.join(
+                    frames_dir, f"frame_{frame_index:06d}.png"), enhanced_bgr)
                 frame_index += 1
 
         capture.release()
@@ -1887,13 +2032,16 @@ class DiffusionEngine:
         unet.save_pretrained(os.path.join(base_dir, unet_dirname))
 
         if decom is not None:
-            torch.save(decom.state_dict(), os.path.join(base_dir, decom_filename))
+            torch.save(decom.state_dict(), os.path.join(
+                base_dir, decom_filename))
         if condition_adapter is not None:
-            torch.save(condition_adapter.state_dict(), os.path.join(base_dir, adapter_filename))
+            torch.save(condition_adapter.state_dict(),
+                       os.path.join(base_dir, adapter_filename))
 
         metadata_path = os.path.join(base_dir, metadata_filename)
         with open(metadata_path, "w") as metadata_file:
-            json.dump(self._model_metadata(step=step, metrics=metrics), metadata_file, indent=2)
+            json.dump(self._model_metadata(
+                step=step, metrics=metrics), metadata_file, indent=2)
 
     def _save_checkpoint(self, step):
         save_path = os.path.join(self.args.output_dir, f"checkpoint-{step}")
@@ -1903,9 +2051,11 @@ class DiffusionEngine:
 
         unwrapped = self._unwrap_training_model()
         if unwrapped.decom_model is not None:
-            torch.save(unwrapped.decom_model.state_dict(), os.path.join(save_path, "decom_model.pth"))
+            torch.save(unwrapped.decom_model.state_dict(),
+                       os.path.join(save_path, "decom_model.pth"))
         if unwrapped.condition_adapter is not None:
-            torch.save(unwrapped.condition_adapter.state_dict(), os.path.join(save_path, "condition_adapter.pth"))
+            torch.save(unwrapped.condition_adapter.state_dict(),
+                       os.path.join(save_path, "condition_adapter.pth"))
 
         with open(os.path.join(save_path, "checkpoint_metadata.json"), "w") as metadata_file:
             json.dump(self._model_metadata(step=step), metadata_file, indent=2)
@@ -1913,12 +2063,14 @@ class DiffusionEngine:
         total_limit = getattr(self.args, "checkpoints_total_limit", None)
         if total_limit is not None and self.accelerator.is_main_process:
             checkpoints = sorted(
-                [item for item in os.listdir(self.args.output_dir) if item.startswith("checkpoint-")],
+                [item for item in os.listdir(
+                    self.args.output_dir) if item.startswith("checkpoint-")],
                 key=lambda item: int(item.split("-")[1]),
             )
             if len(checkpoints) > total_limit:
                 for checkpoint_name in checkpoints[: len(checkpoints) - total_limit]:
-                    checkpoint_path = os.path.join(self.args.output_dir, checkpoint_name)
+                    checkpoint_path = os.path.join(
+                        self.args.output_dir, checkpoint_name)
                     logger.info(f"Removing old checkpoint: {checkpoint_path}")
                     shutil.rmtree(checkpoint_path)
 

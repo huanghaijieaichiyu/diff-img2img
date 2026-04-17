@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import cv2
@@ -8,6 +9,7 @@ import numpy as np
 
 from datasets.data_set import LowLightDataset
 from datasets.prepare_data import (
+    ensure_prepared_training_data,
     load_manifest_entries,
     load_manifest_info,
     manifest_info_path,
@@ -151,7 +153,8 @@ def test_dataset_falls_back_to_jsonl_when_manifest_info_missing(tmp_path):
         phase="train",
         manifest_path=str(manifest_path),
     )
-    assert dataset.data == [(entry["low_path"], entry["high_path"]) for entry in entries]
+    assert dataset.data == [(entry["low_path"], entry["high_path"])
+                            for entry in entries]
 
 
 def test_dataset_resolves_relative_manifest_entries_against_active_roots(tmp_path):
@@ -185,7 +188,8 @@ def test_dataset_resolves_relative_manifest_entries_against_active_roots(tmp_pat
         manifest_path=str(manifest_path),
         prepared_cache_dir=str(cache_dir),
     )
-    assert dataset.data == [(str(low_path.resolve()), str(high_path.resolve()))]
+    assert dataset.data == [
+        (str(low_path.resolve()), str(high_path.resolve()))]
     assert resolve_manifest_entry_path(
         entries[0],
         "low_path",
@@ -220,4 +224,115 @@ def test_validate_prepared_cache_survives_cache_relocation_with_relative_manifes
         synthesis_seed=5,
         darker_ranges=None,
     )
-    assert relocated_manifest_path == str((relocated_cache_dir / "train_manifest.jsonl").resolve())
+    assert relocated_manifest_path == str(
+        (relocated_cache_dir / "train_manifest.jsonl").resolve())
+
+
+def test_force_prepare_skips_validate_path(tmp_path, monkeypatch):
+    data_dir = tmp_path / "dataset"
+    _write_rgb_image(data_dir / "our485" / "high" / "0.png", 96)
+
+    def _raise_if_called(*args, **kwargs):  # pragma: no cover - behavior assertion helper
+        raise AssertionError(
+            "validate_prepared_cache should not be called when force=True")
+
+    monkeypatch.setattr(
+        "datasets.prepare_data.validate_prepared_cache", _raise_if_called)
+
+    manifest_path, prepared = ensure_prepared_training_data(
+        data_dir,
+        None,
+        variant_count=1,
+        synthesis_seed=3,
+        darker_ranges=None,
+        prepare_workers=1,
+        force=True,
+        prepare_on_train=True,
+    )
+
+    assert prepared is True
+    assert Path(manifest_path).exists()
+
+
+def test_prepare_reuses_low_cache_when_only_train_resolution_changes(tmp_path):
+    data_dir = tmp_path / "dataset"
+    cache_dir = tmp_path / "cache"
+    _write_rgb_image(data_dir / "our485" / "high" / "0.png", 96)
+
+    prepare_training_data(
+        data_dir,
+        cache_dir,
+        variant_count=1,
+        synthesis_seed=17,
+        darker_ranges=None,
+        prepare_workers=1,
+        prepared_train_resolution=8,
+        force=False,
+    )
+
+    low_variant = cache_dir / "our485" / "low" / "0__v00.png"
+    assert low_variant.exists()
+    mtime_before = low_variant.stat().st_mtime
+
+    prepare_training_data(
+        data_dir,
+        cache_dir,
+        variant_count=1,
+        synthesis_seed=17,
+        darker_ranges=None,
+        prepare_workers=1,
+        prepared_train_resolution=12,
+        force=False,
+    )
+
+    assert low_variant.exists()
+    assert low_variant.stat().st_mtime == mtime_before
+    assert (cache_dir / "train_cache" / "12" /
+            "our485" / "low" / "0__v00.png").exists()
+    assert (cache_dir / "train_cache" / "12" /
+            "our485" / "high" / "0.png").exists()
+
+
+def test_dataset_missing_train_dirs_do_not_raise(tmp_path):
+    data_dir = tmp_path / "dataset"
+    (data_dir / "our485").mkdir(parents=True, exist_ok=True)
+
+    dataset = LowLightDataset(image_dir=str(
+        data_dir), img_size=8, phase="train")
+    assert len(dataset) == 0
+
+
+def test_validate_cache_invalidates_when_source_file_changes_in_place(tmp_path):
+    data_dir = tmp_path / "dataset"
+    cache_dir = tmp_path / "cache"
+    source_path = data_dir / "our485" / "high" / "0.png"
+    _write_rgb_image(source_path, 90)
+
+    manifest_path = prepare_training_data(
+        data_dir,
+        cache_dir,
+        variant_count=1,
+        synthesis_seed=19,
+        darker_ranges=None,
+        prepare_workers=1,
+        force=False,
+    )
+    assert Path(manifest_path).exists()
+    assert validate_prepared_cache(
+        data_dir,
+        cache_dir,
+        variant_count=1,
+        synthesis_seed=19,
+        darker_ranges=None,
+    ) == manifest_path
+
+    time.sleep(0.002)
+    _write_rgb_image(source_path, 140)
+
+    assert validate_prepared_cache(
+        data_dir,
+        cache_dir,
+        variant_count=1,
+        synthesis_seed=19,
+        darker_ranges=None,
+    ) is None

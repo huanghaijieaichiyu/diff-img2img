@@ -21,12 +21,14 @@ VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
 
 
 def _normalize_to_model_space(image_rgb: np.ndarray) -> torch.Tensor:
-    image_tensor = torch.from_numpy(np.ascontiguousarray(image_rgb.transpose(2, 0, 1))).float() / 255.0
+    image_tensor = torch.from_numpy(np.ascontiguousarray(
+        image_rgb.transpose(2, 0, 1))).float() / 255.0
     return image_tensor.mul(2.0).sub(1.0)
 
 
 def _resize_rgb(image_rgb: np.ndarray, size: int) -> np.ndarray:
-    interpolation = cv2.INTER_AREA if min(image_rgb.shape[:2]) >= size else cv2.INTER_LINEAR
+    interpolation = cv2.INTER_AREA if min(
+        image_rgb.shape[:2]) >= size else cv2.INTER_LINEAR
     return cv2.resize(image_rgb, (size, size), interpolation=interpolation)
 
 
@@ -66,14 +68,19 @@ class LowLightDataset(Dataset):
             return
 
         if phase == "train" and (manifest_path or paired_samples):
-            manifest_entries = paired_samples if paired_samples is not None else self._load_prepared_entries(manifest_path)
+            manifest_entries = paired_samples if paired_samples is not None else self._load_prepared_entries(
+                manifest_path)
             self.data = []
+            missing_entries = 0
             for entry in manifest_entries:
                 if not entry.get("low_path") or not entry.get("high_path"):
                     continue
-                use_train_cache = int(entry.get("train_resolution") or 0) == int(self.img_size)
-                low_field = "train_low_path" if use_train_cache and entry.get("train_low_path") else "low_path"
-                high_field = "train_high_path" if use_train_cache and entry.get("train_high_path") else "high_path"
+                use_train_cache = int(
+                    entry.get("train_resolution") or 0) == int(self.img_size)
+                low_field = "train_low_path" if use_train_cache and entry.get(
+                    "train_low_path") else "low_path"
+                high_field = "train_high_path" if use_train_cache and entry.get(
+                    "train_high_path") else "high_path"
                 low_path = resolve_manifest_entry_path(
                     entry,
                     low_field,
@@ -86,10 +93,23 @@ class LowLightDataset(Dataset):
                     data_dir=self.image_dir,
                     prepared_cache_dir=self.prepared_cache_dir,
                 )
-                if low_path and high_path:
-                    self.data.append((low_path, high_path))
+                raw_low_path = str(entry.get(low_field) or "")
+                raw_high_path = str(entry.get(high_field) or "")
+                allow_missing_for_external_paths = os.path.isabs(
+                    raw_low_path) and os.path.isabs(raw_high_path)
+                if not low_path or not high_path:
+                    missing_entries += 1
+                    continue
+                if not allow_missing_for_external_paths and (not os.path.exists(low_path) or not os.path.exists(high_path)):
+                    missing_entries += 1
+                    continue
+                self.data.append((low_path, high_path))
+            if missing_entries > 0:
+                print(
+                    f"警告: prepared manifest 中有 {missing_entries} 条记录无法解析或文件不存在，已跳过。")
             if not self.data:
-                raise RuntimeError(f"Prepared training manifest is empty: {manifest_path}")
+                raise RuntimeError(
+                    f"Prepared training manifest is empty: {manifest_path}")
             return
 
         if phase == "train":
@@ -106,6 +126,13 @@ class LowLightDataset(Dataset):
 
         high_dir = os.path.join(subset_dir, "high")
         low_dir = os.path.join(subset_dir, "low")
+        if not os.path.exists(high_dir):
+            print(f"警告: 目录 {high_dir} 不存在，数据集为空。")
+            return
+        if phase == "train" and not self.online_synthesis and not os.path.exists(low_dir):
+            print(f"警告: 目录 {low_dir} 不存在，训练数据集为空。")
+            return
+
         image_names = [
             filename for filename in os.listdir(high_dir)
             if filename.lower().endswith(VALID_EXTENSIONS)
@@ -126,7 +153,8 @@ class LowLightDataset(Dataset):
 
     def _get_darker(self):
         if self.darker is None:
-            self.darker = Darker(randomize=True, param_ranges=self.darker_ranges)
+            self.darker = Darker(
+                randomize=True, param_ranges=self.darker_ranges)
         return self.darker
 
     @staticmethod
@@ -166,10 +194,12 @@ class LowLightDataset(Dataset):
         height, width = high_rgb.shape[:2]
         top, left, crop_h, crop_w = self._random_crop_coords(height, width)
         high_patch = high_rgb[top:top + crop_h, left:left + crop_w]
-        high_patch = _resize_rgb(high_patch, self.img_size) if high_patch.shape[:2] != (self.img_size, self.img_size) else high_patch
+        high_patch = _resize_rgb(high_patch, self.img_size) if high_patch.shape[:2] != (
+            self.img_size, self.img_size) else high_patch
 
         darker = self._get_darker()
-        low_patch_bgr = darker.degrade_single(cv2.cvtColor(high_patch, cv2.COLOR_RGB2BGR))
+        low_patch_bgr = darker.degrade_single(
+            cv2.cvtColor(high_patch, cv2.COLOR_RGB2BGR))
         low_patch = cv2.cvtColor(low_patch_bgr, cv2.COLOR_BGR2RGB)
 
         if random.random() > 0.5:
@@ -208,7 +238,8 @@ class LowLightDataset(Dataset):
                 low_rgb, high_rgb = self._train_online_pair(high_rgb)
             else:
                 low_rgb = self._read_rgb(low_path)
-                low_rgb, high_rgb = self._train_precomputed_pair(low_rgb, high_rgb)
+                low_rgb, high_rgb = self._train_precomputed_pair(
+                    low_rgb, high_rgb)
         else:
             low_rgb = self._read_rgb(low_path)
             low_rgb = _resize_rgb(low_rgb, self.img_size)

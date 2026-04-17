@@ -39,6 +39,15 @@ def test_resolve_validation_step_counts_full_keeps_benchmark_steps():
     assert step_counts == [8, 20]
 
 
+def test_resolve_training_epoch_limit_rounds_up():
+    # 3 updates/epoch, 10 total steps -> 4 epochs required.
+    assert DiffusionEngine._resolve_training_epoch_limit(10, 3) == 4
+
+
+def test_resolve_training_epoch_limit_at_least_one_epoch():
+    assert DiffusionEngine._resolve_training_epoch_limit(1, 0) == 1
+
+
 @pytest.mark.skipif(not hasattr(torch, "compile"), reason="torch.compile unavailable")
 def test_grouped_lr_optimizer_supports_compiled_child_modules():
     engine = DiffusionEngine.__new__(DiffusionEngine)
