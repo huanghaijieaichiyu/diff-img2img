@@ -65,7 +65,8 @@ def load_config_defaults(config_path: str) -> dict[str, Any]:
 
     defaults = flatten_config_tree(config_data)
     defaults["config"] = str(resolved_path)
-    defaults["config_name"] = config_data.get("meta", {}).get("name", resolved_path.stem)
+    defaults["config_name"] = config_data.get(
+        "meta", {}).get("name", resolved_path.stem)
     return defaults
 
 
@@ -160,6 +161,7 @@ def build_runtime_summary(args: argparse.Namespace | SimpleNamespace | dict[str,
         "prepare_on_train": payload.get("prepare_on_train"),
         "prepare_workers": payload.get("prepare_workers"),
         "prepare_force": payload.get("prepare_force"),
+        "degradation_backend": payload.get("degradation_backend"),
         "offline_variant_count": payload.get("offline_variant_count"),
         "synthesis_seed": payload.get("synthesis_seed"),
         "validation_steps": payload.get("validation_steps"),
@@ -174,13 +176,16 @@ def build_runtime_summary(args: argparse.Namespace | SimpleNamespace | dict[str,
         "inject_mode": payload.get("inject_mode"),
         "decom_variant": payload.get("decom_variant"),
         "condition_variant": payload.get("condition_variant"),
+        "loss_balance_mode": payload.get("loss_balance_mode"),
+        "frequency_loss_weight": payload.get("frequency_loss_weight"),
+        "edge_loss_weight": payload.get("edge_loss_weight"),
         "prepared_train_resolution": payload.get("prepared_train_resolution"),
         "semantic_backbone": payload.get("semantic_backbone"),
         "nr_metric": payload.get("nr_metric"),
         "attention_backend": payload.get("attention_backend"),
         "use_torch_compile": payload.get("use_torch_compile"),
         "torch_compile_mode": payload.get("torch_compile_mode"),
-        "enable_xformers_memory_efficient_attention": payload.get("enable_xformers_memory_efficient_attention"),
+        "enable_torch_sdpa_memory_efficient_attention": payload.get("enable_torch_sdpa_memory_efficient_attention"),
         "resolved_unet_backend": payload.get("unet_backend_resolved_backend"),
         "resume": payload.get("resume"),
     }
@@ -200,11 +205,16 @@ def runtime_summary_lines(summary: dict[str, Any], prefix: str = "[config-summar
         f"num_inference_steps:{summary.get('num_inference_steps')} benchmark_inference_steps:{summary.get('benchmark_inference_steps')}",
         f"{prefix} train_validation=fast:{summary.get('train_fast_validation')} "
         f"metrics:{summary.get('train_validation_metrics')} steps:{summary.get('train_validation_benchmark_steps')}",
+        f"{prefix} cache=prepare_on_train:{summary.get('prepare_on_train')} prepare_workers:{summary.get('prepare_workers')} "
+        f"offline_variant_count:{summary.get('offline_variant_count')} synthesis_seed:{summary.get('synthesis_seed')} "
+        f"degradation_backend:{summary.get('degradation_backend')}",
         f"{prefix} model=use_retinex:{summary.get('use_retinex')} decom_variant:{summary.get('decom_variant')} "
         f"condition_variant:{summary.get('condition_variant')} conditioning_space:{summary.get('conditioning_space')} "
         f"inject_mode:{summary.get('inject_mode')} prepared_train_resolution:{summary.get('prepared_train_resolution')}",
+        f"{prefix} loss=balance_mode:{summary.get('loss_balance_mode')} frequency:{summary.get('frequency_loss_weight')} "
+        f"edge:{summary.get('edge_loss_weight')}",
         f"{prefix} backend=requested:{summary.get('attention_backend')} compile:{summary.get('use_torch_compile')} "
-        f"compile_mode:{summary.get('torch_compile_mode')} xformers_requested:{summary.get('enable_xformers_memory_efficient_attention')} "
+        f"compile_mode:{summary.get('torch_compile_mode')} sdpa_requested:{summary.get('enable_torch_sdpa_memory_efficient_attention')} "
         f"resolved:{summary.get('resolved_unet_backend')}",
     ]
 
@@ -241,7 +251,8 @@ def build_preview_namespace(config_path: str, overrides: dict[str, Any]) -> Simp
     payload = load_config_defaults(config_path)
     payload.update(overrides)
     payload["config"] = str(Path(resolve_config_path(config_path)))
-    payload["config_name"] = payload.get("config_name", Path(payload["config"]).stem)
+    payload["config_name"] = payload.get(
+        "config_name", Path(payload["config"]).stem)
     payload["effective_batch_size"] = effective_batch_size(
         payload.get("batch_size"),
         payload.get("gradient_accumulation_steps"),

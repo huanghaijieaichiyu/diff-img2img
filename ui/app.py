@@ -17,7 +17,6 @@ import yaml
 from html import escape
 from concurrent.futures import ProcessPoolExecutor
 
-# Import project modules
 sys.path.append(os.getcwd())
 
 from utils.workflow_utils import (
@@ -30,7 +29,7 @@ from utils.workflow_utils import (
     summarize_prepared_cache as shared_summarize_prepared_cache,
 )
 
-# --- Localization ---
+# 本地化配置
 LANGUAGES = {
     "English": "en",
     "简体中文": "zh"
@@ -351,7 +350,7 @@ TRANSLATIONS = {
 
 
 
-# --- Page Configuration ---
+# 页面配置
 st.set_page_config(
     page_title="Diff-Img2Img Studio",
     layout="wide",
@@ -359,7 +358,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Custom CSS for Modern UI ---
+# 自定义样式
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Source+Serif+4:wght@600;700&display=swap');
@@ -384,20 +383,20 @@ st.markdown("""
             linear-gradient(180deg, #f8f4ec 0%, #f2ede2 100%);
     }
 
-    /* Global Fonts */
+    /* 全局字体 */
     html, body, [class*="css"] {
         font-family: 'Space Grotesk', 'Avenir Next', 'Helvetica Neue', sans-serif;
         color: var(--text);
     }
     
-    /* Headings */
+    /* 标题 */
     h1, h2, h3 {
         font-family: 'Source Serif 4', Georgia, serif;
         font-weight: 700;
         color: var(--text);
     }
     
-    /* Buttons */
+    /* 按钮 */
     .stButton button {
         width: 100%;
         border-radius: 12px;
@@ -414,7 +413,7 @@ st.markdown("""
         box-shadow: 0 14px 28px rgba(15, 118, 110, 0.24);
     }
     
-    /* Inputs & Selects */
+    /* 输入框与下拉框 */
     .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div {
         border-radius: 12px;
         border: 1px solid var(--line);
@@ -425,7 +424,7 @@ st.markdown("""
         box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.18);
     }
     
-    /* Expanders & Cards */
+    /* 折叠面板与卡片 */
     div[data-testid="stExpander"] {
         border-radius: 18px;
         border: 1px solid var(--line);
@@ -434,7 +433,7 @@ st.markdown("""
         margin-bottom: 1rem;
     }
     
-    /* Metric Cards */
+    /* 指标卡片 */
     div[data-testid="metric-container"] {
         background: linear-gradient(180deg, rgba(255,255,255,0.95) 0%, rgba(250,246,238,0.92) 100%);
         padding: 1rem;
@@ -449,13 +448,13 @@ st.markdown("""
         border-color: rgba(15, 118, 110, 0.20);
     }
     
-    /* Sidebar */
+    /* 侧边栏 */
     section[data-testid="stSidebar"] {
         background: linear-gradient(180deg, rgba(250, 246, 237, 0.96) 0%, rgba(241, 235, 222, 0.94) 100%);
         border-right: 1px solid var(--line);
     }
     
-    /* Custom Classes */
+    /* 自定义类 */
     .metric-card {
         background-color: #ffffff;
         padding: 20px;
@@ -566,7 +565,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- State Management ---
+# 状态管理
 if 'page' not in st.session_state:
     st.session_state.page = "Home"
 if 'training_pid' not in st.session_state:
@@ -582,7 +581,7 @@ if 'training_status_file' not in st.session_state:
 if 'language' not in st.session_state:
     st.session_state.language = "en"
 
-# --- Sidebar Language Selector ---
+# 侧边栏语言选择
 with st.sidebar:
     st.image("https://img.icons8.com/color/48/000000/google-translate.png", width=30)
     selected_lang_name = st.selectbox(
@@ -594,10 +593,10 @@ with st.sidebar:
     lang = st.session_state.language
 
 def t(key):
-    """Helper to get translated string"""
+    """获取翻译文本。"""
     return TRANSLATIONS[lang].get(key, key)
 
-# --- Helper Functions ---
+# 通用工具函数
 def list_folders(path):
     try:
         path = os.path.abspath(path)
@@ -787,7 +786,7 @@ def build_prepare_command(config_path, data_dir, prepared_cache_dir, variant_cou
         darker_ranges_text=darker_ranges_text,
     )
 
-# --- Pages ---
+# 页面渲染
 
 def home_page():
     render_intro_card(
@@ -881,7 +880,7 @@ def dataset_page():
     with st.expander(t("how_it_works"), expanded=False):
         st.markdown(t("darker_desc"))
         
-    # --- Dataset Recommendations ---
+# 数据集推荐
     st.info(f"""
     **{t("dataset_recommendation")}**
     {t("dataset_link_text")}
@@ -979,7 +978,7 @@ def training_page():
         badges=["small", "middle", "max"],
     )
     
-    # --- Sidebar Status ---
+# 侧边栏状态
     with st.sidebar:
         st.divider()
         if st.session_state.training_pid:
@@ -998,7 +997,7 @@ def training_page():
         else:
             st.info(t("idle"))
 
-    # --- Configuration Tabs ---
+# 配置标签页
     tab_config, tab_monitor = st.tabs([t("config"), t("monitoring")])
     
     with tab_config:
@@ -1139,7 +1138,7 @@ def training_page():
                 with st.expander(t("prepare_stdout"), expanded=result.returncode != 0):
                     st.code((result.stdout or "") + ("\n" + result.stderr if result.stderr else ""), language="bash")
     
-    # --- Launch Logic ---
+# 启动逻辑
     if train_btn and not st.session_state.training_pid:
         cmd = build_train_command(
             model_scale=model_scale,
@@ -1184,34 +1183,34 @@ def training_page():
                 except OSError:
                     st.session_state.training_pgid = None
             st.success(t("train_launched"))
-            time.sleep(1) # Wait for startup
+            time.sleep(1)  # 等待启动
             st.rerun()
         except Exception as e:
             st.error(f"Launch failed: {e}")
 
-    # --- Monitoring Tab ---
+# 监控标签页
     with tab_monitor:
         if not st.session_state.training_pid and not st.session_state.training_csv_file:
             st.info(t("start_training_hint"))
         else:
-            # Auto-refresh toggle
+            # 自动刷新开关
             col_controls = st.container()
             with col_controls:
                 auto_refresh = st.toggle(t("auto_refresh"), value=False, help=t("auto_refresh_help"))
                 st.caption(t("monitoring_note"))
                 
-            # Layout: Left (Logs), Right (Charts)
+            # 布局：左侧日志，右侧图表
             c_logs, c_charts = st.columns([1, 1])
             
             with c_logs:
                 st.subheader(t("terminal_output"))
-                # Use a container with fixed height for logs to behave like a terminal window
+                # 使用固定高度容器，让日志像终端窗口一样显示
                 log_container = st.container(height=600) 
                 logs = read_log_file(st.session_state.training_log_file, num_lines=200)
                 log_container.code(logs, language="bash", line_numbers=True)
 
             with c_charts:
-                st.subheader(t("results")) # Metrics
+                st.subheader(t("results"))  # 指标
                 csv_path = st.session_state.training_csv_file
                 status = read_status_file(st.session_state.training_status_file)
                 if status:
@@ -1263,12 +1262,12 @@ def training_page():
                 else:
                     st.info(t("initializing_metrics_log"))
 
-            # Auto-refresh logic
+            # 自动刷新逻辑
             if auto_refresh and st.session_state.training_pid:
                 time.sleep(5)
                 st.rerun()
             
-            # Check process status
+            # 检查进程状态
             if st.session_state.training_pid:
                 try:
                     training_pgid = st.session_state.get("training_pgid")
@@ -1319,7 +1318,7 @@ def evaluation_page():
                 with open(metric_file, 'r') as f:
                     metrics = f.readlines()
                 
-                # Display as cards
+                # 以卡片形式显示
                 st.subheader(t("results"))
                 m_cols = st.columns(3)
                 for line in metrics:
@@ -1339,7 +1338,7 @@ def evaluation_page():
 def visualization_page():
     render_intro_card(t("vis_header"), t("vis_desc"))
     
-    # Import visual logic dynamically
+    # 动态导入可视化逻辑
     try:
         from scripts.visual_val import load_models, run_inference, tensor_to_pil, plot_histogram
     except ImportError:
@@ -1353,7 +1352,7 @@ def visualization_page():
         if st.button(t("reload_models")):
             st.cache_resource.clear()
 
-    # Load Models
+    # 加载模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
         models = load_models(model_path, use_retinex, device)
@@ -1361,7 +1360,7 @@ def visualization_page():
         st.error(f"{t('load_failed')}: {e}")
         return
 
-    # Select Data
+    # 选择数据
     data_path = folder_selector(t("dataset_root"), "vis_data", "../datasets/kitti_LOL")
     test_low = os.path.join(data_path, "eval15", "low")
     
@@ -1373,11 +1372,11 @@ def visualization_page():
             from PIL import Image
             from torchvision import transforms
             
-            # Paths
+            # 路径
             low_p = os.path.join(test_low, sel_file)
             high_p = os.path.join(data_path, "eval15", "high", sel_file)
             
-            # Load & Process
+            # 加载并处理
             img_low = Image.open(low_p).convert("RGB")
             img_high = Image.open(high_p).convert("RGB")
             
@@ -1394,7 +1393,7 @@ def visualization_page():
             
             img_out = tensor_to_pil(t_out)
             
-            # Layout
+            # 布局
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.image(img_low, caption=t("synthesized_input"), use_container_width=True)
@@ -1410,7 +1409,7 @@ def visualization_page():
 def configuration_page():
     render_intro_card(t("accelerate_config_header"), t("accelerate_config_desc"))
 
-    # Check for existing config
+    # 检查是否已有配置
     config_path = "accelerate_config.yaml"
     default_config = {
         "compute_environment": "LOCAL_MACHINE",
@@ -1470,10 +1469,10 @@ def configuration_page():
             
     st.info(t("config_tip"))
 
-# --- Main Nav ---
+# 主导航
 with st.sidebar:
     st.title(t("nav_title"))
-    # Define mapping between localized names and internal keys
+    # 本地化名称与内部页面键的映射
     nav_options = {
         t("home"): "Home",
         t("dataset"): "Dataset Preparation",

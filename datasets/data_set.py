@@ -6,6 +6,7 @@ from typing import Optional
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from datasets.prepare_data import (
@@ -14,22 +15,41 @@ from datasets.prepare_data import (
     manifest_info_path,
     resolve_manifest_entry_path,
 )
-from scripts.darker import Darker
+from utils.torch_low_light_degrader import TorchLowLightDegrader
 
 
 VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
 
 
-def _normalize_to_model_space(image_rgb: np.ndarray) -> torch.Tensor:
+def _rgb_to_tensor(image_rgb: np.ndarray | torch.Tensor) -> torch.Tensor:
+    if isinstance(image_rgb, torch.Tensor):
+        return image_rgb.float()
     image_tensor = torch.from_numpy(np.ascontiguousarray(
-        image_rgb.transpose(2, 0, 1))).float() / 255.0
+        image_rgb.transpose(2, 0, 1))).float()
+    return image_tensor / 255.0
+
+
+def _normalize_to_model_space(image_rgb: np.ndarray | torch.Tensor) -> torch.Tensor:
+    image_tensor = _rgb_to_tensor(image_rgb)
+    if image_tensor.max().item() > 1.5:
+        image_tensor = image_tensor / 255.0
     return image_tensor.mul(2.0).sub(1.0)
 
 
-def _resize_rgb(image_rgb: np.ndarray, size: int) -> np.ndarray:
-    interpolation = cv2.INTER_AREA if min(
-        image_rgb.shape[:2]) >= size else cv2.INTER_LINEAR
-    return cv2.resize(image_rgb, (size, size), interpolation=interpolation)
+def _resize_rgb(image_rgb: np.ndarray | torch.Tensor, size: int) -> torch.Tensor:
+    image_tensor = _rgb_to_tensor(image_rgb)
+    if image_tensor.ndim != 3:
+        raise ValueError(
+            f"Expected image tensor with shape (C, H, W), got {tuple(image_tensor.shape)}")
+    if image_tensor.shape[-2:] == (size, size):
+        return image_tensor
+    resized = F.interpolate(
+        image_tensor.unsqueeze(0),
+        size=(size, size),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return resized.squeeze(0)
 
 
 class LowLightDataset(Dataset):
@@ -50,7 +70,7 @@ class LowLightDataset(Dataset):
         self.phase = phase
         self.online_synthesis = online_synthesis and (phase == "train")
         self.darker_ranges = darker_ranges
-        self.darker = None
+        self.torch_degrader = None
         self.data = []
         self.decode_cache_size = max(0, int(decode_cache_size or 0))
         self.decode_cache = OrderedDict()
@@ -151,11 +171,13 @@ class LowLightDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def _get_darker(self):
-        if self.darker is None:
-            self.darker = Darker(
-                randomize=True, param_ranges=self.darker_ranges)
-        return self.darker
+    def _get_torch_degrader(self):
+        if self.torch_degrader is None:
+            self.torch_degrader = TorchLowLightDegrader(
+                randomize=True,
+                param_ranges=self.darker_ranges,
+            )
+        return self.torch_degrader
 
     @staticmethod
     def _load_prepared_entries(manifest_path: str | None) -> list[dict]:
@@ -194,33 +216,32 @@ class LowLightDataset(Dataset):
         height, width = high_rgb.shape[:2]
         top, left, crop_h, crop_w = self._random_crop_coords(height, width)
         high_patch = high_rgb[top:top + crop_h, left:left + crop_w]
-        high_patch = _resize_rgb(high_patch, self.img_size) if high_patch.shape[:2] != (
-            self.img_size, self.img_size) else high_patch
+        high_patch = _resize_rgb(high_patch, self.img_size)
 
-        darker = self._get_darker()
-        low_patch_bgr = darker.degrade_single(
-            cv2.cvtColor(high_patch, cv2.COLOR_RGB2BGR))
-        low_patch = cv2.cvtColor(low_patch_bgr, cv2.COLOR_BGR2RGB)
+        torch_degrader = self._get_torch_degrader()
+        low_patch = torch_degrader.degrade(high_patch)
 
         if random.random() > 0.5:
-            low_patch = np.flip(low_patch, axis=1).copy()
-            high_patch = np.flip(high_patch, axis=1).copy()
+            low_patch = torch.flip(low_patch, dims=(2,))
+            high_patch = torch.flip(high_patch, dims=(2,))
 
         return low_patch, high_patch
 
     def _train_precomputed_pair(self, low_rgb: np.ndarray, high_rgb: np.ndarray):
-        height, width = low_rgb.shape[:2]
+        low_tensor = _rgb_to_tensor(low_rgb)
+        high_tensor = _rgb_to_tensor(high_rgb)
+        height, width = low_tensor.shape[-2:]
         top, left, crop_h, crop_w = self._random_crop_coords(height, width)
-        low_patch = low_rgb[top:top + crop_h, left:left + crop_w]
-        high_patch = high_rgb[top:top + crop_h, left:left + crop_w]
+        low_patch = low_tensor[:, top:top + crop_h, left:left + crop_w]
+        high_patch = high_tensor[:, top:top + crop_h, left:left + crop_w]
 
-        if low_patch.shape[:2] != (self.img_size, self.img_size):
+        if low_patch.shape[-2:] != (self.img_size, self.img_size):
             low_patch = _resize_rgb(low_patch, self.img_size)
             high_patch = _resize_rgb(high_patch, self.img_size)
 
         if random.random() > 0.5:
-            low_patch = np.flip(low_patch, axis=1).copy()
-            high_patch = np.flip(high_patch, axis=1).copy()
+            low_patch = torch.flip(low_patch, dims=(2,))
+            high_patch = torch.flip(high_patch, dims=(2,))
 
         return low_patch, high_patch
 

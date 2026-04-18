@@ -11,7 +11,8 @@ from utils.project_config import (
 
 def test_resolve_config_path_for_named_preset():
     assert resolve_config_path("middle").endswith("configs/train/middle.yaml")
-    assert resolve_config_path("small_throughput").endswith("configs/train/small_throughput.yaml")
+    assert resolve_config_path("small_throughput").endswith(
+        "configs/train/small_throughput.yaml")
 
 
 def test_load_config_defaults_exposes_flattened_values():
@@ -43,7 +44,8 @@ def test_build_preview_namespace_and_runtime_summary():
 def test_load_preset_summary_matches_yaml_shape():
     summary = load_preset_summary("middle")
     assert summary["name"] == "middle"
-    assert summary["effective_batch"] == summary["batch_size"] * summary["gradient_accumulation_steps"]
+    assert summary["effective_batch"] == summary["batch_size"] * \
+        summary["gradient_accumulation_steps"]
 
 
 def test_runtime_summary_includes_train_validation_fields():
@@ -72,17 +74,17 @@ def test_runtime_summary_includes_backend_fields():
             "config_name": "small",
             "attention_backend": "auto",
             "use_torch_compile": True,
-            "torch_compile_mode": "reduce-overhead",
-            "enable_xformers_memory_efficient_attention": True,
-            "unet_backend_resolved_backend": "xformers",
+            "torch_compile_mode": "max-autotune-no-cudagraphs",
+            "enable_torch_sdpa_memory_efficient_attention": True,
+            "unet_backend_resolved_backend": "sdpa",
         }
     )
 
     assert summary["attention_backend"] == "auto"
     assert summary["use_torch_compile"] is True
-    assert summary["torch_compile_mode"] == "reduce-overhead"
-    assert summary["enable_xformers_memory_efficient_attention"] is True
-    assert summary["resolved_unet_backend"] == "xformers"
+    assert summary["torch_compile_mode"] == "max-autotune-no-cudagraphs"
+    assert summary["enable_torch_sdpa_memory_efficient_attention"] is True
+    assert summary["resolved_unet_backend"] == "sdpa"
 
 
 def test_runtime_summary_includes_inject_mode_and_prepared_train_resolution():

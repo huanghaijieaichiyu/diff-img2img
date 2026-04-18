@@ -42,7 +42,7 @@ def get_image_format(files: List[Tuple[str, str]]) -> str:
         sys.exit(1)
 
     _, first_file = files[0]
-    return Path(first_file).suffix[1:]  # Remove the leading dot
+    return Path(first_file).suffix[1:]  # 去掉前导点号
 
 
 def rename_files(data_dir: str) -> None:

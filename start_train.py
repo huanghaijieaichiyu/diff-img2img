@@ -88,8 +88,15 @@ def create_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--attention-backend",
-        choices=["auto", "compile", "xformers", "native"],
+        choices=["auto", "compile", "sdpa", "native"],
         help="UNet 运行后端策略",
+    )
+
+    parser.add_argument(
+        "--enable-torch-sdpa-memory-efficient-attention",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="启用 PyTorch 官方 SDPA 内存高效注意力",
     )
 
     parser.add_argument(
@@ -152,6 +159,10 @@ def main():
         cmd.extend(["--model_path", args.model_path])
     if args.attention_backend:
         cmd.extend(["--attention_backend", args.attention_backend])
+    if args.enable_torch_sdpa_memory_efficient_attention is True:
+        cmd.append("--enable_torch_sdpa_memory_efficient_attention")
+    elif args.enable_torch_sdpa_memory_efficient_attention is False:
+        cmd.append("--no-enable_torch_sdpa_memory_efficient_attention")
     if args.compile_mode:
         cmd.extend(["--torch_compile_mode", args.compile_mode])
     if args.use_torch_compile is True:

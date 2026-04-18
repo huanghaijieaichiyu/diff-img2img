@@ -8,12 +8,13 @@ runtime:
   mixed_precision: fp16
   attention_backend: auto
   use_torch_compile: true
-  torch_compile_mode: reduce-overhead
+  torch_compile_mode: max-autotune-no-cudagraphs
   resolution: 256
   prepared_train_resolution: 256
   log_interval: 10
   num_workers: 4
-  prepare_on_train: true
+  prepare_on_train: false
+  degradation_backend: torch
   prepared_cache_dir:
   offline_variant_count: 3
   prepare_workers:
@@ -43,7 +44,7 @@ model:
   unet_block_channels: [32, 64, 96, 128]
   unet_down_block_types: [DownBlock2D, DownBlock2D, DownBlock2D, AttnDownBlock2D]
   unet_up_block_types: [AttnUpBlock2D, UpBlock2D, UpBlock2D, UpBlock2D]
-  enable_xformers_memory_efficient_attention: true
+  enable_torch_sdpa_memory_efficient_attention: true
   enable_gradient_checkpointing: false
   use_cfg: true
   cfg_drop_prob: 0.1
@@ -65,11 +66,18 @@ loss:
   use_uncertainty_weighting: false
   use_lpips: false
   lpips_resize: 128
+  lpips_stage_enable: false
+  lpips_stage_start_ratio: 0.8
   wavelet_loss_weight: 0.0
   retinex_loss_weight: 0.1
   tv_loss_weight: 0.1
   retinex_consistency_weight: 1.0
   retinex_exposure_weight: 0.1
+  frequency_loss_weight: 0.02
+  edge_loss_weight: 0.03
+  loss_balance_mode: ema
+  loss_balance_decay: 0.98
+  loss_balance_warmup_steps: 1000
   x0_loss_weight: 0.18
   x0_loss_t_max: 180
   x0_loss_warmup_steps: 250

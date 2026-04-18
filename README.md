@@ -67,7 +67,8 @@ Before the first epoch, training validates or builds a prepared cache under:
 Key points:
 
 - Training consumes the prepared cache, not a single pre-existing `our485/low` folder.
-- If the cache is missing or stale, `train` will rebuild it automatically.
+- Default `train` mode requires a valid prepared cache (offline-first).
+- Optional: set `--prepare-on-train` if you want training to auto-build missing cache.
 - Interrupted prepare runs can resume as long as the metadata still matches the requested settings.
 
 To prepare the cache explicitly:
@@ -78,7 +79,8 @@ python3 main.py --mode prepare \
   --data_dir /path/to/dataset \
   --offline_variant_count 3 \
   --prepare_workers 4 \
-  --synthesis_seed 42
+  --synthesis_seed 42 \
+  --degradation-backend torch
 ```
 
 ## Training
@@ -109,11 +111,14 @@ Environment variables understood by `start_train.sh`:
 - `PREPARE_WORKERS`: worker count for offline cache generation
 - `OFFLINE_VARIANT_COUNT`: number of synthetic low-light variants per training image
 - `SYNTHESIS_SEED`: base seed for offline synthesis
+- `DEGRADATION_BACKEND`: `torch` (recommended) or `opencv` for offline synthesis backend
 - `PREPARE_FORCE`: set to `1` to rebuild the cache from scratch
 - `RUN_FULL_EVAL_AFTER_TRAIN`: set to `1` to launch the standardized offline validation right after a successful train run
 - Explicit runtime overrides such as `NUM_WORKERS`, `PREFETCH_FACTOR`, `BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS`, `VALIDATION_STEPS`, `BENCHMARK_INFERENCE_STEPS`, `SEMANTIC_BACKBONE`, and `NR_METRIC`
 
 `start_train.sh` is now a thin shell wrapper. The detailed environment-variable parsing and command assembly live in `utils/train_launcher.py`, while the resolved defaults still come from `configs/train/*.yaml` and `main.py`.
+
+The default UNet attention path now uses PyTorch's built-in SDPA processors, and compile defaults to `max-autotune-no-cudagraphs` for better training stability.
 
 Equivalent raw command:
 

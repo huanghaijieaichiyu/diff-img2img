@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from core.engine import DiffusionEngine, normalize_validation_metrics, resolve_validation_step_counts
 from models.diffusion import CombinedModel
+from utils.loss import CompositeLoss
 
 
 def test_normalize_validation_metrics_defaults_to_psnr_ssim():
@@ -40,7 +41,7 @@ def test_resolve_validation_step_counts_full_keeps_benchmark_steps():
 
 
 def test_resolve_training_epoch_limit_rounds_up():
-    # 3 updates/epoch, 10 total steps -> 4 epochs required.
+    # 3 次更新/轮，10 个总步数需要 4 轮。
     assert DiffusionEngine._resolve_training_epoch_limit(10, 3) == 4
 
 
@@ -64,3 +65,25 @@ def test_grouped_lr_optimizer_supports_compiled_child_modules():
     optimizer = engine._build_optimizer_with_grouped_lr()
 
     assert len(optimizer.param_groups) > 0
+
+
+def test_composite_loss_includes_frequency_and_edge_terms():
+    loss_fn = CompositeLoss(
+        use_lpips=False,
+        w_wavelet=0.0,
+        w_frequency=0.05,
+        w_edge=0.05,
+        use_uncertainty_weighting=False,
+        loss_balance_mode="ema",
+        loss_balance_warmup_steps=0,
+    )
+    pred = torch.zeros(2, 3, 8, 8)
+    target = torch.ones(2, 3, 8, 8)
+
+    total_loss, logs = loss_fn(pred, target)
+
+    assert total_loss.item() >= 0
+    assert "l_frequency" in logs
+    assert "l_edge" in logs
+    assert "w_frequency" in logs
+    assert "w_edge" in logs

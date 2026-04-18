@@ -35,16 +35,6 @@ def configure_cpu_image_backend(num_threads: int = 1) -> None:
         pass
 
 
-def add_gaussian_noise(image: np.ndarray, mean: float = 0, sigma: float = 10) -> np.ndarray:
-    """Simple additive Gaussian noise (legacy, kept for compatibility)."""
-    if image is None:
-        return None
-    img_float = image.astype(np.float32)
-    gauss = np.random.normal(mean, sigma, img_float.shape)
-    noisy = np.clip(img_float + gauss, 0, 255)
-    return noisy.astype(np.uint8)
-
-
 def add_poisson_gaussian_noise(image: np.ndarray,
                                k: float = 0.02,
                                sigma_read: float = 5.0) -> np.ndarray:
@@ -83,25 +73,6 @@ def add_poisson_gaussian_noise(image: np.ndarray,
 # ============================================================================
 #  Headlight / Light Source Simulation
 # ============================================================================
-
-def create_headlight_mask(height: int, width: int,
-                          center_y_factor=0.9, center_x_factor=0.5,
-                          beam_width_factor=0.6, falloff_sharpness=2.0,
-                          max_intensity=1.0) -> np.ndarray:
-    """Legacy single headlight mask (kept for compatibility)."""
-    Y, X = np.ogrid[:height, :width]
-    dist_y = np.maximum(0, (center_y_factor * height - Y) /
-                        (center_y_factor * height))
-    center_x = center_x_factor * width
-    dist_x = np.abs(X - center_x) / (beam_width_factor * width / 2)
-
-    falloff_y = np.exp(-falloff_sharpness * dist_y)
-    falloff_x = np.exp(-falloff_sharpness * 0.5 *
-                       np.maximum(0, dist_x - (1 - dist_y) * 0.3) ** 2)
-
-    mask = np.clip(max_intensity * falloff_y * falloff_x, 0, 1)
-    return cv2.GaussianBlur(mask, (int(width * 0.05) | 1, int(height * 0.05) | 1), 0).astype(np.float32)
-
 
 def create_random_headlight_mask(height: int, width: int,
                                  num_lights: Optional[int] = None) -> np.ndarray:
@@ -302,7 +273,7 @@ class Darker:
 
     Supports two modes:
       1. Offline batch processing (process_images) — for pre-generating datasets
-      2. Single-image processing (adjust_image / degrade_single) — for online synthesis
+      2. Single-image processing (degrade_single) — for online synthesis
 
     Key improvements over the original:
       - Randomized degradation parameters per image
@@ -469,41 +440,6 @@ class Darker:
             adjusted = apply_jpeg_artifact(adjusted, quality=params["jpeg_quality"])
 
         return enforce_reasonable_exposure(img, adjusted)
-
-    def adjust_image(self, img: np.ndarray, mask: np.ndarray,
-                     saturation_factor: float = 0.6,
-                     color_shift_factor: float = 0.1,
-                     noise_sigma: float = 5.0,
-                     headlight_boost: float = 0.8) -> np.ndarray:
-        """
-        Legacy API: apply degradation with explicit mask and simple Gaussian noise.
-        Kept for backward compatibility. For new code, prefer degrade_single().
-        """
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-        v = hsv[:, :, 2] / 255.0
-
-        v_dark = (v ** self.gamma) * self.linear_attenuation
-
-        mask_val = mask if mask.ndim == 2 else mask[:, :, 0]
-        v_final = v_dark * (1 - mask_val * headlight_boost) + \
-            v * (mask_val * headlight_boost)
-
-        hsv[:, :, 2] = np.clip(v_final * 255.0, 0, 255)
-        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation_factor, 0, 255)
-
-        adjusted_bgr = cv2.cvtColor(hsv.astype(
-            np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
-
-        shift_map = color_shift_factor * \
-            (1.0 - mask_val) * np.mean(v_final) * 255
-        adjusted_bgr[:, :, 0] += shift_map
-        adjusted_bgr[:, :, 2] -= shift_map * 0.5
-
-        adjusted_bgr = np.clip(adjusted_bgr, 0, 255).astype(np.uint8)
-
-        if noise_sigma > 0:
-            return add_gaussian_noise(adjusted_bgr, sigma=noise_sigma)
-        return adjusted_bgr
 
     def _process_single_image(self, filename: str):
         """Process a single image with randomized or fixed degradation."""

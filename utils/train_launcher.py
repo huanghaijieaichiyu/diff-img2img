@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+from utils.project_config import resolve_config_path
 
 import os
 import shlex
@@ -13,8 +14,6 @@ from typing import Mapping
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-from utils.project_config import resolve_config_path
 
 
 LOCAL_ACCELERATE_BIN = PROJECT_ROOT / ".venv" / "bin" / "accelerate"
@@ -48,25 +47,32 @@ COMMON_OPTION_SPECS = (
     OptionSpec("PREPARED_CACHE_DIR", "--prepared_cache_dir"),
     OptionSpec("NUM_WORKERS", "--num_workers"),
     OptionSpec("PREFETCH_FACTOR", "--prefetch_factor"),
-    OptionSpec("PERSISTENT_WORKERS", "--persistent_workers", kind="bool_optional"),
+    OptionSpec("PERSISTENT_WORKERS", "--persistent_workers",
+               kind="bool_optional"),
     OptionSpec("PIN_MEMORY", "--pin_memory", kind="bool_optional"),
     OptionSpec("DECODE_CACHE_SIZE", "--decode_cache_size"),
     OptionSpec("OPENCV_THREADS_PER_WORKER", "--opencv_threads_per_worker"),
     OptionSpec("MIXED_PRECISION", "--mixed_precision"),
     OptionSpec("USE_RETINEX", "--use_retinex", kind="bool_optional"),
     OptionSpec("ATTENTION_BACKEND", "--attention_backend"),
-    OptionSpec("USE_TORCH_COMPILE", "--use_torch_compile", kind="bool_optional"),
+    OptionSpec("ENABLE_TORCH_SDPA_MEMORY_EFFICIENT_ATTENTION",
+               "--enable_torch_sdpa_memory_efficient_attention", kind="bool_optional"),
+    OptionSpec("USE_TORCH_COMPILE", "--use_torch_compile",
+               kind="bool_optional"),
     OptionSpec("TORCH_COMPILE_MODE", "--torch_compile_mode"),
-    OptionSpec("ALLOW_UNSAFE_COMPILE_WITH_FILM", "--allow_unsafe_compile_with_film", kind="bool_optional"),
+    OptionSpec("ALLOW_UNSAFE_COMPILE_WITH_FILM",
+               "--allow_unsafe_compile_with_film", kind="bool_optional"),
 )
 
 TRAIN_OPTION_SPECS = (
     OptionSpec("PREPARE_WORKERS", "--prepare_workers"),
     OptionSpec("OFFLINE_VARIANT_COUNT", "--offline_variant_count"),
     OptionSpec("SYNTHESIS_SEED", "--synthesis_seed"),
+    OptionSpec("DEGRADATION_BACKEND", "--degradation_backend"),
     OptionSpec("VALIDATION_STEPS", "--validation_steps"),
     OptionSpec("NUM_VALIDATION_IMAGES", "--num_validation_images"),
-    OptionSpec("BENCHMARK_INFERENCE_STEPS", "--benchmark_inference_steps", kind="list"),
+    OptionSpec("BENCHMARK_INFERENCE_STEPS",
+               "--benchmark_inference_steps", kind="list"),
     OptionSpec("BATCH_SIZE", "--batch_size"),
     OptionSpec("GRADIENT_ACCUMULATION_STEPS", "--gradient_accumulation_steps"),
     OptionSpec("MAX_TRAIN_STEPS", "--max_train_steps"),
@@ -82,9 +88,12 @@ TRAIN_OPTION_SPECS = (
 
 VALIDATE_OPTION_SPECS = (
     OptionSpec("FULL_EVAL_BATCH_SIZE", "--batch_size", default="2"),
-    OptionSpec("FULL_EVAL_NUM_VALIDATION_IMAGES", "--num_validation_images", default="12"),
-    OptionSpec("FULL_EVAL_BENCHMARK_INFERENCE_STEPS", "--benchmark_inference_steps", kind="list", default="8 20"),
-    OptionSpec("FULL_EVAL_SEMANTIC_BACKBONE", "--semantic_backbone", default="resnet18"),
+    OptionSpec("FULL_EVAL_NUM_VALIDATION_IMAGES",
+               "--num_validation_images", default="12"),
+    OptionSpec("FULL_EVAL_BENCHMARK_INFERENCE_STEPS",
+               "--benchmark_inference_steps", kind="list", default="8 20"),
+    OptionSpec("FULL_EVAL_SEMANTIC_BACKBONE",
+               "--semantic_backbone", default="resnet18"),
     OptionSpec("FULL_EVAL_NR_METRIC", "--nr_metric", default="niqe"),
 )
 
@@ -187,8 +196,10 @@ def build_validate_command(
     output_dir: str,
     environ: Mapping[str, str],
 ) -> tuple[str, ...]:
-    model_path = environ.get("MODEL_PATH") or os.path.join(output_dir, "best_model")
-    validation_output_dir = environ.get("VALIDATION_OUTPUT_DIR") or os.path.join(output_dir, "full_eval")
+    model_path = environ.get("MODEL_PATH") or os.path.join(
+        output_dir, "best_model")
+    validation_output_dir = environ.get(
+        "VALIDATION_OUTPUT_DIR") or os.path.join(output_dir, "full_eval")
 
     command = [
         accelerate_bin,
@@ -215,7 +226,8 @@ def build_validate_command(
 def plan_from_env(environ: Mapping[str, str]) -> LaunchPlan:
     run_mode = (environ.get("RUN_MODE") or "train").strip().lower()
     if run_mode not in {"train", "validate"}:
-        raise SystemExit(f"Unsupported RUN_MODE={run_mode!r}. Expected 'train' or 'validate'.")
+        raise SystemExit(
+            f"Unsupported RUN_MODE={run_mode!r}. Expected 'train' or 'validate'.")
 
     model_size = (environ.get("MODEL_SIZE") or "middle").strip() or "middle"
     config_key = environ.get("CONFIG_PATH") or model_size
@@ -270,7 +282,8 @@ def plan_from_env(environ: Mapping[str, str]) -> LaunchPlan:
 
 
 def _warn_if_cross_mounted_data(data_dir: str, prepared_cache_dir: str | None) -> None:
-    active_cache_dir = prepared_cache_dir or os.path.join(data_dir, ".prepared")
+    active_cache_dir = prepared_cache_dir or os.path.join(
+        data_dir, ".prepared")
     if data_dir.startswith("/mnt/") or active_cache_dir.startswith("/mnt/"):
         print("[start_train][warning] dataset or prepared cache appears to be on a cross-mounted path.", file=sys.stderr)
         print("[start_train][warning] For trustworthy throughput measurements, prefer a local Linux SSD.", file=sys.stderr)
@@ -283,7 +296,8 @@ def _print_command(command: tuple[str, ...]) -> None:
 def _terminate_active_process(_signum, _frame) -> None:
     global _ACTIVE_PROCESS
     if _ACTIVE_PROCESS is not None and _ACTIVE_PROCESS.poll() is None:
-        print("\n[start_train] interrupt received, stopping launcher...", file=sys.stderr, flush=True)
+        print("\n[start_train] interrupt received, stopping launcher...",
+              file=sys.stderr, flush=True)
         try:
             os.killpg(_ACTIVE_PROCESS.pid, signal.SIGTERM)
         except (AttributeError, ProcessLookupError):
@@ -297,7 +311,8 @@ def _terminate_active_process(_signum, _frame) -> None:
 
 def _run_command(command: tuple[str, ...]) -> int:
     global _ACTIVE_PROCESS
-    process = subprocess.Popen(command, cwd=PROJECT_ROOT, start_new_session=True)
+    process = subprocess.Popen(
+        command, cwd=PROJECT_ROOT, start_new_session=True)
     _ACTIVE_PROCESS = process
     try:
         return process.wait()
@@ -310,7 +325,8 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _terminate_active_process)
 
     plan = plan_from_env(os.environ)
-    _warn_if_cross_mounted_data(plan.data_dir, os.environ.get("PREPARED_CACHE_DIR"))
+    _warn_if_cross_mounted_data(
+        plan.data_dir, os.environ.get("PREPARED_CACHE_DIR"))
 
     print(f"[start_train] accelerate_bin={plan.accelerate_bin}", flush=True)
     print(f"[start_train] run_mode={plan.run_mode}", flush=True)

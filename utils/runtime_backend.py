@@ -5,12 +5,12 @@ from dataclasses import dataclass, replace
 import torch
 
 
-UNET_BACKEND_CHOICES = ("auto", "compile", "xformers", "native")
+UNET_BACKEND_CHOICES = ("auto", "compile", "sdpa", "native")
 TORCH_COMPILE_MODE_CHOICES = (
     "default",
-    "reduce-overhead",
     "max-autotune",
     "max-autotune-no-cudagraphs",
+    "reduce-overhead",
 )
 
 
@@ -21,8 +21,8 @@ class UNetRuntimeBackend:
     use_torch_compile: bool
     torch_compile_mode: str
     compile_enabled: bool
-    xformers_requested: bool
-    xformers_enabled: bool
+    sdpa_requested: bool
+    sdpa_enabled: bool
     uses_dynamic_film_hooks: bool
     allow_unsafe_compile_with_film: bool
     reasons: tuple[str, ...] = ()
@@ -37,8 +37,8 @@ class UNetRuntimeBackend:
             "use_torch_compile": self.use_torch_compile,
             "torch_compile_mode": self.torch_compile_mode,
             "compile_enabled": self.compile_enabled,
-            "xformers_requested": self.xformers_requested,
-            "xformers_enabled": self.xformers_enabled,
+            "sdpa_requested": self.sdpa_requested,
+            "sdpa_enabled": self.sdpa_enabled,
             "uses_dynamic_film_hooks": self.uses_dynamic_film_hooks,
             "allow_unsafe_compile_with_film": self.allow_unsafe_compile_with_film,
             "reasons": list(self.reasons),
@@ -72,7 +72,8 @@ def _requested_backend(args) -> str:
 
 
 def _torch_compile_mode(args) -> str:
-    mode = getattr(args, "torch_compile_mode", None) or "reduce-overhead"
+    mode = getattr(args, "torch_compile_mode",
+                   None) or "max-autotune-no-cudagraphs"
     mode = str(mode).strip().lower()
     if mode not in TORCH_COMPILE_MODE_CHOICES:
         raise ValueError(
@@ -86,10 +87,14 @@ def resolve_unet_runtime_backend(args) -> UNetRuntimeBackend:
     requested_backend = _requested_backend(args)
     use_torch_compile = bool(getattr(args, "use_torch_compile", True))
     torch_compile_mode = _torch_compile_mode(args)
-    xformers_requested = bool(getattr(args, "enable_xformers_memory_efficient_attention", False))
-    uses_dynamic_film_hooks = getattr(args, "inject_mode", None) == "film_pyramid"
-    allow_unsafe_compile_with_film = bool(getattr(args, "allow_unsafe_compile_with_film", False))
-    compile_supported = hasattr(torch, "compile") and callable(getattr(torch.nn.Module, "compile", None))
+    sdpa_requested = bool(
+        getattr(args, "enable_torch_sdpa_memory_efficient_attention", False))
+    uses_dynamic_film_hooks = getattr(
+        args, "inject_mode", None) == "film_pyramid"
+    allow_unsafe_compile_with_film = bool(
+        getattr(args, "allow_unsafe_compile_with_film", False))
+    compile_supported = hasattr(torch, "compile") and callable(
+        getattr(torch.nn.Module, "compile", None))
 
     backend = UNetRuntimeBackend(
         requested_backend=requested_backend,
@@ -97,8 +102,8 @@ def resolve_unet_runtime_backend(args) -> UNetRuntimeBackend:
         use_torch_compile=use_torch_compile,
         torch_compile_mode=torch_compile_mode,
         compile_enabled=False,
-        xformers_requested=xformers_requested,
-        xformers_enabled=False,
+        sdpa_requested=sdpa_requested,
+        sdpa_enabled=False,
         uses_dynamic_film_hooks=uses_dynamic_film_hooks,
         allow_unsafe_compile_with_film=allow_unsafe_compile_with_film,
     )
@@ -126,14 +131,15 @@ def resolve_unet_runtime_backend(args) -> UNetRuntimeBackend:
             backend,
             resolved_backend="compile",
             compile_enabled=True,
+            sdpa_enabled=sdpa_requested,
         ).with_reason("Explicit compile backend requested.")
 
-    if requested_backend == "xformers":
+    if requested_backend == "sdpa":
         return replace(
             backend,
-            resolved_backend="xformers",
-            xformers_enabled=True,
-        ).with_reason("Explicit xformers backend requested.")
+            resolved_backend="sdpa",
+            sdpa_enabled=True,
+        ).with_reason("Explicit PyTorch SDPA backend requested.")
 
     if requested_backend == "native":
         return backend.with_reason("Explicit native PyTorch attention backend requested.")
@@ -143,16 +149,17 @@ def resolve_unet_runtime_backend(args) -> UNetRuntimeBackend:
             backend,
             resolved_backend="compile",
             compile_enabled=True,
+            sdpa_enabled=sdpa_requested,
         ).with_reason("Auto backend selected torch.compile.")
 
     if compile_block_reason is not None:
         backend = backend.with_reason(compile_block_reason)
 
-    if xformers_requested:
+    if sdpa_requested:
         return replace(
             backend,
-            resolved_backend="xformers",
-            xformers_enabled=True,
-        ).with_reason("Falling back to xformers.")
+            resolved_backend="sdpa",
+            sdpa_enabled=True,
+        ).with_reason("Falling back to PyTorch SDPA attention.")
 
     return backend.with_reason("Falling back to native PyTorch attention.")

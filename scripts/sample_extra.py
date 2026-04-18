@@ -1,12 +1,10 @@
 # 从nuscenes数据集中提取不同地点的图片
 
 import os
-import json
-import numpy as np
 import PIL.Image as Image
 import glob
 from tqdm import tqdm
-from darker import Darker
+from scripts.darker import Darker
 import cv2  # 添加 cv2 导入
 
 
@@ -45,24 +43,7 @@ def extract_images(nuscenes_data_path, output_path):
 def darken_images(input_path, output_path):
     image_path_list = glob.glob(os.path.join(input_path, '*.jpg'))
     image_path_list.sort()
-    # 实例化 Darker - data_dir 对于 adjust_image 不是必需的
-    darker = Darker()
-    # 定义参数
-    base_ratio = 0.05
-    headlight_mask_params = {
-        'center_y_factor': 0.95,
-        'beam_width_factor': 0.7,
-        'falloff_sharpness': 3.0,
-        'max_intensity': 0.98
-    }
-    effect_params = {
-        'saturation_factor': 0.5,
-        'color_shift_factor': 0.12,
-        'noise_sigma': 8.0,
-        'headlight_boost': 0.9,
-        'saturation_boost': 0.5,
-        'color_shift_dampen': 0.7
-    }
+    darker = Darker(randomize=True)
 
     os.makedirs(output_path, exist_ok=True)  # 确保输出目录存在
 
@@ -75,22 +56,7 @@ def darken_images(input_path, output_path):
                 print(f"Warning: Could not read image: {image_path}")
                 continue
 
-            h, w = image.shape[:2]
-            # 获取蒙版
-            mask = darker.get_mask(h, w, **headlight_mask_params)
-
-            # 应用暗化调整，单独传递效果参数
-            dark_image = Darker.adjust_image(  # 调用静态方法
-                image,
-                mask,
-                base_ratio,
-                saturation_factor=effect_params['saturation_factor'],
-                color_shift_factor=effect_params['color_shift_factor'],
-                noise_sigma=effect_params['noise_sigma'],
-                headlight_boost=effect_params['headlight_boost'],
-                saturation_boost=effect_params['saturation_boost'],
-                color_shift_dampen=effect_params['color_shift_dampen']
-            )
+            dark_image = darker.degrade_single(image)
 
             # 构建输出路径
             file_name = os.path.basename(image_path)

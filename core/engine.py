@@ -24,6 +24,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import DDPMScheduler, UNet2DModel
+from diffusers.models.attention_processor import AttnProcessor2_0
 from diffusers.optimization import get_scheduler
 from diffusers.schedulers.scheduling_dpmsolver_multistep import DPMSolverMultistepScheduler
 from diffusers.training_utils import EMAModel
@@ -102,6 +103,8 @@ class DiffusionEngine:
             "l_diff",
             "l_x0",
             "l_wavelet",
+            "l_frequency",
+            "l_edge",
             "x0_w",
             "l_ret",
             "l_recon_low",
@@ -137,6 +140,8 @@ class DiffusionEngine:
         self._lpips_fn = None
         self._lpips_load_attempted = False
         self._semantic_metric = None
+        self._lpips_stage_start_step = 0
+        self._lpips_stage_last_enabled = None
 
         logging_dir = os.path.join(args.output_dir, "logs")
         accelerator_project_config = ProjectConfiguration(
@@ -186,13 +191,61 @@ class DiffusionEngine:
             prediction_type=args.prediction_type,
         )
         use_uncertainty = getattr(args, "use_uncertainty_weighting", False)
+        self.lpips_stage_enable = bool(
+            getattr(args, "lpips_stage_enable", False))
+        self.lpips_stage_start_ratio = float(
+            getattr(args, "lpips_stage_start_ratio", 0.8))
+        if self.lpips_stage_enable and (
+            use_uncertainty or getattr(self.args, "loss_balance_mode", "fixed") == "uncertainty"
+        ):
+            logger.warning(
+                "lpips_stage_enable is incompatible with uncertainty loss balancing; disabling staged LPIPS."
+            )
+            self.lpips_stage_enable = False
+
+        criterion_use_lpips = bool(
+            getattr(args, "use_lpips", True)) or self.lpips_stage_enable
         self.criterion = CompositeLoss(
             device=self.accelerator.device,
-            use_uncertainty_weighting=use_uncertainty,
-            use_lpips=getattr(args, "use_lpips", True),
+            use_uncertainty_weighting=use_uncertainty or getattr(self.args, "loss_balance_mode", "fixed") == "uncertainty",
+            use_lpips=criterion_use_lpips,
             lpips_resize=getattr(args, "lpips_resize", None),
             w_wavelet=getattr(args, "wavelet_loss_weight", 0.0),
+            w_frequency=getattr(args, "frequency_loss_weight", 0.0),
+            w_edge=getattr(args, "edge_loss_weight", 0.0),
+            loss_balance_mode=getattr(args, "loss_balance_mode", "fixed"),
+            loss_balance_decay=getattr(args, "loss_balance_decay", 0.98),
+            loss_balance_warmup_steps=getattr(args, "loss_balance_warmup_steps", 0),
         ).to(self.accelerator.device)
+
+    def _configure_lpips_stage_schedule(self):
+        if not self.lpips_stage_enable:
+            self._lpips_stage_start_step = 0
+            return
+        max_steps = max(1, int(self.args.max_train_steps))
+        start_step = int(max_steps * self.lpips_stage_start_ratio)
+        self._lpips_stage_start_step = max(0, min(max_steps - 1, start_step))
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Staged LPIPS enabled: start at joint_step=%s (%s%% of max_train_steps=%s)",
+                self._lpips_stage_start_step,
+                int(self.lpips_stage_start_ratio * 100),
+                max_steps,
+            )
+
+    def _update_lpips_runtime_state(self, joint_step: int):
+        if not self.lpips_stage_enable:
+            return
+        lpips_enabled = joint_step >= self._lpips_stage_start_step
+        if self._lpips_stage_last_enabled is None or lpips_enabled != self._lpips_stage_last_enabled:
+            self.criterion.use_lpips = lpips_enabled
+            self._lpips_stage_last_enabled = lpips_enabled
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "LPIPS runtime state switched to %s at joint_step=%s",
+                    "ON" if lpips_enabled else "OFF",
+                    joint_step,
+                )
 
     def _validation_plan(self, fast: bool) -> tuple[list[int], tuple[str, ...]]:
         if fast:
@@ -362,46 +415,56 @@ class DiffusionEngine:
             reason_text = "; ".join(
                 backend.reasons) if backend.reasons else "no extra notes"
             logger.info(
-                "UNet runtime backend: requested=%s resolved=%s compile=%s xformers=%s gradient_checkpointing=%s (%s)",
+                "UNet runtime backend: requested=%s resolved=%s compile=%s sdpa=%s gradient_checkpointing=%s (%s)",
                 backend.requested_backend,
                 backend.resolved_backend,
                 backend.compile_enabled,
-                backend.xformers_enabled,
+                backend.sdpa_enabled,
                 checkpointing_enabled,
                 reason_text,
             )
         return backend
 
+    @staticmethod
+    def _enable_torch_sdpa_memory_efficient_attention(module):
+        if module is None or not hasattr(module, "set_attn_processor"):
+            raise AttributeError(
+                "UNet does not support setting an attention processor.")
+        module.set_attn_processor(AttnProcessor2_0())
+
     def _apply_unet_runtime_backend(self, backend):
+        if backend.sdpa_enabled:
+            try:
+                self._enable_torch_sdpa_memory_efficient_attention(self.unet)
+            except Exception as exc:
+                if backend.requested_backend == "sdpa":
+                    raise
+                backend = replace(
+                    backend,
+                    resolved_backend="native",
+                    sdpa_enabled=False,
+                ).with_reason(f"PyTorch SDPA enable failed and backend fell back to native attention: {exc}")
+
         if backend.compile_enabled:
             try:
                 self.unet.compile(mode=backend.torch_compile_mode)
             except Exception as exc:
                 if backend.requested_backend == "compile":
                     raise
-                fallback_backend = "xformers" if backend.xformers_requested else "native"
+                fallback_backend = "sdpa" if backend.sdpa_requested else "native"
                 backend = replace(
                     backend,
                     resolved_backend=fallback_backend,
                     compile_enabled=False,
-                    xformers_enabled=fallback_backend == "xformers",
+                    sdpa_enabled=fallback_backend == "sdpa",
                 ).with_reason(f"torch.compile failed and auto backend fell back to {fallback_backend}: {exc}")
             else:
+                if backend.sdpa_enabled:
+                    return backend.with_reason("Enabled PyTorch SDPA attention and applied torch.compile to the UNet in-place.")
                 return backend.with_reason("Applied torch.compile to the UNet in-place.")
 
-        if backend.xformers_enabled:
-            try:
-                self.unet.enable_xformers_memory_efficient_attention()
-            except Exception as exc:
-                if backend.requested_backend == "xformers":
-                    raise
-                backend = replace(
-                    backend,
-                    resolved_backend="native",
-                    xformers_enabled=False,
-                ).with_reason(f"xformers enable failed and backend fell back to native attention: {exc}")
-            else:
-                return backend.with_reason("Enabled xformers memory efficient attention.")
+        if backend.sdpa_enabled:
+            return backend.with_reason("Enabled PyTorch SDPA attention.")
 
         return backend
 
@@ -767,8 +830,16 @@ class DiffusionEngine:
             self.args.seed or 42) + worker_id
         random.seed(worker_seed)
         np.random.seed(worker_seed % (2 ** 32 - 1))
+        torch.manual_seed(worker_seed)
         cv2.setNumThreads(
             max(0, int(getattr(self.args, "opencv_threads_per_worker", 1))))
+
+    def _move_batch_to_device(self, batch):
+        if isinstance(batch, torch.Tensor):
+            return batch.to(self.accelerator.device, non_blocking=bool(getattr(self.args, "pin_memory", True)))
+        if isinstance(batch, (list, tuple)):
+            return type(batch)(self._move_batch_to_device(item) for item in batch)
+        return batch
 
     def _collect_runtime_metrics(self, data_time: float, compute_time: float, batch_size: int) -> dict:
         iter_time = max(data_time + compute_time, 1e-8)
@@ -1073,12 +1144,19 @@ class DiffusionEngine:
                 "Training dataset is empty. Please check prepared cache and source files under "
                 "'<data_dir>/our485/high'."
             )
+        train_drop_last = len(train_dataset) >= int(self.args.batch_size)
+        if not train_drop_last:
+            logger.info(
+                "Training dataset size (%s) is smaller than batch size (%s); setting drop_last=False.",
+                len(train_dataset),
+                self.args.batch_size,
+            )
         train_loader_kwargs = {
             "batch_size": self.args.batch_size,
             "shuffle": True,
             "num_workers": self.args.num_workers,
             "pin_memory": bool(getattr(self.args, "pin_memory", True)),
-            "drop_last": True,
+            "drop_last": train_drop_last,
             "worker_init_fn": self._worker_init_fn,
         }
         if self.args.num_workers > 0:
@@ -1087,11 +1165,17 @@ class DiffusionEngine:
             train_loader_kwargs["prefetch_factor"] = max(
                 2, int(getattr(self.args, "prefetch_factor", 4)))
         train_dataloader = DataLoader(train_dataset, **train_loader_kwargs)
+        if len(train_dataloader) == 0:
+            raise RuntimeError(
+                "Train dataloader produced zero batches. "
+                "Check batch_size, distributed sharding, and dataset size."
+            )
 
         num_update_steps_per_epoch = math.ceil(
             len(train_dataloader) / self.args.gradient_accumulation_steps)
         if self.args.max_train_steps is None:
             self.args.max_train_steps = self.args.epochs * num_update_steps_per_epoch
+        self._configure_lpips_stage_schedule()
         max_train_epochs = self._resolve_training_epoch_limit(
             self.args.max_train_steps,
             num_update_steps_per_epoch,
@@ -1215,6 +1299,12 @@ class DiffusionEngine:
                 train_iterator = iter(train_dataloader)
                 batch = next(train_iterator)
 
+            if batch is None:
+                logger.warning(
+                    "Received empty training batch during warmup; skipping.")
+                last_iter_end = time.perf_counter()
+                continue
+
             data_time = time.perf_counter() - last_iter_end
             compute_start = time.perf_counter()
             _, logs = self._train_step(
@@ -1281,6 +1371,11 @@ class DiffusionEngine:
             for batch in train_dataloader:
                 if completed_joint_steps >= self.args.max_train_steps:
                     break
+
+                if batch is None:
+                    logger.warning("Received empty training batch; skipping.")
+                    last_iter_end = time.perf_counter()
+                    continue
 
                 phase = self._set_training_stage(completed_joint_steps)
                 data_time = time.perf_counter() - last_iter_end
@@ -1365,7 +1460,18 @@ class DiffusionEngine:
         self._save_final_model(global_step=global_step)
 
     def _train_step(self, batch, optimizer, lr_scheduler, global_step: int, phase: str, joint_step: int):
+        if batch is None:
+            raise RuntimeError(
+                "Received an empty batch from train_dataloader. "
+                "This usually indicates an invalid dataloader configuration for the current dataset size."
+            )
+        if not isinstance(batch, (list, tuple)) or len(batch) != 2:
+            raise TypeError(
+                f"Expected batch to be a (low_light_images, clean_images) pair, got {type(batch)}"
+            )
         low_light_images, clean_images = batch
+        low_light_images = self._move_batch_to_device(low_light_images)
+        clean_images = self._move_batch_to_device(clean_images)
 
         # CFG: Randomly drop conditions during training (10% probability)
         use_cfg = getattr(self.args, 'use_cfg', False)
@@ -1435,6 +1541,8 @@ class DiffusionEngine:
             residual_target = self._residual_target(
                 clean_images, low_light_images)
 
+            self._update_lpips_runtime_state(joint_step)
+
             noise = torch.randn_like(residual_target)
             if self.args.offset_noise:
                 offset_noise = torch.randn(
@@ -1472,8 +1580,10 @@ class DiffusionEngine:
                 target = self.noise_scheduler.get_velocity(
                     residual_target, noise, timesteps)
 
-            weighting_scheme = getattr(
-                self.args, "loss_weighting_scheme", "min_snr")
+            weighting_scheme = str(getattr(
+                self.args, "loss_weighting_scheme", "min_snr")).strip().lower()
+            if weighting_scheme == "mini_snr":
+                weighting_scheme = "min_snr"
             if weighting_scheme == "min_snr":
                 snr_weights = compute_min_snr_loss_weights(
                     self.noise_scheduler, timesteps, self.args.snr_gamma)
@@ -1545,6 +1655,8 @@ class DiffusionEngine:
                 "l_diff": loss_diffusion.item(),
                 "l_x0": x0_loss.item(),
                 "l_wavelet": float(x0_logs.get("l_wavelet", torch.tensor(0.0, device=clean_images.device)).item()) if x0_logs else 0.0,
+                "l_frequency": float(x0_logs.get("l_frequency", torch.tensor(0.0, device=clean_images.device)).item()) if x0_logs else 0.0,
+                "l_edge": float(x0_logs.get("l_edge", torch.tensor(0.0, device=clean_images.device)).item()) if x0_logs else 0.0,
                 "x0_w": x0_weight_log,
                 "l_ret": retinex_losses["retinex_total"].item(),
                 "l_recon_low": retinex_losses["l_recon_low"].item(),
@@ -1651,6 +1763,9 @@ class DiffusionEngine:
             for val_low, val_clean in eval_dataloader:
                 if self.accelerator.is_main_process and num_samples >= self.args.num_validation_images:
                     break
+
+                val_low = self._move_batch_to_device(val_low)
+                val_clean = self._move_batch_to_device(val_clean)
 
                 if torch.cuda.is_available():
                     torch.cuda.synchronize(self.accelerator.device)
@@ -1832,6 +1947,8 @@ class DiffusionEngine:
                     "l_diff": "",
                     "l_x0": "",
                     "l_wavelet": "",
+                    "l_frequency": "",
+                    "l_edge": "",
                     "x0_w": "",
                     "l_ret": "",
                     "l_recon_low": "",
@@ -1924,7 +2041,7 @@ class DiffusionEngine:
             for batch in tqdm(dataloader, desc="Predicting"):
                 low_light = batch[0] if isinstance(
                     batch, (list, tuple)) else batch
-                low_light = low_light.to(self.accelerator.device)
+                low_light = self._move_batch_to_device(low_light)
                 enhanced = self._inference_step(
                     low_light,
                     self.unet,

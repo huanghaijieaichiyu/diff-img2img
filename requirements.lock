@@ -82,7 +82,6 @@ numpy==2.2.5
     #   tifffile
     #   torchvision
     #   transformers
-    #   xformers
 nvidia-cublas-cu12==12.4.5.8
     # via
     #   nvidia-cudnn-cu12
@@ -201,7 +200,6 @@ torch==2.6.0
     #   timm
     #   torchaudio
     #   torchvision
-    #   xformers
 torchaudio==2.6.0
     # via inr2rgb (pyproject.toml)
 torcheval==0.0.7
@@ -229,7 +227,5 @@ urllib3==2.4.0
     # via requests
 werkzeug==3.1.3
     # via tensorboard
-xformers==0.0.29.post3
-    # via inr2rgb (pyproject.toml)
 zipp==3.21.0
     # via importlib-metadata

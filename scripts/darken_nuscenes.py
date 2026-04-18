@@ -20,7 +20,7 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 
-# Ensure project root is importable
+# 确保项目根目录可导入
 sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..")))
 
@@ -29,18 +29,18 @@ try:
 except ImportError:
     raise ImportError("Please install the project first: pip install -e .")
 # =============================================
-#  Configuration
+#  配置
 # =============================================
 SRC_DIR = Path("/mnt/f/datasets/nuscenes")
 DST_DIR = Path("/mnt/f/datasets/nuscenes_lowlight")
 
-# Only process camera folders
+# 仅处理相机目录
 CAMERA_PREFIXES = ("CAM_FRONT", "CAM_FRONT_LEFT", "CAM_FRONT_RIGHT",
                    "CAM_BACK", "CAM_BACK_LEFT", "CAM_BACK_RIGHT")
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
 
-MAX_WORKERS = 8  # Parallel processing workers
+MAX_WORKERS = 8  # 并行处理的 worker 数
 
 
 def collect_image_tasks(src_root: Path, dst_root: Path):
@@ -81,28 +81,28 @@ def process_single_image(args):
 
 
 def copy_non_image_data(src_root: Path, dst_root: Path):
-    """Copy/symlink non-camera directories and files to preserve dataset structure."""
-    # Directories to copy entirely (as symlinks for speed)
+    """复制或链接非相机目录和文件，以保留数据集结构。"""
+    # 需要整体处理的目录（为提速使用符号链接）
     for item in src_root.iterdir():
         dst_item = dst_root / item.name
         if dst_item.exists():
             continue
 
         if item.name in ("samples", "sweeps"):
-            # For samples/sweeps: create dir, copy non-camera subfolders as symlinks
+            # 对样本目录：创建目录，并将非相机子目录做成符号链接
             dst_item.mkdir(parents=True, exist_ok=True)
             for sub in item.iterdir():
                 dst_sub = dst_item / sub.name
                 if dst_sub.exists():
                     continue
                 if sub.is_dir() and not sub.name.startswith(CAMERA_PREFIXES):
-                    # Non-camera data (LIDAR, RADAR): symlink
+                    # 非相机数据：符号链接
                     os.symlink(str(sub.resolve()), str(dst_sub))
         elif item.is_dir():
-            # Other directories (v1.0-mini, maps, etc.): symlink
+            # 其他目录：符号链接
             os.symlink(str(item.resolve()), str(dst_item))
         elif item.is_file():
-            # Root files (pkl, LICENSE, etc.): symlink
+            # 根目录文件：符号链接
             os.symlink(str(item.resolve()), str(dst_item))
 
 
@@ -114,11 +114,11 @@ def main():
     assert SRC_DIR.exists(), f"Source not found: {SRC_DIR}"
     DST_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. Copy non-image data (symlinks)
+    # 1. 复制非图像数据（符号链接）
     print("📂 Linking non-image data...")
     copy_non_image_data(SRC_DIR, DST_DIR)
 
-    # 2. Collect image tasks
+    # 2. 收集图像任务
     print("🔍 Scanning for camera images...")
     tasks = collect_image_tasks(SRC_DIR, DST_DIR)
     print(f"   Found {len(tasks)} camera images to process.\n")
@@ -127,7 +127,7 @@ def main():
         print("No images found!")
         return
 
-    # 3. Darker configuration
+    # 3. 退化配置
     darker_config = {
         "gamma": (1.5, 4.0),
         "linear_attenuation": (0.25, 0.7),
@@ -144,7 +144,7 @@ def main():
         "jpeg_quality": (50, 90),
     }
 
-    # 4. Process in parallel
+    # 4. 并行处理
     print(f"🌙 Darkening images with {MAX_WORKERS} workers...")
     worker_args = [(src, dst, darker_config) for src, dst in tasks]
 

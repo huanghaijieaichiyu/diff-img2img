@@ -160,6 +160,96 @@ class HaarWaveletLoss(nn.Module):
         return per_sample.mean()
 
 
+class FrequencyDomainLoss(nn.Module):
+    """
+    Frequency-domain reconstruction loss.
+    Uses a log-magnitude spectrum comparison to emphasize high-frequency detail.
+    """
+
+    def __init__(self, resize_to: int | None = None):
+        super().__init__()
+        self.resize_to = resize_to
+
+    def forward(self, pred, target, reduction="mean"):
+        pred = _resize_if_needed(pred.float(), self.resize_to)
+        target = _resize_if_needed(target.float(), self.resize_to)
+
+        pred_fft = torch.fft.rfft2(pred, norm="ortho")
+        target_fft = torch.fft.rfft2(target, norm="ortho")
+        pred_mag = torch.log1p(torch.abs(pred_fft))
+        target_mag = torch.log1p(torch.abs(target_fft))
+        per_sample = torch.abs(pred_mag - target_mag).mean(dim=(1, 2, 3))
+        if reduction == "none":
+            return per_sample
+        return per_sample.mean()
+
+
+class EdgeLoss(nn.Module):
+    """
+    Edge-aware gradient loss using fixed Sobel filters.
+    """
+
+    def __init__(self):
+        super().__init__()
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0],
+             [-2.0, 0.0, 2.0],
+             [-1.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        )
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0],
+             [0.0, 0.0, 0.0],
+             [1.0, 2.0, 1.0]],
+            dtype=torch.float32,
+        )
+        self.register_buffer("sobel_kernel", torch.stack([sobel_x, sobel_y], dim=0).unsqueeze(1))
+
+    def forward(self, pred, target, reduction="mean"):
+        pred = pred.float()
+        target = target.float()
+        channels = pred.shape[1]
+        weight = self.sobel_kernel.repeat(channels, 1, 1, 1)
+        pred_grad = F.conv2d(pred, weight, padding=1, groups=channels)
+        target_grad = F.conv2d(target, weight, padding=1, groups=channels)
+        pred_grad = pred_grad.view(pred.shape[0], channels, 2, pred_grad.shape[-2], pred_grad.shape[-1])
+        target_grad = target_grad.view(target.shape[0], channels, 2, target_grad.shape[-2], target_grad.shape[-1])
+        pred_mag = torch.sqrt(pred_grad[:, :, 0] ** 2 + pred_grad[:, :, 1] ** 2 + 1e-6)
+        target_mag = torch.sqrt(target_grad[:, :, 0] ** 2 + target_grad[:, :, 1] ** 2 + 1e-6)
+        per_sample = torch.abs(pred_mag - target_mag).mean(dim=(1, 2, 3))
+        if reduction == "none":
+            return per_sample
+        return per_sample.mean()
+
+
+class EMAWeightedLossBalancer(nn.Module):
+    """
+    Dynamic loss balancer inspired by modern multi-loss training practice.
+    Keeps a running EMA of each loss magnitude and rescales terms to keep them comparable.
+    """
+
+    def __init__(self, num_losses: int, decay: float = 0.98, min_scale: float = 0.25, max_scale: float = 4.0):
+        super().__init__()
+        self.decay = decay
+        self.min_scale = min_scale
+        self.max_scale = max_scale
+        self.register_buffer("loss_ema", torch.ones(num_losses))
+        self.register_buffer("step_count", torch.zeros((), dtype=torch.long))
+
+    def forward(self, losses):
+        detached_losses = torch.stack([loss.detach().float() for loss in losses])
+        if self.step_count.item() == 0:
+            self.loss_ema.copy_(detached_losses.clamp_min(1e-6))
+        else:
+            self.loss_ema.mul_(self.decay).add_(detached_losses * (1.0 - self.decay))
+
+        reference = self.loss_ema[0].clamp_min(1e-6)
+        weights = (reference / self.loss_ema.clamp_min(1e-6)).clamp(self.min_scale, self.max_scale)
+        total = sum(weight * loss for weight, loss in zip(weights, losses))
+        self.step_count.add_(1)
+        return total, weights
+
+
 class UncertaintyWeightedLoss(nn.Module):
     """
     P0 Improvement: Uncertainty-based automatic loss weighting.
@@ -201,8 +291,13 @@ class CompositeLoss(nn.Module):
                  w_ssim=0.1,
                  w_lpips=0.1,
                  w_wavelet=0.0,
+                 w_frequency=0.0,
+                 w_edge=0.0,
                  device='cuda',
                  use_uncertainty_weighting=True,
+                 loss_balance_mode='fixed',
+                 loss_balance_decay=0.98,
+                 loss_balance_warmup_steps=0,
                  use_lpips=True,
                  lpips_resize=None):
         super(CompositeLoss, self).__init__()
@@ -210,22 +305,40 @@ class CompositeLoss(nn.Module):
         self.w_ssim = w_ssim
         self.w_lpips = w_lpips
         self.w_wavelet = w_wavelet
+        self.w_frequency = w_frequency
+        self.w_edge = w_edge
         self.use_uncertainty_weighting = use_uncertainty_weighting
         self.use_lpips = use_lpips
+        self.loss_balance_mode = loss_balance_mode
+        self.loss_balance_warmup_steps = max(0, int(loss_balance_warmup_steps))
+        self.loss_balancer = None
 
         self.char_loss = CharbonnierLoss()
         self.ssim_loss = SSIMLoss()
         self.lpips_loss = LPIPSLoss(enabled=use_lpips, resize_to=lpips_resize)
         self.wavelet_loss = HaarWaveletLoss() if w_wavelet > 0 else None
+        self.frequency_loss = FrequencyDomainLoss(resize_to=lpips_resize) if w_frequency > 0 else None
+        self.edge_loss = EdgeLoss() if w_edge > 0 else None
 
         self.active_term_names = ["char", "ssim"]
         if use_lpips:
             self.active_term_names.append("lpips")
         if self.wavelet_loss is not None:
             self.active_term_names.append("wavelet")
+        if self.frequency_loss is not None:
+            self.active_term_names.append("frequency")
+        if self.edge_loss is not None:
+            self.active_term_names.append("edge")
 
         if use_uncertainty_weighting:
             self.uncertainty_weighter = UncertaintyWeightedLoss(num_losses=len(self.active_term_names))
+        elif self.loss_balance_mode == "ema":
+            self.loss_balancer = EMAWeightedLossBalancer(
+                num_losses=len(self.active_term_names),
+                decay=loss_balance_decay,
+            )
+        else:
+            self.loss_balancer = None
 
     def forward(self, pred, target, sample_weight: torch.Tensor | None = None):
         """
@@ -245,6 +358,8 @@ class CompositeLoss(nn.Module):
 
         l_lpips = self.lpips_loss(pred.clamp(-1, 1), target.clamp(-1, 1), reduction="none") if self.use_lpips else torch.zeros(pred.shape[0], device=pred.device)
         l_wavelet = self.wavelet_loss(pred_01, target_01, reduction="none") if self.wavelet_loss is not None else torch.zeros(pred.shape[0], device=pred.device)
+        l_frequency = self.frequency_loss(pred_01, target_01, reduction="none") if self.frequency_loss is not None else torch.zeros(pred.shape[0], device=pred.device)
+        l_edge = self.edge_loss(pred_01, target_01, reduction="none") if self.edge_loss is not None else torch.zeros(pred.shape[0], device=pred.device)
 
         if sample_weight is not None:
             sample_weight = sample_weight.to(pred.device).float()
@@ -262,6 +377,10 @@ class CompositeLoss(nn.Module):
                 active_losses.append(reduce_samples(l_lpips))
             if self.wavelet_loss is not None:
                 active_losses.append(reduce_samples(l_wavelet))
+            if self.frequency_loss is not None:
+                active_losses.append(reduce_samples(l_frequency))
+            if self.edge_loss is not None:
+                active_losses.append(reduce_samples(l_edge))
             total_loss, weights = self.uncertainty_weighter(active_losses)
             named_weights = {
                 f"w_{name}": weights.get(f"weight_{index}")
@@ -272,26 +391,67 @@ class CompositeLoss(nn.Module):
                 'l_ssim': reduce_samples(l_ssim).detach(),
                 'l_lpips': reduce_samples(l_lpips).detach(),
                 'l_wavelet': reduce_samples(l_wavelet).detach(),
+                'l_frequency': reduce_samples(l_frequency).detach(),
+                'l_edge': reduce_samples(l_edge).detach(),
                 'l_total': total_loss.detach(),
                 'w_char': named_weights.get('w_char', self.w_char),
                 'w_ssim': named_weights.get('w_ssim', self.w_ssim),
                 'w_lpips': named_weights.get('w_lpips', self.w_lpips),
                 'w_wavelet': named_weights.get('w_wavelet', self.w_wavelet),
+                'w_frequency': named_weights.get('w_frequency', self.w_frequency),
+                'w_edge': named_weights.get('w_edge', self.w_edge),
             }
         else:
-            total_per_sample = self.w_char * l_char + self.w_ssim * l_ssim
+            base_terms = [
+                self.w_char * l_char,
+                self.w_ssim * l_ssim,
+            ]
             if self.use_lpips:
-                total_per_sample = total_per_sample + self.w_lpips * l_lpips
+                base_terms.append(self.w_lpips * l_lpips)
             if self.wavelet_loss is not None:
-                total_per_sample = total_per_sample + self.w_wavelet * l_wavelet
-            total_loss = reduce_samples(total_per_sample)
+                base_terms.append(self.w_wavelet * l_wavelet)
+            if self.frequency_loss is not None:
+                base_terms.append(self.w_frequency * l_frequency)
+            if self.edge_loss is not None:
+                base_terms.append(self.w_edge * l_edge)
+
+            base_loss_scalars = [reduce_samples(term) for term in base_terms]
+
+            if self.loss_balance_mode == "ema" and self.loss_balancer is not None:
+                balanced_loss, weights = self.loss_balancer(base_loss_scalars)
+                weight_map = {
+                    name: weights[index].detach().item()
+                    for index, name in enumerate(self.active_term_names)
+                }
+                if self.loss_balancer.step_count.item() <= self.loss_balance_warmup_steps:
+                    total_loss = sum(base_loss_scalars)
+                else:
+                    total_loss = balanced_loss
+            else:
+                total_loss = sum(base_loss_scalars)
+                weight_map = {
+                    'char': self.w_char,
+                    'ssim': self.w_ssim,
+                    'lpips': self.w_lpips if self.use_lpips else 0.0,
+                    'wavelet': self.w_wavelet if self.wavelet_loss is not None else 0.0,
+                    'frequency': self.w_frequency if self.frequency_loss is not None else 0.0,
+                    'edge': self.w_edge if self.edge_loss is not None else 0.0,
+                }
+
             logs = {
                 'l_pix': reduce_samples(l_char).detach(),
                 'l_ssim': reduce_samples(l_ssim).detach(),
                 'l_lpips': reduce_samples(l_lpips).detach(),
                 'l_wavelet': reduce_samples(l_wavelet).detach(),
+                'l_frequency': reduce_samples(l_frequency).detach(),
+                'l_edge': reduce_samples(l_edge).detach(),
                 'l_total': total_loss.detach(),
-                'w_wavelet': self.w_wavelet,
+                'w_char': weight_map.get('char', self.w_char),
+                'w_ssim': weight_map.get('ssim', self.w_ssim),
+                'w_lpips': weight_map.get('lpips', self.w_lpips),
+                'w_wavelet': weight_map.get('wavelet', self.w_wavelet),
+                'w_frequency': weight_map.get('frequency', self.w_frequency),
+                'w_edge': weight_map.get('edge', self.w_edge),
             }
 
         return total_loss, logs

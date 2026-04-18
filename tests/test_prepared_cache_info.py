@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 
 import cv2
@@ -9,12 +8,10 @@ import numpy as np
 
 from datasets.data_set import LowLightDataset
 from datasets.prepare_data import (
-    ensure_prepared_training_data,
     load_manifest_entries,
     load_manifest_info,
     manifest_info_path,
     prepare_training_data,
-    resolve_manifest_entry_path,
     validate_prepared_cache,
 )
 
@@ -82,6 +79,40 @@ def test_manifest_info_invalidates_when_expected_fingerprint_changes(tmp_path):
         variant_count=2,
         synthesis_seed=11,
         darker_ranges=None,
+    ) is None
+
+
+def test_validate_prepared_cache_is_backend_specific(tmp_path):
+    data_dir = tmp_path / "dataset"
+    _write_rgb_image(data_dir / "our485" / "high" / "0.png", 96)
+
+    manifest_path = prepare_training_data(
+        data_dir,
+        None,
+        variant_count=1,
+        synthesis_seed=23,
+        darker_ranges=None,
+        degradation_backend="torch",
+        prepare_workers=1,
+        force=False,
+    )
+
+    assert validate_prepared_cache(
+        data_dir,
+        None,
+        variant_count=1,
+        synthesis_seed=23,
+        darker_ranges=None,
+        degradation_backend="torch",
+    ) == manifest_path
+
+    assert validate_prepared_cache(
+        data_dir,
+        None,
+        variant_count=1,
+        synthesis_seed=23,
+        darker_ranges=None,
+        degradation_backend="opencv",
     ) is None
 
 
@@ -232,7 +263,7 @@ def test_force_prepare_skips_validate_path(tmp_path, monkeypatch):
     data_dir = tmp_path / "dataset"
     _write_rgb_image(data_dir / "our485" / "high" / "0.png", 96)
 
-    def _raise_if_called(*args, **kwargs):  # pragma: no cover - behavior assertion helper
+    def _raise_if_called(*args, **kwargs):  # pragma: no cover：行为断言辅助函数
         raise AssertionError(
             "validate_prepared_cache should not be called when force=True")
 

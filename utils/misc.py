@@ -224,6 +224,10 @@ def compute_adaptive_loss_weights(noise_scheduler, timesteps, weighting_scheme="
     Returns:
         Loss weights for each timestep
     """
+    weighting_scheme = str(weighting_scheme).strip().lower()
+    if weighting_scheme == "mini_snr":
+        weighting_scheme = "min_snr"
+
     if weighting_scheme == "min_snr":
         snr_gamma = kwargs.get("snr_gamma", 5.0)
         return compute_min_snr_loss_weights(noise_scheduler, timesteps, snr_gamma)
