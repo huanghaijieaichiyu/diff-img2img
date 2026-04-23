@@ -21,7 +21,7 @@ def configure_cpu_image_backend(num_threads: int = 1) -> None:
 
     The degradation pipeline already parallelizes across processes, so allowing
     OpenCV to spawn many internal threads per worker usually hurts throughput on
-    CPU-bound prepare jobs.
+    CPU-bound dataset generation jobs.
     """
     thread_value = str(max(1, int(num_threads)))
     for env_name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -270,11 +270,11 @@ def _batch_process_single_image(filename: str) -> tuple[str, bool, str]:
 
 class Darker:
     """
-    Enhanced low-light image synthesis engine with realistic degradation.
+    Enhanced low-light dataset generation engine with realistic degradation.
 
-    Supports two modes:
-      1. Offline batch processing (process_images) — for pre-generating datasets
-      2. Single-image processing (degrade_single) — for online synthesis
+    Supports two dataset-making paths:
+      1. Batch processing (process_images) for writing a low-light split
+      2. Single-image processing (degrade_single) for dataset builder utilities
 
     Key improvements over the original:
       - Randomized degradation parameters per image
@@ -358,8 +358,7 @@ class Darker:
 
     def degrade_single(self, img: np.ndarray, params: Optional[dict] = None) -> np.ndarray:
         """
-        Apply full degradation pipeline to a single image.
-        This is the primary entry point for online (in-Dataset) synthesis.
+        Apply the degradation pipeline to one image for dataset generation.
 
         Args:
             img: Input BGR image [0, 255] uint8
@@ -514,7 +513,7 @@ class Darker:
 
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate randomized low-light variants for a dataset split."
+        description="Generate a randomized low-light split from an existing high-light split."
     )
     parser.add_argument(
         "data_dir",

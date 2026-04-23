@@ -4,7 +4,6 @@ meta:
   description: Official recommended 8GB preset with NAF decomposition and deep-only cross-attention conditioning.
 
 runtime:
-  train_profile: auto
   mixed_precision: fp16
   attention_backend: auto
   use_torch_compile: true
@@ -12,14 +11,6 @@ runtime:
   resolution: 256
   log_interval: 10
   num_workers: 4
-  prepare_on_train: false
-  degradation_backend: torch
-  prepared_cache_dir:
-  offline_variant_count: 3
-  prepare_workers:
-  prepare_force: false
-  synthesis_seed: 42
-  darker_ranges:
   prefetch_factor: 4
   persistent_workers: true
   pin_memory: true

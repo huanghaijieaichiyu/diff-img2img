@@ -2,14 +2,13 @@
 
 [![Model Download](https://img.shields.io/badge/Model%20Download-Cloud-blue?style=flat-square&logo=icloud)](https://cloud.189.cn/web/share?code=AJ7fUzBbuUzm) (Access Code: `q2u9`)
 
-Diff-Img2Img is a low-light image enhancement project built around a Retinex-guided conditional diffusion pipeline. The current training flow is preset-driven, uses a prepared offline low-light cache, and ships with a Streamlit studio for dataset preparation, training monitoring, evaluation, and qualitative visualization.
+Diff-Img2Img is a low-light image enhancement project built around a Retinex-guided conditional diffusion pipeline. The current training flow is preset-driven and trains directly on paired source low/high images.
 
 ## What Is In This Repo
 
 - Retinex + diffusion training and inference entrypoint in `main.py`
 - Official training presets in `configs/train/{small,middle,max}.yaml`
 - Minimal train-only launcher in `start_train.py`
-- Offline prepared-cache builder that regenerates low-light variants from `our485/high`
 - Streamlit UI in `ui/app.py`
 
 ## Presets
@@ -41,42 +40,25 @@ python3 start_train.py \
 python3 main.py --mode ui
 ```
 
-## Dataset And Prepared Cache
+## Dataset
 
 Training expects paired data under a dataset root such as:
 
 ```text
 <data_dir>/
   our485/
+    low/
     high/
   eval15/
     low/
     high/
 ```
 
-Before the first epoch, training validates or builds a prepared cache under:
-
-```text
-<data_dir>/.prepared/
-  prepare_meta.json
-  train_manifest.jsonl
-  our485/low/...
-```
-
 Key points:
 
-- Training consumes the prepared cache, not a single pre-existing `our485/low` folder.
-- `train` mode now checks prepared data automatically and rebuilds missing or stale cache before the first epoch.
-- Interrupted prepare runs can resume as long as the metadata still matches the requested settings.
-
-To prepare the cache explicitly:
-
-```bash
-python3 main.py \
-  --mode prepare \
-  --config middle \
-  --data_dir /path/to/dataset
-```
+- Training consumes the existing paired source images in `our485/low` and `our485/high`.
+- `train` mode does not generate additional low-light images or build a `.prepared` cache.
+- Training-time augmentation uses synchronized torchvision crop/rotation/flip parameters for each low/high pair.
 
 ## Training
 
@@ -121,7 +103,6 @@ python3 main.py --mode predict \
 
 The Streamlit studio provides:
 
-- prepared-cache inspection and manual rebuild
 - preset-aware training launch
 - live logs and metric plots from `training_metrics.csv`
 - validation entrypoints
@@ -138,11 +119,10 @@ Default URL: `http://localhost:8501`
 
 ## Run Summaries
 
-Use the built-in artifact utilities to summarize and compare experiments:
+Use the built-in artifact utility to summarize experiments:
 
 ```bash
 python3 scripts/summarize_run.py --run-dir runs/exp
-python3 scripts/compare_runs.py --run-dir runs/exp_a --run-dir runs/exp_b --sort-by psnr
 ```
 
 ## Repo Layout
@@ -150,7 +130,7 @@ python3 scripts/compare_runs.py --run-dir runs/exp_a --run-dir runs/exp_b --sort
 ```text
 configs/train/      preset YAMLs
 core/               engine and training logic
-datasets/           data preparation helpers
+datasets/           paired low/high dataset loader
 models/             Retinex, conditioning, diffusion modules
 scripts/            utilities and visualization helpers
 ui/                 Streamlit app

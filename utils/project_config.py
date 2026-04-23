@@ -30,15 +30,14 @@ CONFIG_PRECEDENCE = [
     "CLI explicit args",
     "shell/UI explicit launch overrides",
     "configs/train/*.yaml defaults",
-    "TRAIN_PROFILES backfill only when values are absent",
+    "built-in train defaults only when values are absent",
 ]
 
 
 def flatten_config_tree(config_node: dict[str, Any]) -> dict[str, Any]:
-    preserved_dict_keys = {"darker_ranges"}
     flat: dict[str, Any] = {}
     for key, value in (config_node or {}).items():
-        if isinstance(value, dict) and key not in preserved_dict_keys:
+        if isinstance(value, dict):
             flat.update(flatten_config_tree(value))
         else:
             flat[key] = value
@@ -185,8 +184,6 @@ def build_runtime_summary(args: argparse.Namespace | SimpleNamespace | dict[str,
         "data_dir": payload.get("data_dir"),
         "output_dir": payload.get("output_dir"),
         "model_path": payload.get("model_path"),
-        "prepared_cache_dir": payload.get("prepared_cache_dir"),
-        "train_profile": payload.get("train_profile"),
         "mixed_precision": payload.get("mixed_precision"),
         "resolution": payload.get("resolution"),
         "batch_size": payload.get("batch_size"),
@@ -202,12 +199,6 @@ def build_runtime_summary(args: argparse.Namespace | SimpleNamespace | dict[str,
         "pin_memory": payload.get("pin_memory"),
         "decode_cache_size": payload.get("decode_cache_size"),
         "opencv_threads_per_worker": payload.get("opencv_threads_per_worker"),
-        "prepare_on_train": payload.get("prepare_on_train"),
-        "prepare_workers": payload.get("prepare_workers"),
-        "prepare_force": payload.get("prepare_force"),
-        "degradation_backend": payload.get("degradation_backend"),
-        "offline_variant_count": payload.get("offline_variant_count"),
-        "synthesis_seed": payload.get("synthesis_seed"),
         "validation_steps": payload.get("validation_steps"),
         "num_validation_images": payload.get("num_validation_images"),
         "num_inference_steps": payload.get("num_inference_steps"),
@@ -223,7 +214,6 @@ def build_runtime_summary(args: argparse.Namespace | SimpleNamespace | dict[str,
         "loss_balance_mode": payload.get("loss_balance_mode"),
         "frequency_loss_weight": payload.get("frequency_loss_weight"),
         "edge_loss_weight": payload.get("edge_loss_weight"),
-        "prepared_train_resolution": payload.get("prepared_train_resolution"),
         "semantic_backbone": payload.get("semantic_backbone"),
         "nr_metric": payload.get("nr_metric"),
         "attention_backend": payload.get("attention_backend"),
@@ -239,7 +229,7 @@ def build_runtime_summary(args: argparse.Namespace | SimpleNamespace | dict[str,
 def runtime_summary_lines(summary: dict[str, Any], prefix: str = "[config-summary]") -> list[str]:
     return [
         f"{prefix} mode={summary.get('mode')} config={summary.get('config_name')} config_path={summary.get('config_path')}",
-        f"{prefix} data_dir={summary.get('data_dir')} prepared_cache_dir={summary.get('prepared_cache_dir')} output_dir={summary.get('output_dir')}",
+        f"{prefix} data_dir={summary.get('data_dir')} output_dir={summary.get('output_dir')}",
         f"{prefix} batch_size={summary.get('batch_size')} grad_accum={summary.get('gradient_accumulation_steps')} "
         f"effective_batch={summary.get('effective_batch_size')} min_effective_batch={summary.get('min_effective_batch_size')}",
         f"{prefix} loader=num_workers:{summary.get('num_workers')} prefetch_factor:{summary.get('prefetch_factor')} "
@@ -249,12 +239,10 @@ def runtime_summary_lines(summary: dict[str, Any], prefix: str = "[config-summar
         f"num_inference_steps:{summary.get('num_inference_steps')} benchmark_inference_steps:{summary.get('benchmark_inference_steps')}",
         f"{prefix} train_validation=fast:{summary.get('train_fast_validation')} "
         f"metrics:{summary.get('train_validation_metrics')} steps:{summary.get('train_validation_benchmark_steps')}",
-        f"{prefix} cache=prepare_on_train:{summary.get('prepare_on_train')} prepare_workers:{summary.get('prepare_workers')} "
-        f"offline_variant_count:{summary.get('offline_variant_count')} synthesis_seed:{summary.get('synthesis_seed')} "
-        f"degradation_backend:{summary.get('degradation_backend')}",
+        f"{prefix} data=source_low_high_pairs augmentation:torchvision_random_crop_rotate_flip",
         f"{prefix} model=use_retinex:{summary.get('use_retinex')} decom_variant:{summary.get('decom_variant')} "
         f"condition_variant:{summary.get('condition_variant')} conditioning_space:{summary.get('conditioning_space')} "
-        f"inject_mode:{summary.get('inject_mode')} prepared_train_resolution:{summary.get('prepared_train_resolution')}",
+        f"inject_mode:{summary.get('inject_mode')}",
         f"{prefix} loss=balance_mode:{summary.get('loss_balance_mode')} frequency:{summary.get('frequency_loss_weight')} "
         f"edge:{summary.get('edge_loss_weight')}",
         f"{prefix} backend=requested:{summary.get('attention_backend')} compile:{summary.get('use_torch_compile')} "

@@ -3,30 +3,22 @@ import json
 import os
 import subprocess
 import signal
-import shlex
 import time
 from pathlib import Path
-import shutil
 import sys
-import threading
-import queue
 import pandas as pd
 import plotly.express as px
 import torch
 import yaml
 from html import escape
-from concurrent.futures import ProcessPoolExecutor
 
 sys.path.append(os.getcwd())
 
 from utils.workflow_utils import (
-    build_prepare_command as shared_build_prepare_command,
     build_preview_summary,
     build_train_command as shared_build_train_command,
     load_preset_card,
     quote_command,
-    recommended_prepare_workers as shared_recommended_prepare_workers,
-    summarize_prepared_cache as shared_summarize_prepared_cache,
 )
 
 # 本地化配置
@@ -45,22 +37,22 @@ TRANSLATIONS = {
         "visualization": "Visualization",
         "configuration": "Configuration",
         "app_title": "🌌 Diff-Img2Img Studio",
-        "home_kicker": "Prepared-cache workflow for low-light restoration",
+        "home_kicker": "Paired-source workflow for low-light restoration",
         "home_subtitle": "🚀 Next-Gen Low-Light Enhancement",
-        "home_desc": "Diff-Img2Img combines Retinex decomposition, diffusion restoration, and an offline prepared-cache pipeline to make low-light enhancement runs easier to reproduce and monitor.",
+        "home_desc": "Diff-Img2Img combines Retinex decomposition and diffusion restoration while training directly on paired source low/high images.",
         "key_features": "🌟 Key Features",
-        "feature_1": "**Physics-based Data Synthesis**: Uses `Darker` engine to simulate realistic low-light degradation (Gamma, Noise, Headlights).",
+        "feature_1": "**Direct Paired Training**: Reads existing low/high image pairs without preparing cache files or generating additional training images.",
         "feature_2": "**Retinex-Diffusion Architecture**: Decomposes images into Reflectance/Illumination for stable diffusion training.",
-        "feature_3": "**Full-Stack Workflow**: Prepare cache, launch training, monitor logs, evaluate runs, and inspect outputs in one place.",
+        "feature_3": "**Full-Stack Workflow**: Launch training, monitor logs, evaluate runs, and inspect outputs in one place.",
         "example_results": "🖼️ Example Results",
-        "synthesized_input": "Synthesized Low-Light (Input)",
+        "synthesized_input": "Low-Light Input",
         "ground_truth": "Ground Truth (Reference)",
         "home_tip": "💡 **Tip:** Navigate using the sidebar to start your workflow.",
         "workflow_header": "Workflow",
-        "workflow_prepare_title": "Prepare The Offline Cache",
-        "workflow_prepare_desc": "Generate multi-variant low-light samples from `our485/high`, inspect cache health, and rebuild only when settings change.",
+        "workflow_prepare_title": "Check Paired Data",
+        "workflow_prepare_desc": "Confirm the dataset contains matching `our485/low` and `our485/high` source images.",
         "workflow_train_title": "Launch Preset Training",
-        "workflow_train_desc": "Use the official `small`, `middle`, or `max` configs, preview the final command, and launch with prepared-cache settings attached.",
+        "workflow_train_desc": "Use the official `small`, `middle`, or `max` configs, preview the final command, and launch direct paired-image training.",
         "workflow_eval_title": "Validate And Visualize",
         "workflow_eval_desc": "Read metrics, compare outputs on `eval15`, and keep qualitative checks close to the training loop.",
         "quick_start": "Quick Start",
@@ -87,28 +79,10 @@ TRANSLATIONS = {
         "displaying": "Displaying",
         "dataset_path_invalid": "Dataset path is invalid or missing `eval15/low`.",
         "dataset_header": "🌑 Dataset Preparation",
-        "dataset_sub": "Build and manage the prepared multi-variant low-light cache used by training.",
+        "dataset_sub": "Inspect the paired low/high source data used by training.",
         "how_it_works": "ℹ️ How it works",
-        "darker_desc": """Training now uses a prepared offline cache instead of on-the-fly synthesis:
-        1.  Read clean images from `our485/high`.
-        2.  Regenerate `N` low-light variants per image with the **Darker** engine.
-        3.  Save them under `.prepared/our485/low`.
-        4.  Write `train_manifest.jsonl` + `prepare_meta.json` and let training consume only that cache.""",
+        "darker_desc": "Training reads existing paired images from `our485/low` and `our485/high`.",
         "io_settings": "📁 I/O Settings",
-        "raw_dataset": "Raw Dataset (High Light)",
-        "split": "Split",
-        "physics_params": "🎛️ Physics Params",
-        "gamma": "Gamma",
-        "linear_att": "Linear Attenuation",
-        "effects": "✨ Effects",
-        "headlight": "Headlight Intensity",
-        "noise": "Noise Level (Sigma)",
-        "saturation": "Saturation",
-        "blue_shift": "Blue Shift",
-        "beam_width": "Beam Width",
-        "start_synthesis": "⚡ Start Synthesis",
-        "processing": "Processing Dataset...",
-        "synthesis_complete": "✅ Dataset synthesis complete!",
         "train_dashboard": "🚂 Training Dashboard",
         "running": "RUNNING",
         "stop": "🛑 STOP",
@@ -127,41 +101,11 @@ TRANSLATIONS = {
         "epochs": "Epochs",
         "batch_size": "Batch Size",
         "lr": "Learning Rate",
-        "train_profile": "Training Profile",
         "train_desc": "Launch preset training, inspect the resolved command, and monitor logs plus metrics from the current output directory.",
-        "train_tip": "💡 **Tip:** Training now auto-prepares a 3-variant offline low-light cache when prepared data is missing. Ensure your GPU has enough VRAM for Batch Size > 1 at 512px.",
+        "train_tip": "💡 **Tip:** Training expects existing paired images under `our485/low` and `our485/high`. Ensure your GPU has enough VRAM for Batch Size > 1 at 512px.",
         "launch_train": "🚀 Launch Training",
         "train_launched": "Training launched! Switch to 'Monitoring' tab.",
-        "prepare_dataset": "🧪 Prepare Dataset",
-        "prepare_running": "Preparing offline multi-variant dataset cache...",
-        "prepare_complete": "✅ Prepared dataset cache is ready.",
-        "prepare_failed": "Dataset preparation failed.",
-        "prepared_settings": "🗂️ Prepared Cache",
-        "prepared_cache_dir": "Prepared Cache Dir",
-        "variant_count": "Variant Count",
-        "prepare_workers": "Prepare Workers",
-        "synthesis_seed": "Synthesis Seed",
-        "prepare_force": "Force Rebuild Cache",
-        "darker_ranges": "Darker Ranges (YAML/JSON)",
-        "darker_ranges_help": "Optional override for Darker parameter ranges. Leave blank to use defaults.",
-        "prepared_status": "Prepared Cache Status",
-        "status_ready": "READY",
-        "status_missing": "MISSING",
-        "status_stale": "STALE",
-        "status_preparing": "PREPARING",
-        "status_interrupted": "INTERRUPTED",
-        "status_invalid": "INVALID",
         "high_images": "High Images",
-        "expected_entries": "Expected Entries",
-        "manifest_entries": "Manifest Entries",
-        "meta_variant_count": "Cached Variants",
-        "completed_entries": "Completed Entries",
-        "cache_dir_label": "Cache Dir",
-        "manual_prepare_tip": "Use this to build the prepared cache ahead of training, or let training auto-build it on launch.",
-        "prepare_stdout": "Prepare Output",
-        "prepare_needed": "Prepared cache is missing or stale. Training will rebuild it before the first epoch.",
-        "prepare_ready": "Prepared cache matches the current variant-count/seed settings.",
-        "prepare_resume": "Prepared cache was interrupted previously. Relaunching prepare will resume missing variants only.",
         "process_finished": "⚠️ Process finished or stopped unexpectedly.",
         "refresh_charts": "🔄 Refresh Charts",
         "terminal_output": "💻 Terminal Output",
@@ -200,22 +144,22 @@ TRANSLATIONS = {
         "visualization": "可视化",
         "configuration": "配置",
         "app_title": "🌌 Diff-Img2Img 工作室",
-        "home_kicker": "面向低光增强的 prepared-cache 训练工作流",
+        "home_kicker": "面向低光增强的源图对训练工作流",
         "home_subtitle": "🚀 下一代低光照增强",
-        "home_desc": "Diff-Img2Img 将 Retinex 分解、扩散恢复和离线 prepared-cache 数据流程组合在一起，让低光增强训练更稳定、更容易复现。",
+        "home_desc": "Diff-Img2Img 将 Retinex 分解和扩散恢复组合在一起，训练时直接读取已有 low/high 源图对。",
         "key_features": "🌟 主要特性",
-        "feature_1": "**基于物理的数据合成**：使用 `Darker` 引擎模拟真实的低光照退化（Gamma，噪声，车灯）。",
+        "feature_1": "**源图对直接训练**：直接读取已有 low/high 图对，不再准备缓存文件，也不生成训练变体。",
         "feature_2": "**Retinex-扩散架构**：将图像分解为反射率/光照，以进行稳定的扩散训练。",
-        "feature_3": "**全栈工作流**：在一个界面里完成缓存准备、训练启动、日志监控、评估与可视化。",
+        "feature_3": "**全栈工作流**：在一个界面里完成训练启动、日志监控、评估与可视化。",
         "example_results": "🖼️ 示例结果",
-        "synthesized_input": "合成低光照 (输入)",
+        "synthesized_input": "低光输入",
         "ground_truth": "地面实况 (参考)",
         "home_tip": "💡 **提示：** 使用侧边栏导航开始您的工作流。",
         "workflow_header": "工作流",
-        "workflow_prepare_title": "准备离线缓存",
-        "workflow_prepare_desc": "从 `our485/high` 生成多变体低光样本，检查缓存健康状态，并在参数变化时按需重建。",
+        "workflow_prepare_title": "检查源图对",
+        "workflow_prepare_desc": "确认数据集中存在匹配的 `our485/low` 和 `our485/high` 源图。",
         "workflow_train_title": "启动官方预设训练",
-        "workflow_train_desc": "使用 `small`、`middle` 或 `max` 官方配置，先预览最终命令，再携带 prepared-cache 参数启动训练。",
+        "workflow_train_desc": "使用 `small`、`middle` 或 `max` 官方配置，预览最终命令后直接启动源图对训练。",
         "workflow_eval_title": "评估与可视化",
         "workflow_eval_desc": "读取指标、查看 `eval15` 可视化结果，把定量和定性检查都放在训练闭环里。",
         "quick_start": "快速开始",
@@ -242,28 +186,10 @@ TRANSLATIONS = {
         "displaying": "当前显示",
         "dataset_path_invalid": "数据集路径无效，或缺少 `eval15/low`。",
         "dataset_header": "🌑 数据集准备",
-        "dataset_sub": "构建并管理训练实际使用的 prepared 多变体低光缓存。",
+        "dataset_sub": "检查训练实际使用的 low/high 源图对。",
         "how_it_works": "ℹ️ 工作原理",
-        "darker_desc": """训练现在使用 prepared 离线缓存，而不是读取时在线合成：
-        1.  从 `our485/high` 读取高光图像。
-        2.  用 **Darker** 引擎为每张图重新生成 `N` 个低光变体。
-        3.  结果保存到 `.prepared/our485/low`。
-        4.  同时写出 `train_manifest.jsonl` 和 `prepare_meta.json`，训练阶段只消费这一份缓存。""",
+        "darker_desc": "训练直接读取 `our485/low` 和 `our485/high` 中已有的源图对。",
         "io_settings": "📁 I/O 设置",
-        "raw_dataset": "原始数据集 (高光)",
-        "split": "分割",
-        "physics_params": "🎛️ 物理参数",
-        "gamma": "Gamma",
-        "linear_att": "线性衰减",
-        "effects": "✨ 特效",
-        "headlight": "车灯强度",
-        "noise": "噪声水平 (Sigma)",
-        "saturation": "饱和度",
-        "blue_shift": "蓝移",
-        "beam_width": "光束宽度",
-        "start_synthesis": "⚡ 开始合成",
-        "processing": "正在处理数据集...",
-        "synthesis_complete": "✅ 数据集合成完成！",
         "train_dashboard": "🚂 训练仪表板",
         "running": "运行中",
         "stop": "🛑 停止",
@@ -282,41 +208,11 @@ TRANSLATIONS = {
         "epochs": "轮数 (Epochs)",
         "batch_size": "批次大小",
         "lr": "学习率",
-        "train_profile": "训练配置",
         "train_desc": "用官方预设启动训练，先检查最终命令，再在当前输出目录上持续查看日志和指标。",
-        "train_tip": "💡 **提示：** 如果缺少 prepared 数据，训练会先自动生成 3 变体离线低光缓存。也请确保您的 GPU 显存足以在 512px 下支持批次大小 > 1。",
+        "train_tip": "💡 **提示：** 训练需要 `our485/low` 和 `our485/high` 下已有的匹配图像。也请确保您的 GPU 显存足以在 512px 下支持批次大小 > 1。",
         "launch_train": "🚀 启动训练",
         "train_launched": "训练已启动！切换到 '监控' 标签。",
-        "prepare_dataset": "🧪 准备数据集",
-        "prepare_running": "正在准备离线多变体数据缓存...",
-        "prepare_complete": "✅ Prepared 数据缓存已就绪。",
-        "prepare_failed": "数据准备失败。",
-        "prepared_settings": "🗂️ Prepared 缓存",
-        "prepared_cache_dir": "Prepared 缓存目录",
-        "variant_count": "变体数量",
-        "prepare_workers": "准备并发数",
-        "synthesis_seed": "合成种子",
-        "prepare_force": "强制重建缓存",
-        "darker_ranges": "Darker 参数范围 (YAML/JSON)",
-        "darker_ranges_help": "可选：覆盖 Darker 参数范围。留空则使用默认值。",
-        "prepared_status": "Prepared 缓存状态",
-        "status_ready": "已就绪",
-        "status_missing": "缺失",
-        "status_stale": "过期",
-        "status_preparing": "准备中",
-        "status_interrupted": "已中断",
-        "status_invalid": "无效",
         "high_images": "高光图数量",
-        "expected_entries": "期望条目数",
-        "manifest_entries": "Manifest 条目数",
-        "meta_variant_count": "缓存变体数",
-        "completed_entries": "已完成条目数",
-        "cache_dir_label": "缓存目录",
-        "manual_prepare_tip": "可以先手动构建 prepared 缓存，也可以在启动训练时让系统自动补齐。",
-        "prepare_stdout": "准备输出",
-        "prepare_needed": "Prepared 缓存缺失或已过期。训练启动时会在首个 epoch 前自动重建。",
-        "prepare_ready": "Prepared 缓存与当前变体数/种子设置一致。",
-        "prepare_resume": "Prepared 缓存上次被中断。重新执行 prepare 时只会补齐缺失变体。",
         "process_finished": "⚠️ 进程已结束或异常停止。",
         "refresh_charts": "🔄 刷新图表",
         "terminal_output": "💻 终端输出",
@@ -636,10 +532,6 @@ def clear_training_state():
     st.session_state.training_pgid = None
 
 
-def recommended_prepare_workers():
-    return shared_recommended_prepare_workers()
-
-
 def count_image_files(path):
     if not path or not os.path.exists(path):
         return 0
@@ -649,68 +541,6 @@ def count_image_files(path):
             if filename.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff")):
                 count += 1
     return count
-
-
-def parse_darker_ranges_text(darker_ranges_text):
-    text = (darker_ranges_text or "").strip()
-    if not text:
-        return None
-    try:
-        parsed = yaml.safe_load(text)
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def resolve_cache_dir(data_dir, prepared_cache_dir):
-    if prepared_cache_dir:
-        return os.path.abspath(prepared_cache_dir)
-    return os.path.abspath(os.path.join(data_dir, ".prepared"))
-
-
-def summarize_prepared_cache(data_dir, prepared_cache_dir, variant_count, synthesis_seed, darker_ranges=None):
-    return shared_summarize_prepared_cache(
-        data_dir,
-        prepared_cache_dir,
-        variant_count=variant_count,
-        synthesis_seed=synthesis_seed,
-        darker_ranges=darker_ranges,
-    )
-
-
-def render_prepared_cache_summary(summary):
-    status_map = {
-        "ready": ("success", t("status_ready"), t("prepare_ready")),
-        "missing": ("warning", t("status_missing"), t("prepare_needed")),
-        "stale": ("warning", t("status_stale"), t("prepare_needed")),
-        "preparing": ("info", t("status_preparing"), t("prepare_needed")),
-        "interrupted": ("warning", t("status_interrupted"), t("prepare_resume")),
-        "invalid": ("warning", t("status_invalid"), t("prepare_needed")),
-    }
-    level, label, message = status_map.get(summary["status"], ("warning", summary["status"].upper(), t("prepare_needed")))
-    if level == "success":
-        st.success(f"{t('prepared_status')}: {label}")
-    elif level == "info":
-        st.info(f"{t('prepared_status')}: {label}")
-    else:
-        st.warning(f"{t('prepared_status')}: {label}")
-    st.caption(message)
-
-    top_cols = st.columns(4)
-    top_cols[0].metric(t("high_images"), summary["high_images"])
-    top_cols[1].metric(t("expected_entries"), summary["expected_entries"])
-    top_cols[2].metric(t("manifest_entries"), summary["manifest_entries"])
-    cached_variants = summary["meta"].get("variant_count", "-") if summary["meta"] else "-"
-    top_cols[3].metric(t("meta_variant_count"), cached_variants)
-    if summary["meta"]:
-        st.caption(
-            f"{t('completed_entries')}: {summary['meta'].get('completed_entries', '-')}"
-        )
-    st.caption(f"{t('cache_dir_label')}: `{summary['cache_dir']}`")
-    if summary.get("status_reasons"):
-        st.caption("Reasons: " + ", ".join(summary["status_reasons"]))
-    if summary.get("source_error"):
-        st.caption(f"Source: {summary['source_error']}")
 
 
 def load_preset_summary(preset_name):
@@ -744,15 +574,8 @@ def build_train_command(
     batch_size,
     epochs,
     lr,
-    train_profile,
-    variant_count,
-    prepare_workers,
-    synthesis_seed,
     use_retinex,
     resume,
-    prepared_cache_dir,
-    prepare_force,
-    darker_ranges_text,
 ):
     return shared_build_train_command(
         model_scale=model_scale,
@@ -762,28 +585,8 @@ def build_train_command(
         batch_size=batch_size,
         epochs=epochs,
         lr=lr,
-        train_profile=train_profile,
-        variant_count=variant_count,
-        prepare_workers=prepare_workers,
-        synthesis_seed=synthesis_seed,
         use_retinex=use_retinex,
         resume=resume,
-        prepared_cache_dir=prepared_cache_dir,
-        prepare_force=prepare_force,
-        darker_ranges_text=darker_ranges_text,
-    )
-
-
-def build_prepare_command(config_path, data_dir, prepared_cache_dir, variant_count, prepare_workers, synthesis_seed, prepare_force, darker_ranges_text):
-    return shared_build_prepare_command(
-        config_path=config_path,
-        data_dir=data_dir,
-        prepared_cache_dir=prepared_cache_dir,
-        variant_count=variant_count,
-        prepare_workers=prepare_workers,
-        synthesis_seed=synthesis_seed,
-        prepare_force=prepare_force,
-        darker_ranges_text=darker_ranges_text,
     )
 
 # 页面渲染
@@ -873,13 +676,15 @@ def dataset_page():
     render_intro_card(
         t("dataset_header"),
         t("dataset_sub"),
-        badges=["our485/high", ".prepared", "train_manifest.jsonl"],
+        badges=["our485/low", "our485/high", "eval15"],
     )
-    
-    with st.expander(t("how_it_works"), expanded=False):
-        st.markdown(t("darker_desc"))
-        
-# 数据集推荐
+
+    st.info(
+        "Training reads paired source images directly. Expected layout: "
+        "`<data_dir>/our485/low`, `<data_dir>/our485/high`, and optional validation pairs under "
+        "`<data_dir>/eval15/{low,high}` or `<data_dir>/val/{low,high}`."
+    )
+
     st.info(f"""
     **{t("dataset_recommendation")}**
     {t("dataset_link_text")}
@@ -887,88 +692,12 @@ def dataset_page():
     *   **Quark Drive (China)**: [https://pan.quark.cn/s/1867c35697db](https://pan.quark.cn/s/1867c35697db) (Code: **ZUWn**)
     """)
 
-    with st.form("prepare_cache_form"):
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.subheader(t("io_settings"))
-            data_dir = folder_selector(t("dataset_root"), "prepare_data_dir", "../datasets/kitti_LOL")
-            prepared_cache_dir = st.text_input(t("prepared_cache_dir"), value="", placeholder="../datasets/kitti_LOL/.prepared")
-            model_scale_options = ["small", "middle", "max"]
-            model_scale = st.selectbox(t("model_scale"), model_scale_options, index=1)
-
-        with c2:
-            st.subheader(t("prepared_settings"))
-            variant_count = st.number_input(t("variant_count"), min_value=1, max_value=8, value=3)
-            prepare_workers = st.number_input(t("prepare_workers"), min_value=1, max_value=64, value=recommended_prepare_workers())
-            synthesis_seed = st.number_input(t("synthesis_seed"), min_value=0, value=42)
-            prepare_force = st.checkbox(t("prepare_force"), value=False)
-
-        darker_ranges_text = st.text_area(
-            t("darker_ranges"),
-            value="",
-            height=180,
-            placeholder="gamma: [1.5, 4.0]\nlinear_attenuation: [0.25, 0.7]\nnoise_sigma_read: [2.0, 15.0]",
-            help=t("darker_ranges_help"),
-        )
-        st.info(t("manual_prepare_tip"))
-        prepare_btn = st.form_submit_button(t("prepare_dataset"), type="primary")
-
-    cache_summary = summarize_prepared_cache(
-        data_dir,
-        prepared_cache_dir,
-        variant_count,
-        synthesis_seed,
-        parse_darker_ranges_text(darker_ranges_text),
-    )
-    render_prepared_cache_summary(cache_summary)
-    preview_cmd = build_prepare_command(
-        config_path=f"configs/train/{model_scale}.yaml",
-        data_dir=data_dir,
-        prepared_cache_dir=prepared_cache_dir,
-        variant_count=variant_count,
-        prepare_workers=prepare_workers,
-        synthesis_seed=synthesis_seed,
-        prepare_force=prepare_force,
-        darker_ranges_text=darker_ranges_text,
-    )
-    with st.expander(t("command_preview"), expanded=False):
-        st.code(quote_command(preview_cmd), language="bash")
-
-    if prepare_btn:
-        if not os.path.exists(data_dir):
-            st.error(f"❌ Directory not found: {data_dir}")
-            return
-
-        config_path = f"configs/train/{model_scale}.yaml"
-        cmd = build_prepare_command(
-            config_path=config_path,
-            data_dir=data_dir,
-            prepared_cache_dir=prepared_cache_dir,
-            variant_count=variant_count,
-            prepare_workers=prepare_workers,
-            synthesis_seed=synthesis_seed,
-            prepare_force=prepare_force,
-            darker_ranges_text=darker_ranges_text,
-        )
-        with st.spinner(t("prepare_running")):
-            result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode == 0:
-            st.success(t("prepare_complete"))
-            render_prepared_cache_summary(
-                summarize_prepared_cache(
-                    data_dir,
-                    prepared_cache_dir,
-                    variant_count,
-                    synthesis_seed,
-                    parse_darker_ranges_text(darker_ranges_text),
-                )
-            )
-        else:
-            st.error(t("prepare_failed"))
-        with st.expander(t("prepare_stdout"), expanded=result.returncode != 0):
-            st.code((result.stdout or "") + ("\n" + result.stderr if result.stderr else ""), language="bash")
+    data_dir = folder_selector(t("dataset_root"), "dataset_data_dir", "../datasets/kitti_LOL")
+    low_count = count_image_files(os.path.join(data_dir, "our485", "low"))
+    high_count = count_image_files(os.path.join(data_dir, "our485", "high"))
+    cols = st.columns(2)
+    cols[0].metric("our485/low", low_count)
+    cols[1].metric("our485/high", high_count)
 
 def training_page():
     render_intro_card(
@@ -1007,7 +736,6 @@ def training_page():
                 data_dir = folder_selector(t("dataset_root"), "train_data", "../datasets/kitti_LOL")
                 output_dir = st.text_input(t("exp_name"), value="run_diffusion_experiment", help="Folder where logs and checkpoints will be saved.")
                 resume = st.text_input(t("resume"), placeholder="e.g. 'latest' or checkpoint-1000", help="Leave empty to start new training.")
-                prepared_cache_dir = st.text_input(t("prepared_cache_dir"), value="", placeholder="../datasets/kitti_LOL/.prepared")
                 
                 st.subheader(t("model"))
                 use_retinex = st.checkbox(t("use_retinex"), value=True, help="Highly recommended for low-light tasks.")
@@ -1022,43 +750,18 @@ def training_page():
                 epochs = st.number_input(t("epochs"), value=50, min_value=1)
                 batch_size = st.number_input(t("batch_size"), value=4, min_value=1)
                 lr = st.number_input(t("lr"), value=1e-4, format="%.1e", step=1e-5)
-                train_profile_options = ["auto", "debug_online"]
-                train_profile = st.selectbox(t("train_profile"), train_profile_options, index=0)
-                st.subheader(t("prepared_settings"))
-                variant_count = st.number_input(t("variant_count"), min_value=1, max_value=8, value=3)
-                prepare_workers = st.number_input(t("prepare_workers"), min_value=1, max_value=64, value=recommended_prepare_workers())
-                synthesis_seed = st.number_input(t("synthesis_seed"), min_value=0, value=42)
-                prepare_force = st.checkbox(t("prepare_force"), value=False)
-                darker_ranges_text = st.text_area(
-                    t("darker_ranges"),
-                    value="",
-                    height=180,
-                    placeholder="gamma: [1.5, 4.0]\nlinear_attenuation: [0.25, 0.7]",
-                    help=t("darker_ranges_help"),
-                )
                 
             st.info(t("train_tip"))
-            button_cols = st.columns(2)
-            prepare_btn = button_cols[0].form_submit_button(t("prepare_dataset"))
-            train_btn = button_cols[1].form_submit_button(t("launch_train"), type="primary")
+            train_btn = st.form_submit_button(t("launch_train"), type="primary")
 
         preset_summary = load_preset_summary(model_scale)
-        cache_summary = summarize_prepared_cache(
-            data_dir,
-            prepared_cache_dir,
-            variant_count,
-            synthesis_seed,
-            parse_darker_ranges_text(darker_ranges_text),
-        )
         effective_batch = int(batch_size) * int(preset_summary.get("gradient_accumulation_steps", 1))
-        summary_cols = st.columns(4)
+        summary_cols = st.columns(3)
         summary_cols[0].metric(t("target_vram"), f"{preset_summary['target_vram_gb']} GB")
         summary_cols[1].metric(t("preset_resolution"), str(preset_summary["resolution"]))
         summary_cols[2].metric(t("effective_batch"), effective_batch)
-        summary_cols[3].metric(t("prepared_status"), t(f"status_{cache_summary['status']}"))
         st.caption(f"{t('preset_description')}: {preset_summary['description']}")
 
-        render_prepared_cache_summary(cache_summary)
         if effective_batch < 16:
             st.warning(f"{t('recommended_effective_batch')}: 16")
         else:
@@ -1072,15 +775,8 @@ def training_page():
             batch_size=batch_size,
             epochs=epochs,
             lr=lr,
-            train_profile=train_profile,
-            variant_count=variant_count,
-            prepare_workers=prepare_workers,
-            synthesis_seed=synthesis_seed,
             use_retinex=use_retinex,
             resume=resume,
-            prepared_cache_dir=prepared_cache_dir,
-            prepare_force=prepare_force,
-            darker_ranges_text=darker_ranges_text,
         )
         preview_summary = build_preview_summary(
             model_scale,
@@ -1091,52 +787,13 @@ def training_page():
             batch_size=batch_size,
             epochs=epochs,
             lr=lr,
-            train_profile=train_profile,
-            variant_count=variant_count,
-            prepare_workers=prepare_workers,
-            synthesis_seed=synthesis_seed,
             use_retinex=use_retinex,
             resume=resume,
-            prepared_cache_dir=prepared_cache_dir,
-            prepare_force=prepare_force,
         )
         with st.expander(t("command_preview"), expanded=False):
             st.code(quote_command(train_cmd_preview), language="bash")
         with st.expander("Resolved Config Summary", expanded=False):
             st.json(preview_summary)
-
-        if prepare_btn:
-            if not os.path.exists(data_dir):
-                st.error(f"❌ Directory not found: {data_dir}")
-            else:
-                prepare_cmd = build_prepare_command(
-                    config_path=f"configs/train/{model_scale}.yaml",
-                    data_dir=data_dir,
-                    prepared_cache_dir=prepared_cache_dir,
-                    variant_count=variant_count,
-                    prepare_workers=prepare_workers,
-                    synthesis_seed=synthesis_seed,
-                    prepare_force=prepare_force,
-                    darker_ranges_text=darker_ranges_text,
-                )
-                with st.spinner(t("prepare_running")):
-                    result = subprocess.run(prepare_cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    st.success(t("prepare_complete"))
-                    render_prepared_cache_summary(
-                        summarize_prepared_cache(
-                            data_dir,
-                            prepared_cache_dir,
-                            variant_count,
-                            synthesis_seed,
-                            parse_darker_ranges_text(darker_ranges_text),
-                        )
-                    )
-                else:
-                    st.error(t("prepare_failed"))
-                with st.expander(t("prepare_stdout"), expanded=result.returncode != 0):
-                    st.code((result.stdout or "") + ("\n" + result.stderr if result.stderr else ""), language="bash")
-    
 # 启动逻辑
     if train_btn and not st.session_state.training_pid:
         cmd = build_train_command(
@@ -1147,15 +804,8 @@ def training_page():
             batch_size=batch_size,
             epochs=epochs,
             lr=lr,
-            train_profile=train_profile,
-            variant_count=variant_count,
-            prepare_workers=prepare_workers,
-            synthesis_seed=synthesis_seed,
             use_retinex=use_retinex,
             resume=resume,
-            prepared_cache_dir=prepared_cache_dir,
-            prepare_force=prepare_force,
-            darker_ranges_text=darker_ranges_text,
         )
         
         os.makedirs(output_dir, exist_ok=True)

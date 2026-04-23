@@ -8,8 +8,7 @@
 - 可选地从 checkpoint 恢复
 - 通过 accelerate 启动 `main.py --mode train`
 
-数据准备不再通过这个脚本暴露参数。训练开始前会自动检查 prepared cache，
-若缺失或陈旧则自动重建。
+训练直接读取数据集中的 `low/high` 图对，不会生成 `.prepared` 缓存或在线合成图片。
 
 使用示例:
     python start_train.py --config middle --data-dir /path/to/dataset
@@ -33,10 +32,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def _warn_if_cross_mounted_data(data_dir: str) -> None:
-    prepared_cache_dir = str(Path(data_dir) / ".prepared")
-    if data_dir.startswith("/mnt/") or prepared_cache_dir.startswith("/mnt/"):
+    if data_dir.startswith("/mnt/"):
         print(
-            "[start_train][warning] dataset or prepared cache appears to be on a cross-mounted path.",
+            "[start_train][warning] dataset appears to be on a cross-mounted path.",
             file=sys.stderr,
         )
         print(
@@ -94,7 +92,6 @@ def build_command(args: argparse.Namespace) -> list[str]:
         args.config,
         "--data_dir",
         args.data_dir,
-        "--prepare-on-train",
         "--output_dir",
         args.output_dir,
     ]

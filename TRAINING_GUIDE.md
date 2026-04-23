@@ -23,15 +23,18 @@ python3 start_train.py \
   --resume latest
 ```
 
-训练启动前会先检查 prepared cache；如果缺失或陈旧，会自动重建后再开始训练。
+训练直接读取数据集中的 `our485/low` 与 `our485/high` 源图对，不会生成 `.prepared` 缓存或在线合成图片。
 
-## 2. 预生成 prepared cache
+## 2. 数据集结构
 
-```bash
-python3 main.py \
-  --mode prepare \
-  --config middle \
-  --data_dir /path/to/dataset
+```text
+<data_dir>/
+  our485/
+    low/
+    high/
+  eval15/
+    low/
+    high/
 ```
 
 ## 3. 验证模型
@@ -60,6 +63,6 @@ python3 start_train.py \
 
 - `main.py` 是权威运行时入口
 - `start_train.py` 只保留 train 启动职责
-- prepare/validate/predict/ui 等非训练模式请直接调用 `main.py`
-- 训练相关的公开 CLI 已收紧，prepare/实验性/非核心选项不再作为常规训练入口暴露
-- `start_train.sh`、`prepare_offline_enhancements.py` 等重复入口已移除
+- validate/predict/ui 等非训练模式请直接调用 `main.py`
+- 训练相关的公开 CLI 已收紧，数据生成/实验性/非核心选项不再作为常规训练入口暴露
+- 旧的数据生成入口已从训练链路移除，训练只消费已有源图对

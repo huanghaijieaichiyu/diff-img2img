@@ -875,7 +875,6 @@ class DiffusionEngine:
 
         payload = dict(logs)
         payload.update({
-            "train_profile": self.args.train_profile,
             "mixed_precision": self.args.mixed_precision,
             "use_retinex": self.args.use_retinex,
             "config_summary": self.runtime_summary,
@@ -1136,14 +1135,12 @@ class DiffusionEngine:
             image_dir=self.args.data_dir,
             img_size=self.args.resolution,
             phase="train",
-            manifest_path=getattr(self.args, "train_manifest_path", None),
             decode_cache_size=getattr(self.args, "decode_cache_size", 0),
-            prepared_cache_dir=getattr(self.args, "prepared_cache_dir", None),
         )
         if len(train_dataset) == 0:
             raise RuntimeError(
-                "Training dataset is empty. Please check prepared cache and source files under "
-                "'<data_dir>/our485/high' or '<data_dir>/train/high'."
+                "Training dataset is empty. Expected paired source files under "
+                "'<data_dir>/our485/{low,high}' or '<data_dir>/train/{low,high}'."
             )
         train_drop_last = len(train_dataset) >= int(self.args.batch_size)
         if not train_drop_last:

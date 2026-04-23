@@ -5,8 +5,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
-import yaml
-
 from utils.project_config import (
     load_config_defaults,
     print_runtime_summary,
@@ -23,7 +21,7 @@ CPU_BOUND_CROSS_MOUNT_DEFAULTS = {
 
 
 @dataclass(frozen=True)
-class TrainProfileConfig:
+class TrainDefaults:
     report_to: str
     gradient_accumulation_steps: int
     checkpointing_steps: int
@@ -39,7 +37,6 @@ class TrainProfileConfig:
     retinex_exposure_weight: float
     grad_clip_norm: float
     offset_noise_scale: float
-    online_synthesis: bool
     freeze_decom_steps: int
     decom_warmup_steps: int
     joint_retinex_ramp_steps: int
@@ -61,8 +58,6 @@ class TrainProfileConfig:
     condition_variant: str
     enable_torch_sdpa_memory_efficient_attention: bool
     num_workers: int
-    prepare_on_train: bool
-    degradation_backend: str
     semantic_backbone: str
     nr_metric: str
     # P0/P1 Improvements
@@ -82,112 +77,55 @@ def _recommended_num_workers() -> int:
     return max(2, min(8, cpu_count // 2))
 
 
-TRAIN_PROFILES = {
-    "auto": TrainProfileConfig(
-        report_to="tensorboard",
-        gradient_accumulation_steps=4,
-        checkpointing_steps=1000,
-        validation_steps=500,
-        max_train_steps=None,
-        lr_scheduler="cosine_with_warmup",  # P0: Use cosine annealing
-        lr_warmup_steps=500,
-        offset_noise=True,
-        snr_gamma=5.0,
-        loss_weighting_scheme="min_snr",
-        use_uncertainty_weighting=False,
-        retinex_loss_weight=0.1,
-        tv_loss_weight=0.1,
-        retinex_consistency_weight=1.0,
-        retinex_exposure_weight=0.1,
-        grad_clip_norm=5.0,
-        offset_noise_scale=0.1,
-        online_synthesis=False,
-        freeze_decom_steps=0,
-        decom_warmup_steps=4000,
-        joint_retinex_ramp_steps=2000,
-        x0_loss_weight=0.2,
-        x0_loss_t_max=200,
-        x0_loss_warmup_steps=2000,
-        residual_scale=0.5,
-        ema_decay=0.9999,
-        prediction_type="v_prediction",
-        unet_layers_per_block=2,
-        unet_block_channels=[32, 64, 128, 256, 512],
-        unet_down_block_types=["DownBlock2D", "DownBlock2D",
-                               "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"],
-        unet_up_block_types=["AttnUpBlock2D", "AttnUpBlock2D",
-                             "UpBlock2D", "UpBlock2D", "UpBlock2D"],
-        conditioning_space="hvi_lite",
-        inject_mode="film_pyramid",
-        base_condition_channels=32,
-        decom_base_channels=32,
-        decom_variant="middle",
-        condition_variant="middle",
-        enable_torch_sdpa_memory_efficient_attention=True,
-        num_workers=_recommended_num_workers(),
-        prepare_on_train=False,
-        degradation_backend="torch",
-        semantic_backbone="resnet18",
-        nr_metric="niqe",
-        frequency_loss_weight=0.02,
-        edge_loss_weight=0.03,
-        loss_balance_mode="ema",
-        loss_balance_decay=0.98,
-        loss_balance_warmup_steps=1000,
-    ),
-    "debug_online": TrainProfileConfig(
-        report_to="tensorboard",
-        gradient_accumulation_steps=1,
-        checkpointing_steps=500,
-        validation_steps=250,
-        max_train_steps=None,
-        lr_scheduler="cosine_with_warmup",  # P0: Use cosine annealing
-        lr_warmup_steps=200,
-        offset_noise=True,
-        snr_gamma=5.0,
-        loss_weighting_scheme="min_snr",
-        use_uncertainty_weighting=False,
-        retinex_loss_weight=0.1,
-        tv_loss_weight=0.1,
-        retinex_consistency_weight=1.0,
-        retinex_exposure_weight=0.1,
-        grad_clip_norm=5.0,
-        offset_noise_scale=0.1,
-        online_synthesis=True,
-        freeze_decom_steps=0,
-        decom_warmup_steps=1000,
-        joint_retinex_ramp_steps=1000,
-        x0_loss_weight=0.2,
-        x0_loss_t_max=200,
-        x0_loss_warmup_steps=1000,
-        residual_scale=0.5,
-        ema_decay=0.9999,
-        prediction_type="v_prediction",
-        unet_layers_per_block=2,
-        unet_block_channels=[32, 64, 128, 256, 512],
-        unet_down_block_types=["DownBlock2D", "DownBlock2D",
-                               "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"],
-        unet_up_block_types=["AttnUpBlock2D", "AttnUpBlock2D",
-                             "UpBlock2D", "UpBlock2D", "UpBlock2D"],
-        conditioning_space="hvi_lite",
-        inject_mode="film_pyramid",
-        base_condition_channels=32,
-        decom_base_channels=32,
-        decom_variant="small",
-        condition_variant="small",
-        enable_torch_sdpa_memory_efficient_attention=True,
-        num_workers=max(2, min(4, _recommended_num_workers())),
-        prepare_on_train=False,
-        degradation_backend="torch",
-        semantic_backbone="none",
-        nr_metric="none",
-        frequency_loss_weight=0.02,
-        edge_loss_weight=0.03,
-        loss_balance_mode="ema",
-        loss_balance_decay=0.98,
-        loss_balance_warmup_steps=1000,
-    ),
-}
+DEFAULT_TRAIN_CONFIG = TrainDefaults(
+    report_to="tensorboard",
+    gradient_accumulation_steps=4,
+    checkpointing_steps=1000,
+    validation_steps=500,
+    max_train_steps=None,
+    lr_scheduler="cosine_with_warmup",
+    lr_warmup_steps=500,
+    offset_noise=True,
+    snr_gamma=5.0,
+    loss_weighting_scheme="min_snr",
+    use_uncertainty_weighting=False,
+    retinex_loss_weight=0.1,
+    tv_loss_weight=0.1,
+    retinex_consistency_weight=1.0,
+    retinex_exposure_weight=0.1,
+    grad_clip_norm=5.0,
+    offset_noise_scale=0.1,
+    freeze_decom_steps=0,
+    decom_warmup_steps=4000,
+    joint_retinex_ramp_steps=2000,
+    x0_loss_weight=0.2,
+    x0_loss_t_max=200,
+    x0_loss_warmup_steps=2000,
+    residual_scale=0.5,
+    ema_decay=0.9999,
+    prediction_type="v_prediction",
+    unet_layers_per_block=2,
+    unet_block_channels=[32, 64, 128, 256, 512],
+    unet_down_block_types=["DownBlock2D", "DownBlock2D",
+                           "DownBlock2D", "AttnDownBlock2D", "AttnDownBlock2D"],
+    unet_up_block_types=["AttnUpBlock2D", "AttnUpBlock2D",
+                         "UpBlock2D", "UpBlock2D", "UpBlock2D"],
+    conditioning_space="hvi_lite",
+    inject_mode="film_pyramid",
+    base_condition_channels=32,
+    decom_base_channels=32,
+    decom_variant="middle",
+    condition_variant="middle",
+    enable_torch_sdpa_memory_efficient_attention=True,
+    num_workers=_recommended_num_workers(),
+    semantic_backbone="none",
+    nr_metric="none",
+    frequency_loss_weight=0.02,
+    edge_loss_weight=0.03,
+    loss_balance_mode="ema",
+    loss_balance_decay=0.98,
+    loss_balance_warmup_steps=1000,
+)
 
 
 def _add_hidden_argument(parser: argparse.ArgumentParser, *name_or_flags, **kwargs):
@@ -195,19 +133,6 @@ def _add_hidden_argument(parser: argparse.ArgumentParser, *name_or_flags, **kwar
     if "default" not in kwargs:
         kwargs["default"] = None
     parser.add_argument(*name_or_flags, **kwargs)
-
-
-def _normalize_darker_ranges_arg(darker_ranges):
-    if darker_ranges in (None, "", {}):
-        return None
-    if isinstance(darker_ranges, dict):
-        return darker_ranges
-    if isinstance(darker_ranges, str):
-        parsed = yaml.safe_load(darker_ranges)
-        if not isinstance(parsed, dict):
-            raise ValueError("darker_ranges must decode to a dict.")
-        return parsed
-    raise TypeError(f"Unsupported darker_ranges type: {type(darker_ranges)!r}")
 
 
 def _normalize_validation_metrics_arg(metrics):
@@ -291,10 +216,7 @@ def _apply_cross_mount_throughput_defaults(args):
         args.cross_mount_tuning_applied = {}
         return
 
-    active_cache_dir = getattr(args, "prepared_cache_dir", None) or os.path.join(
-        args.data_dir, ".prepared")
-    slow_paths = [path for path in [args.data_dir,
-                                    active_cache_dir] if _looks_cross_mounted(path)]
+    slow_paths = [path for path in [args.data_dir] if _looks_cross_mounted(path)]
     args.cross_mount_warning_paths = slow_paths
     args.cross_mount_tuning_applied = {}
     if not slow_paths:
@@ -309,9 +231,8 @@ def _apply_cross_mount_throughput_defaults(args):
             args.cross_mount_tuning_applied[field_name] = tuned_value
 
 
-def apply_profile_defaults(args):
-    profile = TRAIN_PROFILES[args.train_profile]
-    for key, value in profile.__dict__.items():
+def apply_train_defaults(args):
+    for key, value in DEFAULT_TRAIN_CONFIG.__dict__.items():
         if getattr(args, key, None) is None:
             setattr(args, key, value)
 
@@ -321,31 +242,6 @@ def apply_profile_defaults(args):
         args.port = 8501
     if args.benchmark_inference_steps is None:
         args.benchmark_inference_steps = [8, 20]
-    if getattr(args, "prepare_on_train", None) is None:
-        args.prepare_on_train = True
-    if getattr(args, "degradation_backend", None) in ("", None):
-        args.degradation_backend = "torch"
-    args.degradation_backend = str(args.degradation_backend).strip().lower()
-    if getattr(args, "prepared_cache_dir", None) in ("", None):
-        args.prepared_cache_dir = os.path.join(args.data_dir, ".prepared")
-    if getattr(args, "offline_variant_count", None) is None:
-        args.offline_variant_count = 3
-    if getattr(args, "prepare_workers", None) is None:
-        args.prepare_workers = _recommended_num_workers()
-    if getattr(args, "prepare_force", None) is None:
-        args.prepare_force = False
-    if getattr(args, "synthesis_seed", None) is None:
-        args.synthesis_seed = args.seed if args.seed is not None else 42
-    if getattr(args, "semantic_synthesis", None) is None:
-        args.semantic_synthesis = False
-    if getattr(args, "semantic_model_id", None) in ("", None):
-        args.semantic_model_id = None
-    if getattr(args, "semantic_profile", None) in ("", None):
-        args.semantic_profile = None
-    if getattr(args, "semantic_cache_dir", None) in ("", None):
-        args.semantic_cache_dir = None
-    args.darker_ranges = _normalize_darker_ranges_arg(
-        getattr(args, "darker_ranges", None))
     if getattr(args, "prefetch_factor", None) is None:
         args.prefetch_factor = 4
     if getattr(args, "persistent_workers", None) is None:
@@ -356,8 +252,6 @@ def apply_profile_defaults(args):
         args.decode_cache_size = 0
     if getattr(args, "opencv_threads_per_worker", None) is None:
         args.opencv_threads_per_worker = 1
-    if getattr(args, "prepared_train_resolution", None) in ("", None):
-        args.prepared_train_resolution = None
     if getattr(args, "use_lpips", None) is None:
         args.use_lpips = True
     if getattr(args, "lpips_resize", None) in ("", None):
@@ -403,7 +297,7 @@ def apply_profile_defaults(args):
     if args.cross_mount_warning_paths:
         joined_paths = ", ".join(args.cross_mount_warning_paths)
         print(
-            "[throughput-warning] dataset or prepared cache appears to be on a cross-mounted path. "
+            "[throughput-warning] dataset appears to be on a cross-mounted path. "
             f"Prefer a local Linux SSD for better throughput: {joined_paths}",
             flush=True,
         )
@@ -417,7 +311,6 @@ def apply_profile_defaults(args):
             )
 
     _validate_model_args(args)
-    _validate_prepare_args(args)
     _attach_effective_batch_metadata(args)
     return args
 
@@ -439,82 +332,6 @@ def _attach_effective_batch_metadata(args):
     args.effective_batch_size = max(
         1, int(args.batch_size)) * max(1, int(args.gradient_accumulation_steps))
     args.min_effective_batch_size = MIN_EFFECTIVE_BATCH_SIZE
-
-
-def _validate_prepare_args(args):
-    if getattr(args, "offline_variant_count", 1) < 1:
-        raise ValueError("offline_variant_count must be >= 1")
-    if getattr(args, "prepare_workers", 1) < 1:
-        raise ValueError("prepare_workers must be >= 1")
-    darker_ranges = getattr(args, "darker_ranges", None)
-    if darker_ranges is not None and not isinstance(darker_ranges, dict):
-        raise ValueError(
-            "darker_ranges must be a dict or a JSON string that decodes to a dict")
-    if getattr(args, "degradation_backend", None) not in {"opencv", "torch"}:
-        raise ValueError("degradation_backend must be either 'opencv' or 'torch'")
-    if getattr(args, "semantic_synthesis", False) and getattr(args, "degradation_backend", None) != "torch":
-        raise ValueError("semantic_synthesis requires degradation_backend='torch'")
-
-
-def _ensure_prepared_training_manifest(args):
-    from datasets.prepare_data import ensure_prepared_training_data
-
-    print(
-        "[prepare] "
-        f"cache_dir={args.prepared_cache_dir} "
-        f"variants={args.offline_variant_count} "
-        f"workers={args.prepare_workers} "
-        f"seed={args.synthesis_seed} "
-        f"backend={args.degradation_backend}",
-        flush=True,
-    )
-    manifest_path, prepared = ensure_prepared_training_data(
-        args.data_dir,
-        args.prepared_cache_dir,
-        variant_count=args.offline_variant_count,
-        synthesis_seed=args.synthesis_seed,
-        darker_ranges=args.darker_ranges,
-        degradation_backend=args.degradation_backend,
-        prepare_workers=args.prepare_workers,
-        prepared_train_resolution=args.prepared_train_resolution,
-        semantic_synthesis=args.semantic_synthesis,
-        semantic_model_id=args.semantic_model_id,
-        semantic_profile=args.semantic_profile,
-        semantic_cache_dir=args.semantic_cache_dir,
-        force=args.prepare_force,
-        prepare_on_train=args.prepare_on_train,
-    )
-    args.train_manifest_path = manifest_path
-    return manifest_path, prepared
-
-
-def _resolve_training_manifest(args):
-    from datasets.prepare_data import validate_prepared_cache
-
-    manifest_path = validate_prepared_cache(
-        args.data_dir,
-        args.prepared_cache_dir,
-        variant_count=args.offline_variant_count,
-        synthesis_seed=args.synthesis_seed,
-        darker_ranges=args.darker_ranges,
-        degradation_backend=args.degradation_backend,
-        prepared_train_resolution=args.prepared_train_resolution,
-        semantic_synthesis=args.semantic_synthesis,
-        semantic_model_id=args.semantic_model_id,
-        semantic_profile=args.semantic_profile,
-        semantic_cache_dir=args.semantic_cache_dir,
-    )
-    if manifest_path is not None:
-        args.train_manifest_path = manifest_path
-        print(
-            f"[prepare] using existing multi-variant training cache at {manifest_path}"
-        )
-        return manifest_path, False
-
-    manifest_path, prepared = _ensure_prepared_training_manifest(args)
-    status = "built" if prepared else "using existing"
-    print(f"[prepare] {status} multi-variant training cache at {manifest_path}")
-    return manifest_path, prepared
 
 
 def _report_effective_batch(args):
@@ -557,7 +374,7 @@ def get_args():
     parser.add_argument(
         "--config", type=str, default=config_defaults["config"], help="YAML config path or preset name: small / middle / max")
     parser.add_argument("--mode", type=str, default="train", choices=[
-                        "train", "prepare", "predict", "validate", "ui"], help="Execution mode")
+                        "train", "predict", "validate", "ui"], help="Execution mode")
     parser.add_argument("--data_dir", type=str,
                         default="../datasets/kitti_LOL", help="Dataset root directory")
     parser.add_argument("--output_dir", type=str, default="runs/exp1",
@@ -588,31 +405,12 @@ def get_args():
                         default=True, help="Enable EMA for the trainable model modules.")
     parser.add_argument("--mixed_precision", type=str, default="fp16",
                         choices=["no", "fp16", "bf16"], help="Mixed precision policy")
-    parser.add_argument("--train_profile", type=str, default="auto",
-                        choices=sorted(TRAIN_PROFILES.keys()), help="High-level training preset")
-
     # Hidden advanced compatibility parameters
     _add_hidden_argument(parser, "--device", type=str)
     _add_hidden_argument(parser, "--report_to", type=str)
     _add_hidden_argument(parser, "--log_interval", type=int)
     _add_hidden_argument(parser, "--num_inference_steps", type=int)
     _add_hidden_argument(parser, "--num_validation_images", type=int)
-    _add_hidden_argument(parser, "--prepare_on_train", "--prepare-on-train", dest="prepare_on_train",
-                         action=argparse.BooleanOptionalAction, default=None)
-    _add_hidden_argument(parser, "--prepared_cache_dir", "--prepared-cache-dir", type=str)
-    _add_hidden_argument(parser, "--offline_variant_count", "--offline-variant-count", type=int)
-    _add_hidden_argument(parser, "--prepare_workers", "--prepare-workers", type=int)
-    _add_hidden_argument(parser, "--prepare_force", "--prepare-force", dest="prepare_force",
-                         action=argparse.BooleanOptionalAction, default=None)
-    _add_hidden_argument(parser, "--synthesis_seed", "--synthesis-seed", type=int)
-    _add_hidden_argument(parser, "--darker_ranges", "--darker-ranges", type=str)
-    _add_hidden_argument(parser, "--degradation_backend", "--degradation-backend", type=str,
-                         choices=["opencv", "torch"])
-    _add_hidden_argument(parser, "--semantic_synthesis", "--semantic-synthesis", dest="semantic_synthesis",
-                         action=argparse.BooleanOptionalAction, default=None)
-    _add_hidden_argument(parser, "--semantic_model_id", "--semantic-model-id", type=str)
-    _add_hidden_argument(parser, "--semantic_profile", "--semantic-profile", type=str)
-    _add_hidden_argument(parser, "--semantic_cache_dir", "--semantic-cache-dir", type=str)
     _add_hidden_argument(parser, "--gradient_accumulation_steps", type=int)
     _add_hidden_argument(parser, "--checkpointing_steps", type=int)
     _add_hidden_argument(parser, "--checkpoints_total_limit", type=int)
@@ -629,8 +427,6 @@ def get_args():
     _add_hidden_argument(parser, "--retinex_exposure_weight", type=float)
     _add_hidden_argument(parser, "--grad_clip_norm", type=float)
     _add_hidden_argument(parser, "--offset_noise_scale", type=float)
-    _add_hidden_argument(parser, "--online_synthesis",
-                         action="store_true", default=None)
     _add_hidden_argument(parser, "--freeze_decom_steps", type=int)
     _add_hidden_argument(parser, "--decom_warmup_steps", type=int)
     _add_hidden_argument(parser, "--joint_retinex_ramp_steps", type=int)
@@ -677,7 +473,6 @@ def get_args():
                          action=argparse.BooleanOptionalAction, default=None)
     _add_hidden_argument(parser, "--decode_cache_size", type=int)
     _add_hidden_argument(parser, "--opencv_threads_per_worker", type=int)
-    _add_hidden_argument(parser, "--prepared_train_resolution", type=int)
     _add_hidden_argument(parser, "--semantic_backbone",
                          type=str, choices=["none", "resnet18"])
     _add_hidden_argument(parser, "--nr_metric", type=str,
@@ -713,7 +508,7 @@ def get_args():
     args = parser.parse_args()
     args._explicit_cli_dests = explicit_cli_dests
     args.config = resolve_config_path(args.config)
-    return apply_profile_defaults(args)
+    return apply_train_defaults(args)
 
 
 if __name__ == "__main__":
@@ -724,11 +519,7 @@ if __name__ == "__main__":
         if args.mode != "ui":
             print_runtime_summary(args)
 
-        if args.mode == "prepare":
-            manifest_path, prepared = _ensure_prepared_training_manifest(args)
-            action = "Prepared" if prepared else "Validated"
-            print(f"{action} multi-variant training cache: {manifest_path}")
-        elif args.mode == "ui":
+        if args.mode == "ui":
             print("🚀 Launching Diff-Img2Img Studio...")
             ui_path = os.path.join("ui", "app.py")
             if not os.path.exists(ui_path):
@@ -741,8 +532,6 @@ if __name__ == "__main__":
             except KeyboardInterrupt:
                 print("\nUI Stopped.")
         else:
-            if args.mode == "train":
-                _resolve_training_manifest(args)
             from core.engine import DiffusionEngine
 
             engine = DiffusionEngine(args)

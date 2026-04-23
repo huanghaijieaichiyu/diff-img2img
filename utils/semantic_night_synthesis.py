@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
-import hashlib
-import json
 import os
 import random
 
@@ -12,12 +8,8 @@ import cv2
 import numpy as np
 import torch
 
-from utils.torch_low_light_degrader import TorchLowLightDegrader
-
 VALID_ASSET_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
-DEFAULT_SEMANTIC_MODEL_ID = "nvidia/segformer-b0-finetuned-cityscapes-512-1024"
 DEFAULT_SEMANTIC_PROFILE = "road_scene_v1"
-SEMANTIC_SYNTHESIS_VERSION = 2
 CITYSCAPES_PRECOMPUTED_MODEL_ID = "precomputed/cityscapes-labelids-v1"
 CITYSCAPES_LABEL_SPACE_LABEL_IDS = "labelIds"
 CITYSCAPES_LABEL_SPACE_TRAIN_IDS = "trainIds"
@@ -54,70 +46,10 @@ CITYSCAPES_ALLOWED_LABEL_VALUES: dict[str, set[int]] = {
 CITYSCAPES_CLASS_GROUPS = CITYSCAPES_CLASS_GROUPS_BY_LABEL_SPACE[CITYSCAPES_LABEL_SPACE_LABEL_IDS]
 
 
-@dataclass(frozen=True)
-class SemanticCacheConfig:
-    cache_dir: str
-    model_id: str
-    device: str
-    profile: str
-    label_space: str
-    contract_hash: str
-    source_image_index_hash: str | None
-    source_image_stat_hash: str | None
-    image_ids: tuple[str, ...]
-
-
-class RoadSceneSemanticSegmenter:
-    def __init__(self, model_id: str = DEFAULT_SEMANTIC_MODEL_ID, device: str = "auto"):
-        self.model_id = str(model_id or DEFAULT_SEMANTIC_MODEL_ID)
-        self.device = resolve_semantic_device(device)
-
-    def predict(self, image_rgb: np.ndarray | torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
-        image = _to_numpy_rgb(image_rgb)
-        height, width = image.shape[:2]
-        image_f = image.astype(np.float32) / 255.0
-        hsv = cv2.cvtColor(image_f, cv2.COLOR_RGB2HSV)
-        sat = hsv[..., 1]
-        val = hsv[..., 2]
-        yy = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
-
-        red = image_f[..., 0]
-        green = image_f[..., 1]
-        blue = image_f[..., 2]
-        label_map = np.full((height, width), 2, dtype=np.uint8)
-        confidence = np.full((height, width), 0.55, dtype=np.float32)
-
-        sky = (yy < 0.45) & (blue > green * 0.95) & (blue > red * 1.05) & (val > 0.35)
-        vegetation = (green > red * 1.08) & (green > blue * 1.02) & (sat > 0.18)
-        sign = (sat > 0.45) & (val > 0.35) & ((red > 0.45) | ((red > 0.35) & (green > 0.35)))
-        light = (val > 0.72) & (sat > 0.2) & (yy > 0.2)
-        road = (yy > 0.45) & (sat < 0.22) & (val > 0.08) & (val < 0.72)
-        vehicle = (yy > 0.42) & (sat > 0.2) & ~vegetation & ~sign & ~light
-        person = (yy > 0.35) & (yy < 0.95) & (sat > 0.15) & (val > 0.15) & (val < 0.85)
-
-        label_map[sky] = 10
-        confidence[sky] = 0.9
-        label_map[vegetation] = 8
-        confidence[vegetation] = 0.8
-        label_map[road] = 0
-        confidence[road] = 0.75
-        label_map[sign] = 7
-        confidence[sign] = 0.8
-        label_map[light] = 6
-        confidence[light] = 0.82
-        label_map[vehicle] = 13
-        confidence[vehicle] = np.maximum(confidence[vehicle], 0.68)
-        label_map[person & ~vehicle & ~road & ~sky] = 11
-        confidence[person & ~vehicle & ~road & ~sky] = np.maximum(confidence[person & ~vehicle & ~road & ~sky], 0.6)
-
-        return label_map.astype(np.uint8), confidence.astype(np.float32)
-
-
 class RoadSceneNightSynthesizer:
     def __init__(
         self,
         sky_asset_dir: str | os.PathLike[str] | None = None,
-        param_ranges: dict | None = None,
         randomize: bool = True,
         profile: str = DEFAULT_SEMANTIC_PROFILE,
     ):
@@ -128,8 +60,6 @@ class RoadSceneNightSynthesizer:
             )
         self.profile = profile
         self.randomize = bool(randomize)
-        self.param_ranges = dict(param_ranges or {})
-        self.degrader = TorchLowLightDegrader(randomize=randomize, param_ranges=param_ranges)
         self.sky_asset_dir = _abspath(sky_asset_dir) if sky_asset_dir else default_sky_asset_dir()
         self.sky_assets = list_sky_assets(self.sky_asset_dir)
 
@@ -348,7 +278,7 @@ class RoadSceneNightSynthesizer:
         final_tensor = _to_tensor_rgb(boosted)
         source_tensor = _to_tensor_rgb(source_rgb)
         if apply_base_noise:
-            final_tensor = TorchLowLightDegrader._enforce_exposure(source_tensor, final_tensor, min_ratio=0.08, max_ratio=0.60)
+            final_tensor = _enforce_exposure(source_tensor, final_tensor, min_ratio=0.08, max_ratio=0.60)
         return final_tensor.clamp(0.0, 1.0)
 
 
@@ -356,35 +286,13 @@ def _abspath(path: str | os.PathLike[str]) -> str:
     return os.path.abspath(os.fspath(path))
 
 
-def resolve_semantic_device(device: str | None) -> str:
-    resolved = str(device or "auto").strip().lower()
-    if resolved == "auto":
-        if torch.cuda.is_available():
-            return "cuda"
-        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-            return "mps"
-        return "cpu"
-    return resolved
-
-
-
-
-def semantic_cache_device_for_model_id(model_id: str | None, device: str | None) -> str:
-    if str(model_id or DEFAULT_SEMANTIC_MODEL_ID).strip() == CITYSCAPES_PRECOMPUTED_MODEL_ID:
-        return "cpu"
-    return resolve_semantic_device(device)
-
 def default_sky_asset_dir(repo_root: str | os.PathLike[str] | None = None) -> str:
     base = Path(repo_root) if repo_root else Path(__file__).resolve().parents[1]
     return _abspath(base / "assets" / "night_sky")
 
 
-def default_semantic_cache_dir(prepared_cache_dir: str | os.PathLike[str]) -> str:
-    return _abspath(Path(prepared_cache_dir) / "semantic_cache")
-
-
 def semantic_label_space_for_model_id(model_id: str | None) -> str:
-    if str(model_id or DEFAULT_SEMANTIC_MODEL_ID).strip() == CITYSCAPES_PRECOMPUTED_MODEL_ID:
+    if str(model_id or CITYSCAPES_PRECOMPUTED_MODEL_ID).strip() == CITYSCAPES_PRECOMPUTED_MODEL_ID:
         return CITYSCAPES_LABEL_SPACE_LABEL_IDS
     return CITYSCAPES_LABEL_SPACE_TRAIN_IDS
 
@@ -404,18 +312,6 @@ def normalize_cityscapes_label_space(label_space: str | None, *, model_id: str |
 def cityscapes_class_groups(label_space: str | None, *, model_id: str | None = None) -> dict[str, set[int]]:
     normalized = normalize_cityscapes_label_space(label_space, model_id=model_id)
     return CITYSCAPES_CLASS_GROUPS_BY_LABEL_SPACE[normalized]
-
-
-def semantic_contract_hash(label_space: str | None, *, model_id: str | None = None) -> str:
-    normalized = normalize_cityscapes_label_space(label_space, model_id=model_id)
-    payload = {
-        "label_space": normalized,
-        "groups": {
-            name: sorted(group_ids)
-            for name, group_ids in sorted(cityscapes_class_groups(normalized).items())
-        },
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def validate_cityscapes_label_map(
@@ -443,256 +339,6 @@ def list_sky_assets(sky_asset_dir: str | os.PathLike[str]) -> list[Path]:
         path for path in directory.rglob("*")
         if path.is_file() and path.suffix.lower() in VALID_ASSET_EXTENSIONS
     )
-
-
-def sky_asset_dir_hash(sky_asset_dir: str | os.PathLike[str] | None) -> str:
-    digest = hashlib.sha256()
-    if not sky_asset_dir:
-        digest.update(b"<none>")
-        return digest.hexdigest()
-    directory = Path(sky_asset_dir)
-    digest.update(_abspath(directory).encode("utf-8"))
-    if not directory.exists():
-        digest.update(b"<missing>")
-        return digest.hexdigest()
-    for asset in list_sky_assets(directory):
-        try:
-            stat = asset.stat()
-            digest.update(str(asset.relative_to(directory)).encode("utf-8"))
-            digest.update(str(int(stat.st_size)).encode("utf-8"))
-            digest.update(str(int(stat.st_mtime_ns)).encode("utf-8"))
-        except OSError:
-            digest.update(str(asset).encode("utf-8"))
-            digest.update(b"-1")
-    return digest.hexdigest()
-
-
-def semantic_cache_meta_path(cache_dir: str | os.PathLike[str]) -> Path:
-    return Path(cache_dir) / "_meta.json"
-
-
-def semantic_cache_entry_path(cache_dir: str | os.PathLike[str], image_id: str) -> Path:
-    return Path(cache_dir) / f"{image_id}.npz"
-
-
-def load_semantic_cache(cache_path: str | os.PathLike[str]) -> tuple[np.ndarray, np.ndarray]:
-    with np.load(cache_path) as payload:
-        label_map = payload["label_map"].astype(np.uint8)
-        confidence_map = payload["confidence_map"].astype(np.float32)
-    return label_map, confidence_map
-
-
-def write_semantic_cache_entry(
-    cache_dir: str | os.PathLike[str],
-    image_id: str,
-    label_map: np.ndarray,
-    confidence_map: np.ndarray,
-) -> str:
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = semantic_cache_entry_path(cache_dir, image_id)
-    np.savez_compressed(
-        cache_path,
-        label_map=np.asarray(label_map).astype(np.uint8),
-        confidence_map=np.asarray(confidence_map).astype(np.float32),
-    )
-    return _abspath(cache_path)
-
-
-def _write_json(path: str | os.PathLike[str], payload: dict) -> None:
-    Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
-
-
-def _read_json(path: str | os.PathLike[str]) -> dict | None:
-    json_path = Path(path)
-    if not json_path.exists():
-        return None
-    return json.loads(json_path.read_text(encoding="utf-8"))
-
-
-def load_semantic_cache_meta(cache_dir: str | os.PathLike[str]) -> dict | None:
-    return _read_json(semantic_cache_meta_path(cache_dir))
-
-
-def resolve_semantic_cache_label_space(
-    cache_dir: str | os.PathLike[str],
-    *,
-    model_id: str | None = None,
-) -> str:
-    meta = load_semantic_cache_meta(cache_dir)
-    return normalize_cityscapes_label_space(
-        meta.get("label_space") if isinstance(meta, dict) else None,
-        model_id=model_id,
-    )
-
-
-def _build_semantic_cache_meta(config: SemanticCacheConfig) -> dict:
-    return {
-        "version": SEMANTIC_SYNTHESIS_VERSION,
-        "cache_dir": config.cache_dir,
-        "model_id": config.model_id,
-        "device": config.device,
-        "profile": config.profile,
-        "label_space": config.label_space,
-        "semantic_contract_hash": config.contract_hash,
-        "source_image_index_hash": config.source_image_index_hash,
-        "source_image_stat_hash": config.source_image_stat_hash,
-        "image_ids": list(config.image_ids),
-        "entry_count": len(config.image_ids),
-        "status": "ready",
-    }
-
-
-def _semantic_cache_meta_matches(meta: dict | None, config: SemanticCacheConfig) -> bool:
-    if not isinstance(meta, dict):
-        return False
-    return (
-        int(meta.get("version", -1)) == SEMANTIC_SYNTHESIS_VERSION
-        and str(meta.get("cache_dir", "")) == config.cache_dir
-        and str(meta.get("model_id", "")) == config.model_id
-        and str(meta.get("profile", "")) == config.profile
-        and str(meta.get("label_space", "")) == config.label_space
-        and str(meta.get("semantic_contract_hash", "")) == config.contract_hash
-        and str(meta.get("source_image_index_hash") or "") == str(config.source_image_index_hash or "")
-        and str(meta.get("source_image_stat_hash") or "") == str(config.source_image_stat_hash or "")
-        and list(meta.get("image_ids") or []) == list(config.image_ids)
-    )
-
-
-def validate_semantic_cache(
-    image_entries: list[tuple[str, Path]],
-    *,
-    cache_dir: str | os.PathLike[str],
-    model_id: str = DEFAULT_SEMANTIC_MODEL_ID,
-    device: str = "auto",
-    profile: str = DEFAULT_SEMANTIC_PROFILE,
-    label_space: str | None = None,
-    source_image_index_hash: str | None = None,
-    source_image_stat_hash: str | None = None,
-) -> bool:
-    label_space = normalize_cityscapes_label_space(label_space, model_id=model_id)
-    config = SemanticCacheConfig(
-        cache_dir=_abspath(cache_dir),
-        model_id=str(model_id or DEFAULT_SEMANTIC_MODEL_ID),
-        device=semantic_cache_device_for_model_id(model_id, device),
-        profile=str(profile or DEFAULT_SEMANTIC_PROFILE),
-        label_space=label_space,
-        contract_hash=semantic_contract_hash(label_space),
-        source_image_index_hash=source_image_index_hash,
-        source_image_stat_hash=source_image_stat_hash,
-        image_ids=tuple(image_id for image_id, _ in image_entries),
-    )
-    meta = load_semantic_cache_meta(config.cache_dir)
-    if not _semantic_cache_meta_matches(meta, config):
-        return False
-    return all(semantic_cache_entry_path(config.cache_dir, image_id).exists() for image_id, _ in image_entries)
-
-
-def build_semantic_cache(
-    image_entries: list[tuple[str, Path]],
-    *,
-    cache_dir: str | os.PathLike[str],
-    model_id: str = DEFAULT_SEMANTIC_MODEL_ID,
-    device: str = "auto",
-    profile: str = DEFAULT_SEMANTIC_PROFILE,
-    source_image_index_hash: str | None = None,
-    source_image_stat_hash: str | None = None,
-    log_fn: Callable[[str], None] | None = None,
-) -> dict[str, str]:
-    cache_dir = _abspath(cache_dir)
-    label_space = normalize_cityscapes_label_space(None, model_id=model_id)
-    config = SemanticCacheConfig(
-        cache_dir=cache_dir,
-        model_id=str(model_id or DEFAULT_SEMANTIC_MODEL_ID),
-        device=semantic_cache_device_for_model_id(model_id, device),
-        profile=str(profile or DEFAULT_SEMANTIC_PROFILE),
-        label_space=label_space,
-        contract_hash=semantic_contract_hash(label_space),
-        source_image_index_hash=source_image_index_hash,
-        source_image_stat_hash=source_image_stat_hash,
-        image_ids=tuple(image_id for image_id, _ in image_entries),
-    )
-    if validate_semantic_cache(
-        image_entries,
-        cache_dir=cache_dir,
-        model_id=config.model_id,
-        device=config.device,
-        profile=config.profile,
-        label_space=config.label_space,
-        source_image_index_hash=source_image_index_hash,
-        source_image_stat_hash=source_image_stat_hash,
-    ):
-        return {
-            image_id: _abspath(semantic_cache_entry_path(cache_dir, image_id))
-            for image_id, _ in image_entries
-        }
-    if config.model_id == CITYSCAPES_PRECOMPUTED_MODEL_ID:
-        raise FileNotFoundError(
-            "semantic_model_id='precomputed/cityscapes-labelids-v1' requires a ready "
-            f"semantic_cache_dir with matching metadata; strict precomputed mode forbids fallback rebuilds: {cache_dir}"
-        )
-
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    segmenter = RoadSceneSemanticSegmenter(model_id=config.model_id, device=config.device)
-    cache_paths: dict[str, str] = {}
-    total = len(image_entries)
-    for index, (image_id, image_path) in enumerate(image_entries, start=1):
-        image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image_bgr is None:
-            raise FileNotFoundError(f"Failed to read source image for semantic cache: {image_path}")
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        label_map, confidence_map = segmenter.predict(image_rgb)
-        validate_cityscapes_label_map(label_map, label_space=config.label_space)
-        cache_paths[image_id] = write_semantic_cache_entry(cache_dir, image_id, label_map, confidence_map)
-        if log_fn and (index == 1 or index == total or index % 200 == 0):
-            log_fn(f"semantic cache {index}/{total}")
-
-    _write_json(semantic_cache_meta_path(cache_dir), _build_semantic_cache_meta(config))
-    return cache_paths
-
-
-def build_semantic_cache_from_precomputed(
-    image_entries: list[tuple[str, Path]],
-    *,
-    masks_by_id: dict[str, np.ndarray],
-    cache_dir: str | os.PathLike[str],
-    model_id: str = CITYSCAPES_PRECOMPUTED_MODEL_ID,
-    device: str = "cpu",
-    profile: str = DEFAULT_SEMANTIC_PROFILE,
-    source_image_index_hash: str | None = None,
-    source_image_stat_hash: str | None = None,
-    log_fn: Callable[[str], None] | None = None,
-) -> dict[str, str]:
-    cache_dir = _abspath(cache_dir)
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    label_space = normalize_cityscapes_label_space(None, model_id=model_id)
-    cache_paths: dict[str, str] = {}
-    total = len(image_entries)
-    for index, (image_id, _) in enumerate(image_entries, start=1):
-        if image_id not in masks_by_id:
-            raise KeyError(f"Missing precomputed semantic mask for image_id={image_id}")
-        label_map = np.asarray(masks_by_id[image_id])
-        if label_map.ndim == 3:
-            label_map = label_map[..., 0]
-        validate_cityscapes_label_map(label_map, label_space=label_space)
-        confidence_map = np.ones(label_map.shape, dtype=np.float32)
-        cache_paths[image_id] = write_semantic_cache_entry(cache_dir, image_id, label_map, confidence_map)
-        if log_fn and (index == 1 or index == total or index % 200 == 0):
-            log_fn(f"semantic cache {index}/{total}")
-
-    config = SemanticCacheConfig(
-        cache_dir=cache_dir,
-        model_id=str(model_id or CITYSCAPES_PRECOMPUTED_MODEL_ID),
-        device=semantic_cache_device_for_model_id(model_id, device),
-        profile=str(profile or DEFAULT_SEMANTIC_PROFILE),
-        label_space=label_space,
-        contract_hash=semantic_contract_hash(label_space),
-        source_image_index_hash=source_image_index_hash,
-        source_image_stat_hash=source_image_stat_hash,
-        image_ids=tuple(image_id for image_id, _ in image_entries),
-    )
-    _write_json(semantic_cache_meta_path(cache_dir), _build_semantic_cache_meta(config))
-    return cache_paths
 
 
 def _to_numpy_rgb(image_rgb: np.ndarray | torch.Tensor) -> np.ndarray:
@@ -735,6 +381,23 @@ def _to_tensor_rgb(image_rgb: np.ndarray | torch.Tensor) -> torch.Tensor:
     if array.max() > 1.0:
         array = array / 255.0
     return torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1))).float().clamp(0.0, 1.0)
+
+
+def _enforce_exposure(source: torch.Tensor, generated: torch.Tensor, min_ratio: float, max_ratio: float) -> torch.Tensor:
+    source_gray = 0.299 * source[0] + 0.587 * source[1] + 0.114 * source[2]
+    generated_gray = 0.299 * generated[0] + 0.587 * generated[1] + 0.114 * generated[2]
+    source_mean = source_gray.mean().clamp_min(1e-6)
+    generated_mean = generated_gray.mean()
+    ratio = generated_mean / source_mean
+
+    adjusted = generated
+    if ratio < min_ratio:
+        alpha = float(torch.clamp((min_ratio - ratio) / max(min_ratio, 1e-6), min=0.0, max=1.0).item())
+        adjusted = adjusted * (1.0 - alpha) + source * alpha * 0.35
+    elif ratio > max_ratio:
+        scale = float((max_ratio / ratio.clamp_min(1e-6)).item())
+        adjusted = adjusted * scale
+    return adjusted.clamp(0.0, 1.0)
 
 
 def _blur_map(image: np.ndarray | None, sigma: float) -> np.ndarray:
