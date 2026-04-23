@@ -54,7 +54,9 @@ smoke_test.log
 # *.safetensors
 
 # Data
-datasets/
+datasets/**
+!datasets/
+!datasets/*.py
 data/
 
 # Jupyter
@@ -65,5 +67,8 @@ data/
 uv.lock
 package-lock.json
 *.spec
-.claude
+.claude/
+.codex
 .latex
+.omx/
+.pytest_cache/

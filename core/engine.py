@@ -274,7 +274,8 @@ class DiffusionEngine:
         )
         if len(eval_dataset) == 0:
             raise RuntimeError(
-                "Validation dataset is empty. Expected files under '<data_dir>/eval15/{low,high}'."
+                "Validation dataset is empty. Expected files under '<data_dir>/eval15/{low,high}' "
+                "or '<data_dir>/val/{low,high}'."
             )
         eval_loader_kwargs = {
             "batch_size": self.args.batch_size,
@@ -1142,7 +1143,7 @@ class DiffusionEngine:
         if len(train_dataset) == 0:
             raise RuntimeError(
                 "Training dataset is empty. Please check prepared cache and source files under "
-                "'<data_dir>/our485/high'."
+                "'<data_dir>/our485/high' or '<data_dir>/train/high'."
             )
         train_drop_last = len(train_dataset) >= int(self.args.batch_size)
         if not train_drop_last:

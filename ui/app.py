@@ -819,11 +819,10 @@ def home_page():
     with quick_col:
         st.markdown(f"### {t('quick_start')}")
         st.code(
-            "MODEL_SIZE=middle \\\n"
-            "DATA_DIR=/path/to/dataset \\\n"
-            "OUTPUT_DIR=runs/middle_exp \\\n"
-            "TRAIN_PROFILE=auto \\\n"
-            "bash start_train.sh",
+            "python3 start_train.py \\\n"
+            "  --config middle \\\n"
+            "  --data-dir /path/to/dataset \\\n"
+            "  --output-dir runs/middle_exp",
             language="bash",
         )
         st.caption(t("monitoring_note"))

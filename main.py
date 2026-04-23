@@ -322,7 +322,7 @@ def apply_profile_defaults(args):
     if args.benchmark_inference_steps is None:
         args.benchmark_inference_steps = [8, 20]
     if getattr(args, "prepare_on_train", None) is None:
-        args.prepare_on_train = False
+        args.prepare_on_train = True
     if getattr(args, "degradation_backend", None) in ("", None):
         args.degradation_backend = "torch"
     args.degradation_backend = str(args.degradation_backend).strip().lower()
@@ -336,6 +336,14 @@ def apply_profile_defaults(args):
         args.prepare_force = False
     if getattr(args, "synthesis_seed", None) is None:
         args.synthesis_seed = args.seed if args.seed is not None else 42
+    if getattr(args, "semantic_synthesis", None) is None:
+        args.semantic_synthesis = False
+    if getattr(args, "semantic_model_id", None) in ("", None):
+        args.semantic_model_id = None
+    if getattr(args, "semantic_profile", None) in ("", None):
+        args.semantic_profile = None
+    if getattr(args, "semantic_cache_dir", None) in ("", None):
+        args.semantic_cache_dir = None
     args.darker_ranges = _normalize_darker_ranges_arg(
         getattr(args, "darker_ranges", None))
     if getattr(args, "prefetch_factor", None) is None:
@@ -444,6 +452,8 @@ def _validate_prepare_args(args):
             "darker_ranges must be a dict or a JSON string that decodes to a dict")
     if getattr(args, "degradation_backend", None) not in {"opencv", "torch"}:
         raise ValueError("degradation_backend must be either 'opencv' or 'torch'")
+    if getattr(args, "semantic_synthesis", False) and getattr(args, "degradation_backend", None) != "torch":
+        raise ValueError("semantic_synthesis requires degradation_backend='torch'")
 
 
 def _ensure_prepared_training_manifest(args):
@@ -467,10 +477,43 @@ def _ensure_prepared_training_manifest(args):
         degradation_backend=args.degradation_backend,
         prepare_workers=args.prepare_workers,
         prepared_train_resolution=args.prepared_train_resolution,
+        semantic_synthesis=args.semantic_synthesis,
+        semantic_model_id=args.semantic_model_id,
+        semantic_profile=args.semantic_profile,
+        semantic_cache_dir=args.semantic_cache_dir,
         force=args.prepare_force,
         prepare_on_train=args.prepare_on_train,
     )
     args.train_manifest_path = manifest_path
+    return manifest_path, prepared
+
+
+def _resolve_training_manifest(args):
+    from datasets.prepare_data import validate_prepared_cache
+
+    manifest_path = validate_prepared_cache(
+        args.data_dir,
+        args.prepared_cache_dir,
+        variant_count=args.offline_variant_count,
+        synthesis_seed=args.synthesis_seed,
+        darker_ranges=args.darker_ranges,
+        degradation_backend=args.degradation_backend,
+        prepared_train_resolution=args.prepared_train_resolution,
+        semantic_synthesis=args.semantic_synthesis,
+        semantic_model_id=args.semantic_model_id,
+        semantic_profile=args.semantic_profile,
+        semantic_cache_dir=args.semantic_cache_dir,
+    )
+    if manifest_path is not None:
+        args.train_manifest_path = manifest_path
+        print(
+            f"[prepare] using existing multi-variant training cache at {manifest_path}"
+        )
+        return manifest_path, False
+
+    manifest_path, prepared = _ensure_prepared_training_manifest(args)
+    status = "built" if prepared else "using existing"
+    print(f"[prepare] {status} multi-variant training cache at {manifest_path}")
     return manifest_path, prepared
 
 
@@ -547,32 +590,29 @@ def get_args():
                         choices=["no", "fp16", "bf16"], help="Mixed precision policy")
     parser.add_argument("--train_profile", type=str, default="auto",
                         choices=sorted(TRAIN_PROFILES.keys()), help="High-level training preset")
-    parser.add_argument("--log_interval", type=int, default=10,
-                        help="How often to refresh training summaries")
-    parser.add_argument("--num_inference_steps", type=int, default=8,
-                        help="Inference steps for prediction/validation")
-    parser.add_argument("--num_validation_images", type=int,
-                        default=16, help="How many validation images to evaluate")
-    parser.add_argument("--prepare_on_train", "--prepare-on-train", dest="prepare_on_train", action=argparse.BooleanOptionalAction,
-                        default=None, help="Automatically build the multi-variant prepared training cache before training.")
-    parser.add_argument("--prepared_cache_dir", "--prepared-cache-dir", type=str, default=None,
-                        help="Directory that stores prepared multi-variant low-light training data.")
-    parser.add_argument("--offline_variant_count", "--offline-variant-count", type=int, default=None,
-                        help="How many low-light variants to prepare for each training high-light image.")
-    parser.add_argument("--prepare_workers", "--prepare-workers", type=int,
-                        default=None, help="Worker count for offline data preparation.")
-    parser.add_argument("--prepare_force", "--prepare-force", dest="prepare_force",
-                        action=argparse.BooleanOptionalAction, default=None, help="Force rebuilding the prepared training cache.")
-    parser.add_argument("--synthesis_seed", "--synthesis-seed", type=int,
-                        default=None, help="Base seed used for offline low-light synthesis.")
-    parser.add_argument("--darker_ranges", "--darker-ranges", type=str, default=None,
-                        help="JSON/YAML dict overriding Darker parameter ranges during offline preparation.")
-    parser.add_argument("--degradation_backend", "--degradation-backend", type=str, default=None,
-                        choices=["opencv", "torch"], help="Backend used for offline low-light synthesis cache generation.")
 
     # Hidden advanced compatibility parameters
     _add_hidden_argument(parser, "--device", type=str)
     _add_hidden_argument(parser, "--report_to", type=str)
+    _add_hidden_argument(parser, "--log_interval", type=int)
+    _add_hidden_argument(parser, "--num_inference_steps", type=int)
+    _add_hidden_argument(parser, "--num_validation_images", type=int)
+    _add_hidden_argument(parser, "--prepare_on_train", "--prepare-on-train", dest="prepare_on_train",
+                         action=argparse.BooleanOptionalAction, default=None)
+    _add_hidden_argument(parser, "--prepared_cache_dir", "--prepared-cache-dir", type=str)
+    _add_hidden_argument(parser, "--offline_variant_count", "--offline-variant-count", type=int)
+    _add_hidden_argument(parser, "--prepare_workers", "--prepare-workers", type=int)
+    _add_hidden_argument(parser, "--prepare_force", "--prepare-force", dest="prepare_force",
+                         action=argparse.BooleanOptionalAction, default=None)
+    _add_hidden_argument(parser, "--synthesis_seed", "--synthesis-seed", type=int)
+    _add_hidden_argument(parser, "--darker_ranges", "--darker-ranges", type=str)
+    _add_hidden_argument(parser, "--degradation_backend", "--degradation-backend", type=str,
+                         choices=["opencv", "torch"])
+    _add_hidden_argument(parser, "--semantic_synthesis", "--semantic-synthesis", dest="semantic_synthesis",
+                         action=argparse.BooleanOptionalAction, default=None)
+    _add_hidden_argument(parser, "--semantic_model_id", "--semantic-model-id", type=str)
+    _add_hidden_argument(parser, "--semantic_profile", "--semantic-profile", type=str)
+    _add_hidden_argument(parser, "--semantic_cache_dir", "--semantic-cache-dir", type=str)
     _add_hidden_argument(parser, "--gradient_accumulation_steps", type=int)
     _add_hidden_argument(parser, "--checkpointing_steps", type=int)
     _add_hidden_argument(parser, "--checkpoints_total_limit", type=int)
@@ -702,35 +742,7 @@ if __name__ == "__main__":
                 print("\nUI Stopped.")
         else:
             if args.mode == "train":
-                from datasets.prepare_data import validate_prepared_cache
-
-                manifest_path = validate_prepared_cache(
-                    args.data_dir,
-                    args.prepared_cache_dir,
-                    variant_count=args.offline_variant_count,
-                    synthesis_seed=args.synthesis_seed,
-                    darker_ranges=args.darker_ranges,
-                    degradation_backend=args.degradation_backend,
-                    prepared_train_resolution=args.prepared_train_resolution,
-                )
-                if manifest_path is None:
-                    if getattr(args, "prepare_on_train", False):
-                        manifest_path, prepared = _ensure_prepared_training_manifest(
-                            args)
-                        if prepared:
-                            print(
-                                f"[prepare] built multi-variant training cache at {manifest_path}")
-                        else:
-                            print(
-                                f"[prepare] using existing multi-variant training cache at {manifest_path}")
-                    else:
-                        raise RuntimeError(
-                            "Prepared training cache is missing or stale. Run scripts/prepare_offline_enhancements.py (or `python main.py --mode prepare`) before training."
-                        )
-                else:
-                    args.train_manifest_path = manifest_path
-                    print(
-                        f"[prepare] using existing multi-variant training cache at {manifest_path}")
+                _resolve_training_manifest(args)
             from core.engine import DiffusionEngine
 
             engine = DiffusionEngine(args)

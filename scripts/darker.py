@@ -1,3 +1,4 @@
+import argparse
 import cv2
 import os
 import numpy as np
@@ -511,18 +512,31 @@ class Darker:
         )
 
 
+def _build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate randomized low-light variants for a dataset split."
+    )
+    parser.add_argument(
+        "data_dir",
+        type=str,
+        help="Dataset root containing the expected high/low split layout.",
+    )
+    parser.add_argument(
+        "--phase",
+        type=str,
+        default="train",
+        choices=["train", "test"],
+        help="Dataset split to process.",
+    )
+    return parser
+
+
 if __name__ == '__main__':
-    # =====================================================================
-    #  Configuration for realistic low-light synthesis
-    #  Key change: randomize=True enables per-image random degradation
-    # =====================================================================
+    args = _build_cli_parser().parse_args()
 
-    data_dir = "/mnt/f/datasets/nuscenes_lol"  # Change to your dataset path
-
-    # Custom parameter ranges (optional, these are already the defaults)
     custom_ranges = {
-        "gamma": (1.5, 4.0),              # Much lower than old 6.5
-        "linear_attenuation": (0.25, 0.7), # Higher than old 0.15
+        "gamma": (1.5, 4.0),
+        "linear_attenuation": (0.25, 0.7),
         "saturation_factor": (0.4, 0.85),
         "color_shift_factor": (0.0, 0.12),
         "headlight_boost": (0.0, 0.9),
@@ -539,13 +553,12 @@ if __name__ == '__main__':
     print("Initializing enhanced Darker with randomized degradation...")
     try:
         darker = Darker(
-            data_dir=data_dir,
-            phase="train",
+            data_dir=args.data_dir,
+            phase=args.phase,
             randomize=True,
             param_ranges=custom_ranges,
         )
         darker.process_images()
-
         print("Darker script completed successfully.")
     except Exception as e:
         print(f"An error occurred: {e}")

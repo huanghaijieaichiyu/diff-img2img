@@ -1,8 +1,8 @@
-# 讲nuscenes的图片转换为视频
-
-import os
-import cv2
 import glob
+import os
+from argparse import ArgumentParser
+
+import cv2
 from tqdm import tqdm
 
 
@@ -74,9 +74,16 @@ def video_writer(image_path, video_path, fps=30):
             video.release()
 
 
+def _build_parser() -> ArgumentParser:
+    parser = ArgumentParser(description="Merge an image directory into an MP4 video.")
+    parser.add_argument("image_path", type=str, help="Directory containing input frames.")
+    parser.add_argument("video_path", type=str, help="Output MP4 path.")
+    parser.add_argument("--fps", type=int, default=30, help="Video FPS.")
+    return parser
+
+
 if __name__ == '__main__':
-    image_path = '/home/huang/BEVFormer/runs/visual/combined'
-    video_path = '/home/huang/BEVFormer/runs/visual/combined.mp4'
-    print(f'image_path: {image_path}')
-    print(f'video_path: {video_path}')
-    video_writer(image_path, video_path)
+    args = _build_parser().parse_args()
+    print(f'image_path: {args.image_path}')
+    print(f'video_path: {args.video_path}')
+    video_writer(args.image_path, args.video_path, fps=args.fps)

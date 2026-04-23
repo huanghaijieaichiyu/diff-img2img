@@ -2,28 +2,29 @@
 """
 训练启动脚本 - DiffImg2Img 项目
 
-简洁的训练启动脚本，只需指定配置文件和数据集路径。
-所有详细配置从 YAML 配置文件加载。
+`start_train.py` 是一个极简训练入口，只负责：
+- 选择训练 preset/config
+- 指定数据目录与输出目录
+- 可选地从 checkpoint 恢复
+- 通过 accelerate 启动 `main.py --mode train`
+
+数据准备不再通过这个脚本暴露参数。训练开始前会自动检查 prepared cache，
+若缺失或陈旧则自动重建。
 
 使用示例:
-    # 使用默认配置
-    python start_train.py
-
-    # 指定配置和数据集
     python start_train.py --config middle --data-dir /path/to/dataset
-
-    # 从检查点恢复
-    python start_train.py --config middle --resume latest
-
-    # 验证模式
-    python start_train.py --mode validate --model-path runs/retinex/best_model
+    python start_train.py --config middle --data-dir /path/to/dataset --output-dir runs/exp
+    python start_train.py --config middle --data-dir /path/to/dataset --resume latest
 """
 
-from utils.project_config import load_preset_summary, resolve_config_path
+from __future__ import annotations
+
 import argparse
 import subprocess
 import sys
 from pathlib import Path
+
+from utils.project_config import load_preset_summary
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -34,101 +35,79 @@ if str(PROJECT_ROOT) not in sys.path:
 def _warn_if_cross_mounted_data(data_dir: str) -> None:
     prepared_cache_dir = str(Path(data_dir) / ".prepared")
     if data_dir.startswith("/mnt/") or prepared_cache_dir.startswith("/mnt/"):
-        print("[start_train][warning] dataset or prepared cache appears to be on a cross-mounted path.", file=sys.stderr)
-        print("[start_train][warning] For trustworthy throughput measurements, prefer a local Linux SSD.", file=sys.stderr)
+        print(
+            "[start_train][warning] dataset or prepared cache appears to be on a cross-mounted path.",
+            file=sys.stderr,
+        )
+        print(
+            "[start_train][warning] For trustworthy throughput measurements, prefer a local Linux SSD.",
+            file=sys.stderr,
+        )
 
 
 def create_parser() -> argparse.ArgumentParser:
-    """创建命令行参数解析器"""
     parser = argparse.ArgumentParser(
-        description="DiffImg2Img 训练启动脚本",
+        description="DiffImg2Img 极简训练启动脚本",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-
     parser.add_argument(
         "--config",
         type=str,
         default="small_throughput",
-        help="配置文件: small / middle / max 或 YAML 文件路径 (默认: small)",
+        help="训练预设或 YAML 配置路径 (默认: small_throughput)",
     )
-
     parser.add_argument(
         "--data-dir",
         type=str,
-        default="/mnt/f/datasets/kitti_LOL",
-        help="数据集目录路径 (默认: /mnt/f/datasets/kitti_LOL)",
+        default="/path/to/dataset",
+        help="数据集目录路径 (默认: /path/to/dataset)",
     )
-
     parser.add_argument(
         "--output-dir",
         type=str,
         default="runs/retinex",
         help="训练输出目录 (默认: runs/retinex)",
     )
-
-    parser.add_argument(
-        "--mode",
-        choices=["train", "validate", "predict"],
-        default="train",
-        help="运行模式 (默认: train)",
-    )
-
     parser.add_argument(
         "--resume",
         type=str,
         help="从检查点恢复训练 (指定路径或 'latest')",
     )
-
-    parser.add_argument(
-        "--model-path",
-        type=str,
-        help="模型路径 (用于 validate/predict 模式)",
-    )
-
-    parser.add_argument(
-        "--attention-backend",
-        choices=["auto", "compile", "sdpa", "native"],
-        help="UNet 运行后端策略",
-    )
-
-    parser.add_argument(
-        "--enable-torch-sdpa-memory-efficient-attention",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="启用 PyTorch 官方 SDPA 内存高效注意力",
-    )
-
-    parser.add_argument(
-        "--compile-mode",
-        choices=["default", "reduce-overhead",
-                 "max-autotune", "max-autotune-no-cudagraphs"],
-        help="torch.compile 模式",
-    )
-
-    parser.add_argument(
-        "--use-torch-compile",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="显式开启或关闭 torch.compile",
-    )
-
     return parser
 
 
 def find_accelerate() -> str:
-    """查找 accelerate 可执行文件"""
     venv_accelerate = PROJECT_ROOT / ".venv" / "bin" / "accelerate"
     return str(venv_accelerate) if venv_accelerate.exists() else "accelerate"
 
 
-def main():
-    """主函数"""
+def build_command(args: argparse.Namespace) -> list[str]:
+    main_script = PROJECT_ROOT / "main.py"
+    cmd = [
+        find_accelerate(),
+        "launch",
+        str(main_script),
+        "--mode",
+        "train",
+        "--config",
+        args.config,
+        "--data_dir",
+        args.data_dir,
+        "--prepare-on-train",
+        "--output_dir",
+        args.output_dir,
+    ]
+    if args.resume:
+        cmd.extend(["--resume", args.resume])
+    return cmd
+
+
+def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
     _warn_if_cross_mounted_data(args.data_dir)
 
-    # 显示配置摘要
     try:
         summary = load_preset_summary(args.config)
         print("=" * 70)
@@ -139,46 +118,15 @@ def main():
     except Exception:
         pass
 
-    # 构建命令
-    accelerate_bin = find_accelerate()
-    main_script = PROJECT_ROOT / "main.py"
-
-    cmd = [
-        accelerate_bin,
-        "launch",
-        str(main_script),
-        "--mode", args.mode,
-        "--config", args.config,
-        "--data_dir", args.data_dir,
-        "--output_dir", args.output_dir,
-    ]
-
-    if args.resume:
-        cmd.extend(["--resume", args.resume])
-    if args.model_path:
-        cmd.extend(["--model_path", args.model_path])
-    if args.attention_backend:
-        cmd.extend(["--attention_backend", args.attention_backend])
-    if args.enable_torch_sdpa_memory_efficient_attention is True:
-        cmd.append("--enable_torch_sdpa_memory_efficient_attention")
-    elif args.enable_torch_sdpa_memory_efficient_attention is False:
-        cmd.append("--no-enable_torch_sdpa_memory_efficient_attention")
-    if args.compile_mode:
-        cmd.extend(["--torch_compile_mode", args.compile_mode])
-    if args.use_torch_compile is True:
-        cmd.append("--use_torch_compile")
-    elif args.use_torch_compile is False:
-        cmd.append("--no-use_torch_compile")
-
-    # 执行
+    cmd = build_command(args)
     try:
         result = subprocess.run(cmd, cwd=PROJECT_ROOT)
         return result.returncode
     except KeyboardInterrupt:
         print("\n训练被中断", file=sys.stderr)
         return 130
-    except Exception as e:
-        print(f"错误: {e}", file=sys.stderr)
+    except Exception as exc:
+        print(f"错误: {exc}", file=sys.stderr)
         return 1
 
 

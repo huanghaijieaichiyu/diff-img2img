@@ -16,6 +16,8 @@ MODEL_CONFIG_PRESETS = {
     "max": "configs/train/max.yaml",
 }
 
+DEFAULT_CONFIG_DIR = Path("configs/train")
+
 LEGACY_MODEL_CONFIG_ALIASES = {
     "small_sota": "small",
     "small_accum": "small",
@@ -105,6 +107,48 @@ def load_preset_summary(config_value: str) -> dict[str, Any]:
         }
     )
     return summary
+
+
+def list_config_paths(config_dir: str | Path = DEFAULT_CONFIG_DIR) -> list[Path]:
+    config_root = Path(config_dir)
+    if not config_root.exists():
+        return []
+    return sorted(path for path in config_root.glob("*.yaml") if path.is_file())
+
+
+def list_config_names(config_dir: str | Path = DEFAULT_CONFIG_DIR) -> list[str]:
+    return [path.stem for path in list_config_paths(config_dir)]
+
+
+def resolve_repo_config_path(
+    config_value: str,
+    config_dir: str | Path = DEFAULT_CONFIG_DIR,
+    repo_root: str | Path | None = None,
+) -> Path:
+    config_root = Path(config_dir).resolve()
+    repo_root_path = Path(repo_root).resolve() if repo_root is not None else Path.cwd().resolve()
+
+    allowed: dict[str, Path] = {}
+    for path in list_config_paths(config_root):
+        resolved = path.resolve()
+        allowed[path.stem] = resolved
+        allowed[path.name] = resolved
+        allowed[str(path)] = resolved
+        allowed[str(resolved)] = resolved
+        try:
+            allowed[str(path.relative_to(repo_root_path))] = resolved
+        except ValueError:
+            pass
+
+    resolved = allowed.get(config_value)
+    if resolved is None:
+        raise FileNotFoundError(
+            f"Unknown config {config_value!r}. Expected one of {', '.join(sorted(path.stem for path in list_config_paths(config_root)))} "
+            f"or a file under {config_root}."
+        )
+    if not resolved.is_relative_to(config_root):
+        raise ValueError(f"Config {config_value!r} is outside {config_root}.")
+    return resolved
 
 
 def effective_batch_size(batch_size: int | None, gradient_accumulation_steps: int | None) -> int | None:

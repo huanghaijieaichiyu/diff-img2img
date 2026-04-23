@@ -8,9 +8,9 @@ Diff-Img2Img is a low-light image enhancement project built around a Retinex-gui
 
 - Retinex + diffusion training and inference entrypoint in `main.py`
 - Official training presets in `configs/train/{small,middle,max}.yaml`
+- Minimal train-only launcher in `start_train.py`
 - Offline prepared-cache builder that regenerates low-light variants from `our485/high`
 - Streamlit UI in `ui/app.py`
-- Convenience launcher in `start_train.sh` backed by `utils/train_launcher.py`
 
 ## Presets
 
@@ -32,11 +32,10 @@ python3 -m pip install -r requirements.txt
 accelerate config default
 
 # 2. Train with the recommended preset
-MODEL_SIZE=middle \
-DATA_DIR=/path/to/dataset \
-OUTPUT_DIR=runs/middle_exp \
-TRAIN_PROFILE=auto \
-bash start_train.sh
+python3 start_train.py \
+  --config middle \
+  --data-dir /path/to/dataset \
+  --output-dir runs/middle_exp
 
 # 3. Launch the UI studio
 python3 main.py --mode ui
@@ -67,85 +66,43 @@ Before the first epoch, training validates or builds a prepared cache under:
 Key points:
 
 - Training consumes the prepared cache, not a single pre-existing `our485/low` folder.
-- Default `train` mode requires a valid prepared cache (offline-first).
-- Optional: set `--prepare-on-train` if you want training to auto-build missing cache.
+- `train` mode now checks prepared data automatically and rebuilds missing or stale cache before the first epoch.
 - Interrupted prepare runs can resume as long as the metadata still matches the requested settings.
 
 To prepare the cache explicitly:
 
 ```bash
-python3 main.py --mode prepare \
-  --config configs/train/middle.yaml \
-  --data_dir /path/to/dataset \
-  --offline_variant_count 3 \
-  --prepare_workers 4 \
-  --synthesis_seed 42 \
-  --degradation-backend torch
+python3 main.py \
+  --mode prepare \
+  --config middle \
+  --data_dir /path/to/dataset
 ```
 
 ## Training
 
-The recommended way to launch training is the wrapper script:
+The runtime interface remains in `main.py`. `start_train.py` is now a **train-only** launcher that keeps the public training flow intentionally small, similar to mainstream diffusion/accelerate scripts.
 
 ```bash
-MODEL_SIZE=middle \
-DATA_DIR=/path/to/dataset \
-OUTPUT_DIR=runs/exp \
-TRAIN_PROFILE=auto \
-PREPARE_WORKERS=4 \
-OFFLINE_VARIANT_COUNT=3 \
-SYNTHESIS_SEED=42 \
-bash start_train.sh
+python3 start_train.py \
+  --config middle \
+  --data-dir /path/to/dataset \
+  --output-dir runs/exp
 ```
 
-Environment variables understood by `start_train.sh`:
-
-- `MODEL_SIZE`: `small`, `middle`, or `max`
-- `DATA_DIR`: dataset root
-- `OUTPUT_DIR`: run directory
-- `TRAIN_PROFILE`: `auto` or `debug_online`
-- `CONFIG_PATH`: optional explicit YAML path override
-- `RUN_MODE`: `train` or `validate`
-- `MODEL_PATH`: checkpoint directory used when `RUN_MODE=validate`
-- `PREPARED_CACHE_DIR`: optional cache override, defaults to `<DATA_DIR>/.prepared`
-- `PREPARE_WORKERS`: worker count for offline cache generation
-- `OFFLINE_VARIANT_COUNT`: number of synthetic low-light variants per training image
-- `SYNTHESIS_SEED`: base seed for offline synthesis
-- `DEGRADATION_BACKEND`: `torch` (recommended) or `opencv` for offline synthesis backend
-- `PREPARE_FORCE`: set to `1` to rebuild the cache from scratch
-- `RUN_FULL_EVAL_AFTER_TRAIN`: set to `1` to launch the standardized offline validation right after a successful train run
-- Explicit runtime overrides such as `NUM_WORKERS`, `PREFETCH_FACTOR`, `BATCH_SIZE`, `GRADIENT_ACCUMULATION_STEPS`, `VALIDATION_STEPS`, `BENCHMARK_INFERENCE_STEPS`, `SEMANTIC_BACKBONE`, and `NR_METRIC`
-
-`start_train.sh` is now a thin shell wrapper. The detailed environment-variable parsing and command assembly live in `utils/train_launcher.py`, while the resolved defaults still come from `configs/train/*.yaml` and `main.py`.
+For non-training modes or advanced internal controls, call `main.py` directly.
 
 The default UNet attention path now uses PyTorch's built-in SDPA processors, and compile defaults to `max-autotune-no-cudagraphs` for better training stability.
-
-Equivalent raw command:
-
-```bash
-python3 -m accelerate.commands.launch main.py --mode train \
-  --config configs/train/middle.yaml \
-  --data_dir /path/to/dataset \
-  --output_dir runs/exp \
-  --train_profile auto
-```
 
 ## Validation And Prediction
 
 ```bash
 # Quantitative validation
-python3 main.py --mode validate \
-  --model_path runs/exp \
+python3 main.py \
+  --mode validate \
+  --config middle \
+  --model_path runs/exp/best_model \
   --data_dir /path/to/dataset \
-  --output_dir runs/exp_eval
-
-# Equivalent wrapper-based validation
-RUN_MODE=validate \
-MODEL_SIZE=middle \
-DATA_DIR=/path/to/dataset \
-OUTPUT_DIR=runs/exp \
-MODEL_PATH=runs/exp/best_model \
-bash start_train.sh
+  --output_dir runs/exp/full_eval
 
 # Image prediction
 python3 main.py --mode predict \
@@ -198,8 +155,7 @@ models/             Retinex, conditioning, diffusion modules
 scripts/            utilities and visualization helpers
 ui/                 Streamlit app
 main.py             unified CLI entrypoint
-start_train.sh      thin shell wrapper for training
-utils/train_launcher.py
+start_train.py      minimal train-only launcher
 ```
 
 ## Example Gallery

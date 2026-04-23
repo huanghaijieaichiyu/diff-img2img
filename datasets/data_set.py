@@ -14,6 +14,8 @@ from datasets.prepare_data import (
     load_manifest_info,
     manifest_info_path,
     resolve_manifest_entry_path,
+    resolve_eval_pair_dirs,
+    resolve_training_high_dir,
 )
 from utils.torch_low_light_degrader import TorchLowLightDegrader
 
@@ -133,25 +135,25 @@ class LowLightDataset(Dataset):
             return
 
         if phase == "train":
-            subset = "our485"
+            try:
+                high_dir = str(resolve_training_high_dir(image_dir))
+            except FileNotFoundError as exc:
+                print(f"警告: {exc}，数据集为空。")
+                return
+            low_dir = os.path.join(os.path.dirname(high_dir), "low")
+            if not self.online_synthesis and not os.path.exists(low_dir):
+                print(f"警告: 目录 {low_dir} 不存在，训练数据集为空。")
+                return
         elif phase == "test":
-            subset = "eval15"
+            try:
+                low_dir_path, high_dir_path = resolve_eval_pair_dirs(image_dir)
+            except FileNotFoundError as exc:
+                print(f"警告: {exc}，数据集为空。")
+                return
+            low_dir = str(low_dir_path)
+            high_dir = str(high_dir_path)
         else:
             raise ValueError("phase must be 'train', 'test' or 'predict'")
-
-        subset_dir = os.path.join(image_dir, subset)
-        if not os.path.exists(subset_dir):
-            print(f"警告: 目录 {subset_dir} 不存在，数据集为空。")
-            return
-
-        high_dir = os.path.join(subset_dir, "high")
-        low_dir = os.path.join(subset_dir, "low")
-        if not os.path.exists(high_dir):
-            print(f"警告: 目录 {high_dir} 不存在，数据集为空。")
-            return
-        if phase == "train" and not self.online_synthesis and not os.path.exists(low_dir):
-            print(f"警告: 目录 {low_dir} 不存在，训练数据集为空。")
-            return
 
         image_names = [
             filename for filename in os.listdir(high_dir)

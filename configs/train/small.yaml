@@ -11,7 +11,7 @@ runtime:
   torch_compile_mode: max-autotune-no-cudagraphs
   resolution: 256
   log_interval: 10
-  num_workers: 4
+  num_workers: 8
   prepare_on_train: false
   degradation_backend: torch
   prepared_cache_dir:
@@ -41,7 +41,8 @@ model:
   cond_out_channels: 5
   unet_layers_per_block: 2
   unet_block_channels: [32, 64, 128, 160]
-  unet_down_block_types: [DownBlock2D, DownBlock2D, DownBlock2D, AttnDownBlock2D]
+  unet_down_block_types:
+    [DownBlock2D, DownBlock2D, DownBlock2D, AttnDownBlock2D]
   unet_up_block_types: [AttnUpBlock2D, UpBlock2D, UpBlock2D, UpBlock2D]
   enable_torch_sdpa_memory_efficient_attention: true
   enable_gradient_checkpointing: true
