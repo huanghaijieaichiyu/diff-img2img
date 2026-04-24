@@ -34,6 +34,11 @@ from datasets.data_set import LowLightDataset
 from models.conditioning import build_condition_adapter
 from models.diffusion import CombinedModel
 from models.retinex import build_decom_net
+from utils.checkpointing import (
+    checkpoint_step,
+    list_checkpoint_dirs,
+    resolve_resume_checkpoint,
+)
 from utils.loss import CompositeLoss
 from utils.metrics import SemanticFeatureMetric, try_compute_niqe
 from utils.misc import charbonnier_loss_elementwise, compute_min_snr_loss_weights, compute_adaptive_loss_weights, ssim
@@ -1121,6 +1126,12 @@ class DiffusionEngine:
             self.best_psnr = float(best_psnr)
 
     def train(self):
+        if self.args.resume:
+            resume_checkpoint = resolve_resume_checkpoint(
+                self.args.resume, self.args.output_dir)
+            self.args.resume = str(
+                resume_checkpoint) if resume_checkpoint is not None else None
+
         if getattr(self.args, 'use_grouped_lr', False):
             optimizer = self._build_optimizer_with_grouped_lr()
         else:
@@ -1236,28 +1247,16 @@ class DiffusionEngine:
         first_epoch = 0
         completed_joint_steps = 0
         if self.args.resume:
-            if self.args.resume == "latest":
-                checkpoints = [d for d in os.listdir(
-                    self.args.output_dir) if d.startswith("checkpoint-")]
-                if checkpoints:
-                    checkpoints = sorted(
-                        checkpoints, key=lambda item: int(item.split("-")[1]))
-                    self.args.resume = os.path.join(
-                        self.args.output_dir, checkpoints[-1])
-                else:
-                    self.args.resume = None
-
-            if self.args.resume and os.path.isdir(self.args.resume):
-                logger.info(
-                    f"Resuming training from checkpoint: {self.args.resume}")
-                self.accelerator.load_state(self.args.resume)
-                global_step = int(os.path.basename(
-                    self.args.resume).split("-")[1])
-                completed_joint_steps = max(0, global_step - warmup_steps)
-                first_epoch = completed_joint_steps // max(
-                    1, num_update_steps_per_epoch)
-                self._load_ema_state(self.args.resume)
-                self._load_checkpoint_metadata(self.args.resume)
+            resume_step = checkpoint_step(self.args.resume)
+            logger.info(
+                f"Resuming training from checkpoint: {self.args.resume}")
+            self.accelerator.load_state(self.args.resume)
+            global_step = int(resume_step or 0)
+            completed_joint_steps = max(0, global_step - warmup_steps)
+            first_epoch = completed_joint_steps // max(
+                1, num_update_steps_per_epoch)
+            self._load_ema_state(self.args.resume)
+            self._load_checkpoint_metadata(self.args.resume)
 
         if global_step >= warmup_steps:
             self._set_training_stage(completed_joint_steps)
@@ -2177,11 +2176,8 @@ class DiffusionEngine:
 
         total_limit = getattr(self.args, "checkpoints_total_limit", None)
         if total_limit is not None and self.accelerator.is_main_process:
-            checkpoints = sorted(
-                [item for item in os.listdir(
-                    self.args.output_dir) if item.startswith("checkpoint-")],
-                key=lambda item: int(item.split("-")[1]),
-            )
+            checkpoints = [item.name for item in list_checkpoint_dirs(
+                self.args.output_dir)]
             if len(checkpoints) > total_limit:
                 for checkpoint_name in checkpoints[: len(checkpoints) - total_limit]:
                     checkpoint_path = os.path.join(

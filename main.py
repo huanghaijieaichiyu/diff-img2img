@@ -542,7 +542,7 @@ if __name__ == "__main__":
                 engine.validate()
             elif args.mode == "predict":
                 engine.predict()
-    except ValueError as exc:
+    except (ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}", flush=True)
         sys.exit(2)
     except KeyboardInterrupt:
